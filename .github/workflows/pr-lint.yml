@@ -1,0 +1,39 @@
+name: PR Lint
+
+permissions:
+  pull-requests: read
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  conventional-commit:
+    name: Conventional Commit Title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            test
+            ci
+            perf
+          requireScope: false
+          subjectPattern: ^.+$
+          subjectPatternError: |
+            PR title must match conventional commit format:
+            <type>: <description>
+
+            Examples:
+              feat: add webhook validation
+              fix: correct drift detection for empty autoscaling
+              chore: update Go to 1.25
+              docs: add troubleshooting guide

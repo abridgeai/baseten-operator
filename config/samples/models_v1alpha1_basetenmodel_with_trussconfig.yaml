@@ -1,0 +1,77 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  labels:
+    app.kubernetes.io/name: baseten-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: basetenmodel-trussconfig-example
+spec:
+  modelName: "my-llm-model"
+
+  # Inline truss configuration — operator creates deployment automatically.
+  # Mutually exclusive with sourceDeploymentName.
+  # Deployment name is deterministic: depl-{8char-sha256-hash}
+  trussConfig:
+    pythonVersion: "py312"
+
+    resources:
+      accelerator: "H100:1"
+      # useGpu: true
+
+    baseImage:
+      image: "us-docker.pkg.dev/my-project/my-repo/vllm:0.16.0.0"
+      dockerAuth:
+        authMethod: "GCP_SERVICE_ACCOUNT_JSON"
+        secretName: "docker-registry-secret"
+        registry: "us-docker.pkg.dev"
+
+    # Optional: custom server configuration
+    # dockerServer:
+    #   startCommand: "sh -c 'bash /app/data/setup.sh'"
+    #   readinessEndpoint: "/health"
+    #   livenessEndpoint: "/health"
+    #   predictEndpoint: "/v1/completions"
+    #   serverPort: 8000
+
+    # Optional: runtime configuration
+    # runtime:
+    #   predictConcurrency: 256
+
+    # Optional: model metadata tags
+    # modelMetadata:
+    #   tags:
+    #     - "openai-compatible"
+
+    # Optional: Baseten secrets available to deployment (values are empty — configured in Baseten)
+    # secrets:
+    #   docker-registry-secret: ""
+    #   datadog-api-key: ""
+
+    # Optional: environment variables (non-secret)
+    # environmentVariables:
+    #   DD_SITE: "us5.datadoghq.com"
+    #   DD_SERVICE: "my-vllm"
+
+    # Optional: setup script from ConfigMap
+    # setupScript:
+    #   configMapRef:
+    #     name: llama-3-8b-setup
+    #     key: setup.sh
+    # Or inline (for small scripts):
+    # setupScript:
+    #   inline: |
+    #     #!/bin/bash
+    #     echo "setup complete"
+
+  environment:
+    name: "dev"
+
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 3
+      concurrencyTarget: 10
+
+    # Optional: Promotion settings
+    # promotionSettings:
+    #   scaleDownPreviousDeployment: true
+    #   preserveInstanceType: true

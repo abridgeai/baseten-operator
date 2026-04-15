@@ -1,0 +1,103 @@
+# Contributing to Baseten Operator
+
+Thanks for your interest in contributing! This document covers how to get started.
+
+## Development Setup
+
+### Prerequisites
+
+- Go 1.26.2+
+- Docker
+- kubectl
+- [Kind](https://kind.sigs.k8s.io/) (for local testing)
+
+### Build and Test
+
+```bash
+make build                  # build binary
+make test                   # unit tests
+make test-e2e               # e2e tests (creates Kind cluster)
+make lint                   # linter
+make manifests generate     # regenerate CRDs after type changes
+```
+
+### Local Development with Kind
+
+```bash
+kind create cluster --name baseten-dev
+make docker-build IMG=baseten-operator:dev
+kind load docker-image baseten-operator:dev --name baseten-dev
+make install && make deploy IMG=baseten-operator:dev
+```
+
+See [test/kind/README.md](test/kind/README.md) for a full walkthrough.
+
+## Making Changes
+
+### Modifying the API
+
+When adding or modifying fields in `api/v1alpha1/basetenmodel_types.go`:
+
+1. Edit the types file
+2. Add kubebuilder validation markers as needed
+3. Run `make manifests generate` to update CRDs and generated code
+4. Run `make test` to verify
+
+### Code Style
+
+- Follow [Effective Go](https://go.dev/doc/effective_go) conventions
+- Use `go fmt` (run automatically by `make build`)
+- Use structured logging via `log.FromContext(ctx)`
+- Keep controller logic idempotent
+
+## Submitting Changes
+
+### Pull Requests
+
+1. Fork the repo and create a feature branch from `main`
+2. Make your changes with tests
+3. Ensure all checks pass: `make test && make lint`
+4. Open a PR with a conventional commit title
+
+### Commit Convention
+
+PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+feat: add new feature
+fix: correct a bug
+chore: maintenance task
+docs: documentation update
+refactor: code restructuring
+test: add or update tests
+ci: CI/CD changes
+perf: performance improvement
+```
+
+This is enforced by CI on every PR.
+
+### Testing Requirements
+
+- Unit tests for new controller logic or client methods
+- Update existing tests if behavior changes
+- E2e tests for new reconciliation scenarios (when applicable)
+- All tests must pass: `make test && make test-e2e`
+
+## Project Structure
+
+```
+api/v1alpha1/              # CRD type definitions
+internal/
+  baseten/                 # Baseten API client
+  controller/              # Reconciliation logic
+  truss/                   # Truss config generation and push
+cmd/main.go                # Operator entrypoint
+config/                    # Kustomize manifests
+test/e2e/                  # End-to-end tests
+test/kind/                 # Kind cluster test fixtures
+docs/                      # Documentation site (MkDocs)
+```
+
+## Questions?
+
+Open an issue on GitHub. We're happy to help.

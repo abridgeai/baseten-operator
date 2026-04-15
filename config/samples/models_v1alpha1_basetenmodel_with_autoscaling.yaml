@@ -1,0 +1,37 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  labels:
+    app.kubernetes.io/name: baseten-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: basetenmodel-production-example
+spec:
+  modelName: "my-llm-model"
+  sourceDeploymentName: "img-0.11.2.3-wgt-v2-p-1"
+
+  environment:
+    name: "production"
+
+    # Production autoscaling configuration
+    autoscaling:
+      minReplicas: 2
+      maxReplicas: 20
+      concurrencyTarget: 20
+      scaleDownDelay: 120
+      autoscalingWindow: 600
+      targetUtilizationPercentage: 70
+
+    # Production promotion settings
+    promotionSettings:
+      scaleDownPreviousDeployment: true
+      preserveInstanceType: true
+      rampUpWhilePromoting: true
+      rampUpDurationSeconds: 600
+      redeployOnPromotion: false
+      rollingDeploy: true
+      rollingDeployConfig:
+        strategy: "REPLICA"
+        maxSurgePercent: 20
+        maxUnavailablePercent: 20
+        stabilizationTimeSeconds: 300
+        promotionCleanupStrategy: "SCALE_TO_ZERO"

@@ -1,0 +1,50 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: example-model-trussconfig
+  namespace: default
+spec:
+  modelName: "my-llm-model"
+  trussConfig:
+    pythonVersion: "py312"
+    resources:
+      accelerator: "H100:1"
+      useGpu: true
+    secrets:
+      docker-registry-secret: ""
+      datadog-api-key: ""
+    environmentVariables:
+      DD_SITE: "us5.datadoghq.com"
+      DD_ENV: "baseten"
+      DD_SERVICE: "vllm-my-model"
+      DD_TAGS: "model:my-model"
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "false"
+    baseImage:
+      image: "us-docker.pkg.dev/my-project/my-repo/vllm:0.16.0"
+      dockerAuth:
+        authMethod: "GCP_SERVICE_ACCOUNT_JSON"
+        secretName: "docker-registry-secret"
+        registry: "us-docker.pkg.dev"
+    dockerServer:
+      noBuild: true
+      startCommand: "sh -c 'bash /app/data/setup.sh'"
+      readinessEndpoint: "/health"
+      livenessEndpoint: "/health"
+      predictEndpoint: "/v1/completions"
+      serverPort: 8000
+    runtime:
+      predictConcurrency: 256
+    modelMetadata:
+      tags:
+        - "openai-compatible"
+    setupScript:
+      configMapRef:
+        name: example-model-setup
+        key: setup.sh
+  environment:
+    name: "dev"
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 5
+      concurrencyTarget: 10
