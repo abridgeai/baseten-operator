@@ -33,5 +33,8 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
+# Rendered install bundles (make build-installer output)
+dist/
+
 # Design documents (local reference only)
 docs/design/
