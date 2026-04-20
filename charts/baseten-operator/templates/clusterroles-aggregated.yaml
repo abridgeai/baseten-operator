@@ -1,0 +1,141 @@
+{{- /*
+User-facing ClusterRoles for cluster admins to delegate access to BasetenModel
+resources. Not used by the operator itself.
+*/ -}}
+{{- if and .Values.rbac.create .Values.rbac.aggregatedRoles -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodel-admin-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels
+  verbs:
+  - '*'
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodel-editor-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodel-viewer-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodeldeployment-admin-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments
+  verbs:
+  - '*'
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodeldeployment-editor-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-basetenmodeldeployment-viewer-role
+rules:
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodeldeployments/status
+  verbs:
+  - get
+{{- end -}}

@@ -45,8 +45,9 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects; sync CRD into chart.
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	cp config/crd/bases/models.baseten.com_basetenmodels.yaml charts/baseten-operator/files/basetenmodel-crd.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -91,7 +92,6 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@git checkout config/manager/kustomization.yaml 2>/dev/null || true
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: lint
@@ -145,35 +145,38 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	rm Dockerfile.cross
 
 .PHONY: build-installer
-build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: manifests generate ## Render the chart into a consolidated dist/install.yaml.
 	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image baseten-operator=${IMG}
-	"$(KUSTOMIZE)" build config/standalone > dist/install.yaml
+	$(HELM) template baseten-operator charts/baseten-operator \
+		--namespace baseten-operator-system \
+		--set namespace.create=true \
+		--set image.repository=$(IMG_REPO) --set image.tag=$(IMG_TAG) \
+		> dist/install.yaml
 
 ##@ Deployment
 
-ifndef ignore-not-found
-  ignore-not-found = false
-endif
+HELM_RELEASE ?= baseten-operator
+HELM_NAMESPACE ?= baseten-operator-system
+IMG_REPO := $(firstword $(subst :, ,$(IMG)))
+IMG_TAG := $(word 2,$(subst :, ,$(IMG)))
 
 .PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" apply -f -; else echo "No CRDs to install; skipping."; fi
+install: manifests ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	$(KUBECTL) apply -f config/crd/bases/
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
+uninstall: ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
+	$(KUBECTL) delete --ignore-not-found -f config/crd/bases/
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && "$(KUSTOMIZE)" edit set image baseten-operator=${IMG}
-	"$(KUSTOMIZE)" build config/standalone | "$(KUBECTL)" apply -f -
+deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config via Helm.
+	$(HELM) upgrade --install $(HELM_RELEASE) charts/baseten-operator \
+		--namespace $(HELM_NAMESPACE) --create-namespace \
+		--set image.repository=$(IMG_REPO) --set image.tag=$(IMG_TAG)
 
 .PHONY: undeploy
-undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	"$(KUSTOMIZE)" build config/standalone | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+undeploy: ## Undeploy controller from the K8s cluster via Helm.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE) --ignore-not-found
 
 ##@ Dependencies
 
@@ -185,13 +188,12 @@ $(LOCALBIN):
 ## Tool Binaries
 KUBECTL ?= kubectl
 KIND ?= kind
-KUSTOMIZE ?= $(LOCALBIN)/kustomize
+HELM ?= helm
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v5.7.1
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 
 #ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
@@ -205,10 +207,6 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.11.4
-.PHONY: kustomize
-kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
-$(KUSTOMIZE): $(LOCALBIN)
-	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.

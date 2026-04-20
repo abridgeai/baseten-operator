@@ -383,21 +383,20 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 
 ## Installation
 
-**Standalone** (includes Namespace):
+Install via the Helm chart published to GHCR:
 
 ```bash
-kubectl apply -k config/standalone
+helm install baseten-operator oci://ghcr.io/abridgeai/charts/baseten-operator \
+  --namespace baseten-operator-system --create-namespace \
+  --version 0.3.1
 
 kubectl create secret generic baseten-operator-api-key \
-  --namespace=baseten-operator-system \
+  --namespace baseten-operator-system \
   --from-literal=api-key=YOUR_BASETEN_API_KEY
 ```
 
-**Without Namespace** (for when your tooling manages the namespace separately):
-
-```bash
-kubectl apply -k config/default
-```
+See [charts/baseten-operator/README.md](charts/baseten-operator/README.md) for the full values
+reference and GitOps (Argo CD / Config Sync) examples.
 
 ---
 

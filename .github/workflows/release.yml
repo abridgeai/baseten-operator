@@ -69,12 +69,17 @@ jobs:
       #     cache-from: type=gha
       #     cache-to: type=gha,mode=max
 
-      - name: Update kustomization image tag
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update Chart version
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          cd config/manager
-          sed -i "s/newTag: .*/newTag: $VERSION/" kustomization.yaml
+          cd charts/baseten-operator
+          CHART_VERSION="${VERSION#v}"
+          sed -i "s/^version: .*/version: $CHART_VERSION/" Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" Chart.yaml
 
       - name: Commit and tag release
         env:
@@ -82,7 +87,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add config/manager/kustomization.yaml
+          git add charts/baseten-operator/Chart.yaml
           git commit -m "chore: release $VERSION"
           git tag "$VERSION"
           git push origin main --tags
@@ -93,12 +98,39 @@ jobs:
           tag_name: ${{ inputs.version }}
           generate_release_notes: true
 
+      - name: Login to GHCR for Helm push
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "$GH_ACTOR" --password-stdin
+
+      - name: Package and push Helm chart
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          CHART_VERSION="${VERSION#v}"
+          helm package charts/baseten-operator --destination /tmp/chart
+          helm push "/tmp/chart/baseten-operator-${CHART_VERSION}.tgz" oci://ghcr.io/abridgeai/charts
+
+      - name: Attach Helm chart to GitHub Release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHART_VERSION="${VERSION#v}"
+          gh release upload "$VERSION" "/tmp/chart/baseten-operator-${CHART_VERSION}.tgz"
+
       - name: Create release summary
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          echo "## Release $VERSION" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Kustomization updated and GitHub Release created." >> $GITHUB_STEP_SUMMARY
+          CHART_VERSION="${VERSION#v}"
+          {
+            echo "## Release $VERSION"
+            echo
+            echo "**Tag:** \`$VERSION\`"
+            echo "**Chart:** \`oci://ghcr.io/abridgeai/charts/baseten-operator:$CHART_VERSION\`"
+            echo
+            echo "Kustomization updated, Helm chart published to GHCR, and GitHub Release created."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,62 @@
+name: Helm
+
+on:
+  push:
+    paths:
+      - 'charts/**'
+      - 'config/crd/**'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    paths:
+      - 'charts/**'
+      - 'config/crd/**'
+      - '.github/workflows/helm.yml'
+
+jobs:
+  lint-and-validate:
+    name: Lint and validate chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint charts/baseten-operator
+
+      - name: Render chart (default values)
+        run: |
+          mkdir -p /tmp/render
+          helm template baseten-operator charts/baseten-operator \
+            --namespace baseten-operator-system > /tmp/render/default.yaml
+          helm template baseten-operator charts/baseten-operator \
+            --namespace baseten-operator-system \
+            --set crds.install=false \
+            --set rbac.aggregatedRoles=false \
+            --set metrics.enabled=false > /tmp/render/minimal.yaml
+
+      - name: Install kubeconform
+        run: |
+          curl -sSLo /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: Validate rendered manifests
+        run: |
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/render/default.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/render/minimal.yaml
+
+  crd-drift:
+    name: Chart CRD matches config/crd/bases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Diff CRD sources
+        run: |
+          diff config/crd/bases/models.baseten.com_basetenmodels.yaml \
+               charts/baseten-operator/files/basetenmodel-crd.yaml

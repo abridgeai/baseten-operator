@@ -32,16 +32,21 @@ make docker-build IMG=baseten-operator:dev
 kind load docker-image baseten-operator:dev --name baseten-dev
 ```
 
-## Step 3: Install CRDs and Deploy Operator
+## Step 3: Deploy Operator
+
+`make deploy` installs CRDs + controller + RBAC as a single Helm release:
 
 ```bash
-make install
 export BASETEN_API_KEY=your-api-key
 make deploy IMG=baseten-operator:dev
 
 kubectl wait --for=condition=available --timeout=120s \
   -n baseten-operator-system deployment/baseten-operator-controller-manager
 ```
+
+> `make install` / `make uninstall` are a separate path that installs only the CRD via
+> `kubectl apply -f config/crd/bases/`. Don't mix `make install` with `make deploy` —
+> Helm refuses to adopt CRDs it didn't create. Use one or the other.
 
 ## Step 4: Apply Test Resources
 

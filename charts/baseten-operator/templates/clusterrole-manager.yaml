@@ -1,0 +1,48 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "baseten-operator.fullname" . }}-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - models.baseten.com
+  resources:
+  - basetenmodels/status
+  verbs:
+  - get
+  - patch
+  - update
+{{- end -}}

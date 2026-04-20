@@ -79,12 +79,7 @@ var _ = Describe("Manager", Ordered, func() {
 		}
 		Eventually(verifyMockServerReady, 2*time.Minute, time.Second).Should(Succeed())
 
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
+		By("deploying the controller-manager (Helm installs CRDs + operator)")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
@@ -128,12 +123,8 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("kubectl", "delete", "basetenmodels", "--all", "-n", "default", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
-		By("undeploying the controller-manager")
+		By("undeploying the controller-manager (Helm uninstalls CRDs + operator)")
 		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
 		By("removing manager namespace")
