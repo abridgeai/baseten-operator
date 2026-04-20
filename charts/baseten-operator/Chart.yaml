@@ -2,8 +2,8 @@ apiVersion: v2
 name: baseten-operator
 description: Kubernetes operator for managing Baseten model deployments
 type: application
-version: 0.3.1
-appVersion: "v0.3.1"
+version: 0.3.2
+appVersion: "v0.3.2"
 kubeVersion: ">=1.28.0-0"
 keywords:
   - baseten
