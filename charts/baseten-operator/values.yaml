@@ -1,0 +1,115 @@
+# -- Number of controller replicas. Leader election ensures only one reconciles at a time.
+replicaCount: 1
+
+image:
+  # -- Image repository. Override to an internal registry if mirroring.
+  repository: ghcr.io/abridgeai/baseten-operator
+  # -- Image tag. Defaults to the chart's appVersion.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Optionally override the chart name.
+nameOverride: ""
+# -- Optionally override the full release name (prefix of all resources).
+fullnameOverride: ""
+
+namespace:
+  # -- If true, the chart will render a Namespace manifest for `namespace.name`.
+  # Keep `false` when the namespace is managed externally (e.g., via Config Sync or Terraform).
+  create: false
+  # -- Namespace the operator runs in.
+  name: baseten-operator-system
+
+crds:
+  # -- If true, install the BasetenModel CRD as part of the chart. Set to false if
+  # CRDs are managed out-of-band.
+  install: true
+
+serviceAccount:
+  # -- If true, create the ServiceAccount used by the controller.
+  create: true
+  # -- ServiceAccount name. Defaults to `<fullname>-controller-manager`.
+  name: ""
+  # -- Annotations for the ServiceAccount (e.g., Workload Identity bindings).
+  annotations: {}
+
+rbac:
+  # -- If true, create the ClusterRoles and bindings the controller needs.
+  create: true
+  # -- If true, install the `basetenmodel-{admin,editor,viewer}-role` and
+  # `basetenmodeldeployment-{admin,editor,viewer}-role` ClusterRoles. These are
+  # helpers for cluster admins delegating access; they are not used by the operator.
+  aggregatedRoles: true
+
+metrics:
+  # -- If true, expose the controller metrics service (HTTPS on port 8443).
+  enabled: true
+  # -- Metrics service port.
+  port: 8443
+
+# -- Extra args passed to the controller binary (after the always-on metrics + leader-election args).
+extraArgs: []
+
+# -- API key configuration. The controller reads BASETEN_API_KEY from the named Secret/key.
+api:
+  secretName: baseten-operator-api-key
+  secretKey: api-key
+
+# -- Pod-level annotations (e.g., Datadog autodiscovery).
+podAnnotations: {}
+# -- Pod-level labels (in addition to the selector labels).
+podLabels: {}
+
+# -- Node selector for the controller Pod.
+nodeSelector: {}
+# -- Tolerations for the controller Pod.
+tolerations: []
+# -- Affinity rules for the controller Pod.
+affinity: {}
+# -- Priority class name.
+priorityClassName: ""
+# -- Grace period in seconds for Pod termination.
+terminationGracePeriodSeconds: 10
+
+# -- Resource requests and limits for the controller container.
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# -- Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# -- Liveness probe.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8081
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+# -- Readiness probe.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8081
+  initialDelaySeconds: 5
+  periodSeconds: 10

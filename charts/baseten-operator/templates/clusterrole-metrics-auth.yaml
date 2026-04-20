@@ -1,7 +1,8 @@
+{{- if and .Values.rbac.create .Values.metrics.enabled -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: metrics-auth-role
+  name: {{ include "baseten-operator.fullname" . }}-metrics-auth-role
 rules:
 - apiGroups:
   - authentication.k8s.io
@@ -15,3 +16,4 @@ rules:
   - subjectaccessreviews
   verbs:
   - create
+{{- end -}}

@@ -1,0 +1,583 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: basetenmodels.models.baseten.com
+spec:
+  group: models.baseten.com
+  names:
+    kind: BasetenModel
+    listKind: BasetenModelList
+    plural: basetenmodels
+    shortNames:
+    - bm
+    singular: basetenmodel
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.modelName
+      name: Model
+      type: string
+    - jsonPath: .spec.environment.name
+      name: Environment
+      type: string
+    - jsonPath: .status.activeDeploymentName
+      name: Active_Deployment
+      type: string
+    - jsonPath: .status.activeReplicaCount
+      name: Replicas
+      type: integer
+    - jsonPath: .status.deploymentStatus
+      name: Status
+      type: string
+    - jsonPath: .spec.paused
+      name: Paused
+      type: boolean
+    - jsonPath: .spec.sourceDeploymentName
+      name: Source_Deployment
+      type: string
+    - jsonPath: .status.candidateDeploymentName
+      name: Candidate_Deployment
+      type: string
+    - jsonPath: .status.message
+      name: Message
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: BasetenModel is the Schema for the basetenmodels API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of BasetenModel
+            properties:
+              environment:
+                description: Environment defines the target environment and its configuration
+                properties:
+                  autoscaling:
+                    description: |-
+                      Autoscaling configures autoscaling behavior for this environment
+                      Maps to Baseten API: autoscaling_settings
+                    properties:
+                      autoscalingWindow:
+                        description: AutoscalingWindow is the timeframe of traffic
+                          considered for autoscaling decisions (in seconds)
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      concurrencyTarget:
+                        description: ConcurrencyTarget is the number of requests per
+                          replica before scaling up
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxReplicas:
+                        description: MaxReplicas is the maximum number of replicas
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      minReplicas:
+                        description: MinReplicas is the minimum number of replicas
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      scaleDownDelay:
+                        description: ScaleDownDelay is the waiting period before scaling
+                          down any active replica (in seconds)
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      targetUtilizationPercentage:
+                        description: TargetUtilizationPercentage is the target utilization
+                          percentage for scaling decisions
+                        format: int32
+                        maximum: 100
+                        minimum: 1
+                        type: integer
+                    type: object
+                  name:
+                    description: |-
+                      Name is the environment name (e.g., dev, staging, production)
+                      Must be lowercase alphanumeric characters and hyphens only
+                    minLength: 1
+                    pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                    type: string
+                  promotionSettings:
+                    description: |-
+                      PromotionSettings configures deployment promotion behavior for this environment
+                      Maps to Baseten API: promotion_settings (create) and promote operation flags
+                    properties:
+                      preserveInstanceType:
+                        description: |-
+                          PreserveInstanceType preserves the environment's instance type when promoting.
+                          Promote-time only: passed to POST /promote, NOT stored on the environment.
+                          Maps to Baseten API promote operation: preserve_env_instance_type
+                        type: boolean
+                      promotionCleanupStrategy:
+                        description: |-
+                          PromotionCleanupStrategy is the cleanup strategy after a promotion completes
+                          Maps to Baseten API: promotion_cleanup_strategy (top-level in promotion_settings)
+                        enum:
+                        - KEEP
+                        - SCALE_TO_ZERO
+                        - DEACTIVATE
+                        type: string
+                      rampUpDurationSeconds:
+                        description: |-
+                          RampUpDurationSeconds is the duration of traffic ramp-up in seconds
+                          Maps to Baseten API: ramp_up_duration_seconds
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      rampUpWhilePromoting:
+                        description: |-
+                          RampUpWhilePromoting enables traffic ramp-up (canary) during promotion
+                          Maps to Baseten API: ramp_up_while_promoting
+                        type: boolean
+                      redeployOnPromotion:
+                        description: |-
+                          RedeployOnPromotion creates a new deployment on promotion with a copy of the image
+                          Maps to Baseten API: redeploy_on_promotion
+                        type: boolean
+                      rollingDeploy:
+                        description: |-
+                          RollingDeploy enables rolling deploy orchestration for the environment
+                          Maps to Baseten API: rolling_deploy
+                        type: boolean
+                      rollingDeployConfig:
+                        description: |-
+                          RollingDeployConfig configures rolling deployment behavior
+                          Maps to Baseten API: rolling_deploy_config (UpdateRollingDeployConfigV1)
+                        properties:
+                          maxSurgePercent:
+                            description: |-
+                              MaxSurgePercent is the maximum surge percentage for rolling deploys
+                              Maps to Baseten API: max_surge_percent
+                            format: int32
+                            maximum: 100
+                            minimum: 0
+                            type: integer
+                          maxUnavailablePercent:
+                            description: |-
+                              MaxUnavailablePercent is the maximum unavailable percentage for rolling deploys
+                              Maps to Baseten API: max_unavailable_percent
+                            format: int32
+                            maximum: 100
+                            minimum: 0
+                            type: integer
+                          stabilizationTimeSeconds:
+                            description: |-
+                              StabilizationTimeSeconds is the stabilization time in seconds for rolling deploys
+                              Maps to Baseten API: stabilization_time_seconds
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          strategy:
+                            description: |-
+                              Strategy is the rolling deploy strategy
+                              Maps to Baseten API: rolling_deploy_strategy
+                            enum:
+                            - REPLICA
+                            type: string
+                        type: object
+                      scaleDownPreviousDeployment:
+                        description: |-
+                          ScaleDownPreviousDeployment scales down the previous deployment when promoting.
+                          Promote-time only: passed to POST /promote, NOT stored on the environment.
+                          Maps to Baseten API promote operation: scale_down_previous_deployment
+                        type: boolean
+                    type: object
+                required:
+                - name
+                type: object
+              modelName:
+                description: ModelName references an existing Baseten model
+                minLength: 1
+                type: string
+              orphanDeploymentCleanup:
+                description: |-
+                  OrphanDeploymentCleanup configures automatic cleanup of orphan deployments.
+                  Orphan deployments are those NOT actively used by any environment and NOT
+                  matching the current sourceDeploymentName.
+                properties:
+                  delete:
+                    description: Delete enables deletion of orphan deployments older
+                      than DeleteAfterDays.
+                    type: boolean
+                  deleteAfterDays:
+                    description: |-
+                      DeleteAfterDays is the minimum age in days before an orphan deployment can be deleted.
+                      Required when Delete is true. Cleanup skips deletion if not set.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  intervalMinutes:
+                    description: |-
+                      IntervalMinutes is how often cleanup runs (in minutes).
+                      Required. Cleanup is skipped entirely if not set.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                  minToKeep:
+                    description: |-
+                      MinToKeep is the minimum number of orphan deployments to preserve regardless of age.
+                      Sorted by created_at descending (newest kept first).
+                      Required when Delete is true. Cleanup skips deletion if not set.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  scaleToZero:
+                    description: ScaleToZero sets min_replica=0 on orphan deployments
+                      to release GPU resources.
+                    type: boolean
+                type: object
+              paused:
+                description: |-
+                  Paused stops the controller from reconciling this resource.
+                  Use this during emergencies or click-ops to prevent the operator from making
+                  changes while you configure manually in the Baseten UI. When paused, no API
+                  calls are made and the last known status is preserved in the message.
+                type: boolean
+              sourceDeploymentName:
+                description: |-
+                  SourceDeploymentName is the deployment to promote (created by CI/CD via truss push).
+                  Mutually exclusive with trussConfig.
+                  Format: img-{container-img-version}-wgt-{model-weight-version}-p-{platform-config-version}
+                type: string
+              trussConfig:
+                description: |-
+                  TrussConfig specifies the truss configuration for the operator to create a deployment
+                  via truss push. The operator generates a config.yaml, pushes to Baseten, then promotes
+                  the resulting deployment to the target environment.
+                  Mutually exclusive with sourceDeploymentName.
+                properties:
+                  baseImage:
+                    description: BaseImage specifies the Docker base image for the
+                      deployment
+                    properties:
+                      dockerAuth:
+                        description: DockerAuth configures authentication for pulling
+                          the base image
+                        properties:
+                          authMethod:
+                            description: AuthMethod is the authentication method (e.g.,
+                              "GCP_SERVICE_ACCOUNT_JSON")
+                            type: string
+                          registry:
+                            description: Registry is the Docker registry hostname
+                              (e.g., "us-docker.pkg.dev")
+                            type: string
+                          secretName:
+                            description: SecretName is the Baseten secret name containing
+                              credentials
+                            type: string
+                        required:
+                        - authMethod
+                        - registry
+                        - secretName
+                        type: object
+                      image:
+                        description: Image is the Docker image URI (e.g., "us-docker.pkg.dev/.../vllm:0.11.2.1")
+                        type: string
+                    required:
+                    - image
+                    type: object
+                  dockerServer:
+                    description: DockerServer configures the custom server running
+                      in the container
+                    properties:
+                      livenessEndpoint:
+                        description: LivenessEndpoint is the HTTP path for liveness
+                          checks
+                        type: string
+                      noBuild:
+                        description: |-
+                          NoBuild skips the image build step when using a pre-built base image.
+                          Set to true when baseImage already contains everything needed.
+                        type: boolean
+                      predictEndpoint:
+                        description: PredictEndpoint is the HTTP path for prediction
+                          requests
+                        type: string
+                      readinessEndpoint:
+                        description: ReadinessEndpoint is the HTTP path for readiness
+                          checks
+                        type: string
+                      serverPort:
+                        description: 'ServerPort is the port the server listens on
+                          (note: 8080 is reserved by Baseten)'
+                        format: int32
+                        type: integer
+                      startCommand:
+                        description: StartCommand is the command to start the server
+                        type: string
+                    type: object
+                  environmentVariables:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      EnvironmentVariables defines environment variables for the deployment.
+                      Do not store secrets here — use the secrets field instead.
+                    type: object
+                  modelMetadata:
+                    description: ModelMetadata provides metadata about the model
+                    properties:
+                      exampleModelInput:
+                        description: |-
+                          ExampleModelInput provides a sample input for the Baseten model testing UI.
+                          Accepts arbitrary JSON (e.g., {"prompt": "hello", "max_tokens": 128}).
+                        x-kubernetes-preserve-unknown-fields: true
+                      tags:
+                        description: Tags are labels for the model (e.g., "openai-compatible")
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  pythonVersion:
+                    description: PythonVersion is the Python version to build with
+                      (e.g., "py311", "py312")
+                    type: string
+                  resources:
+                    description: Resources defines compute resources for the deployment
+                    properties:
+                      accelerator:
+                        description: Accelerator specifies GPU type and count (e.g.,
+                          "H100:2", "A100:4", "L4")
+                        type: string
+                      useGpu:
+                        description: UseGpu enables GPU support
+                        type: boolean
+                    required:
+                    - accelerator
+                    type: object
+                  runtime:
+                    description: Runtime configures runtime behavior
+                    properties:
+                      predictConcurrency:
+                        description: PredictConcurrency is the maximum number of concurrent
+                          prediction requests
+                        format: int32
+                        type: integer
+                    type: object
+                  secrets:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Secrets defines secret keys available to the deployment.
+                      Values should be empty strings (actual values are configured in Baseten).
+                    type: object
+                  setupScript:
+                    description: |-
+                      SetupScript references a setup/startup script for the deployment.
+                      Large scripts should be stored in a ConfigMap and referenced via configMapRef.
+                    properties:
+                      configMapRef:
+                        description: ConfigMapRef references a key in a ConfigMap
+                          containing the script
+                        properties:
+                          key:
+                            description: Key is the key in the ConfigMap's data
+                            type: string
+                          name:
+                            description: Name is the ConfigMap name
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      inline:
+                        description: Inline contains the script content directly (for
+                          small scripts only)
+                        type: string
+                    type: object
+                required:
+                - baseImage
+                - resources
+                type: object
+            required:
+            - environment
+            - modelName
+            type: object
+            x-kubernetes-validations:
+            - message: one of sourceDeploymentName or trussConfig must be specified
+              rule: has(self.sourceDeploymentName) || has(self.trussConfig)
+            - message: sourceDeploymentName and trussConfig are mutually exclusive
+              rule: '!(has(self.sourceDeploymentName) && has(self.trussConfig))'
+          status:
+            description: status defines the observed state of BasetenModel
+            properties:
+              activeDeploymentName:
+                description: |-
+                  ActiveDeploymentName is the name of the currently live deployment in the environment
+                  Populated from the environment's current_deployment.name on each reconcile
+                type: string
+              activeReplicaCount:
+                description: ActiveReplicaCount is the number of active replicas for
+                  the deployment
+                format: int32
+                type: integer
+              candidateDeploymentID:
+                description: |-
+                  CandidateDeploymentID is the ID of the deployment being promoted (double-promote guard)
+                  Set after calling Promote(), cleared when promotion completes (current matches prefix)
+                type: string
+              candidateDeploymentName:
+                description: |-
+                  CandidateDeploymentName is the name of the deployment being promoted
+                  Populated from the environment's candidate_deployment.name on each reconcile
+                type: string
+              conditions:
+                description: Conditions represent the current state of the BasetenModel
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              deploymentRetryCount:
+                description: |-
+                  DeploymentRetryCount tracks the number of retry attempts for the current failure.
+                  Used to compute exponential backoff intervals. Cleared on ACTIVE or SCALED_TO_ZERO.
+                format: int32
+                type: integer
+              deploymentStatus:
+                description: |-
+                  DeploymentStatus represents the most relevant deployment status
+                  Shows candidate status during promotion, otherwise active deployment status
+                type: string
+              firstDeploymentFailureTime:
+                description: |-
+                  FirstDeploymentFailureTime is when the current deployment first entered a retryable
+                  failure state (FAILED, DEPLOY_FAILED, BUILD_FAILED). Used to enforce the 2-hour
+                  retry deadline — after which the operator stops retrying and returns a terminal error.
+                  Automatically cleared when the deployment becomes ACTIVE or SCALED_TO_ZERO.
+                format: date-time
+                type: string
+              lastCleanupTime:
+                description: LastCleanupTime is the last time orphan deployment cleanup
+                  was executed
+                format: date-time
+                type: string
+              message:
+                description: Message provides human-readable information about the
+                  current state
+                type: string
+              modelID:
+                description: ModelID is the Baseten model ID
+                type: string
+              nextRetryTime:
+                description: |-
+                  NextRetryTime is the earliest time the next retry attempt is allowed.
+                  Computed as exponential backoff (2m base, doubling, capped at 30m) with 0-50% jitter.
+                  Cleared on ACTIVE or SCALED_TO_ZERO.
+                format: date-time
+                type: string
+              sourceDeploymentID:
+                description: |-
+                  SourceDeploymentID is the resolved Baseten deployment ID for the source deployment
+                  Cached after lookup to avoid repeated API calls and to surface errors
+                type: string
+              sourceDeploymentName:
+                description: |-
+                  SourceDeploymentName is the source deployment name that was resolved
+                  Mirrors spec.sourceDeploymentName to confirm what the controller actually resolved
+                type: string
+              trussConfigHash:
+                description: |-
+                  TrussConfigHash is the hash of the trussConfig + setup script content.
+                  Used for change detection — a new hash triggers a new truss push.
+                type: string
+              trussPushStatus:
+                description: |-
+                  TrussPushStatus tracks the internal state of the truss push operation.
+                  Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created)
+                type: string
+              trussPushTime:
+                description: |-
+                  TrussPushTime is the last time a truss push was initiated.
+                  Used to detect stale TRUSS_PUSHING state and retry after timeout.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

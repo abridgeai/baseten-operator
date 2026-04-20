@@ -1,11 +1,11 @@
-# permissions to do leader election.
+{{- if .Values.rbac.create -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   labels:
-    app.kubernetes.io/name: baseten-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: leader-election-role
+    {{- include "baseten-operator.labels" . | nindent 4 }}
+  name: {{ include "baseten-operator.fullname" . }}-leader-election-role
+  namespace: {{ include "baseten-operator.namespace" . }}
 rules:
 - apiGroups:
   - ""
@@ -38,3 +38,4 @@ rules:
   verbs:
   - create
   - patch
+{{- end -}}
