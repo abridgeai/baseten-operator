@@ -21,3 +21,13 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11.4
+
+      - name: Regenerate manifests and DeepCopy code
+        run: make manifests generate
+
+      - name: Fail if regeneration produced a diff
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are out of date. Run 'make manifests generate' locally and commit the result."
+            exit 1
+          fi
