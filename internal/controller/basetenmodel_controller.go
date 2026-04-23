@@ -143,6 +143,9 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Step 2: Reconcile environment (create if needed, fix autoscaling drift)
 	env, envResult, err := r.reconcileEnvironment(ctx, model, modelID, envName)
 	if err != nil || envResult != nil {
+		if r.invalidateModelID(ctx, model, err) {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		return *envResult, err
 	}
 
@@ -247,6 +250,9 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			sourceDeploymentID:   sourceDeploymentID,
 			sourceDeploymentName: sourceDeploymentName,
 		})
+		if r.invalidateModelID(ctx, model, err) {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -775,8 +781,13 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 				message:          fmt.Sprintf("%sunable to check deployment %s: %v", ap, deploymentName, err),
 				modelID:          modelID,
 			})
+			// Propagate the error so the top-level Reconcile can invalidate a stale
+			// cached model ID on 404. Baseten's list-deployments endpoint 404s when
+			// the model ID itself is no longer valid (model recreated / migrated),
+			// which should trigger a re-resolution by name rather than infinitely
+			// retrying against a dead ID.
 			result := ctrl.Result{RequeueAfter: 30 * time.Second}
-			return "", &result, nil
+			return "", &result, err
 		}
 
 		if existingID != "" {
