@@ -14,6 +14,7 @@ const (
 	EventTrussPushCompleted        = "TrussPushCompleted"
 	EventReconciliationPaused      = "ReconciliationPaused"
 	EventDeploymentRetried         = "DeploymentRetried"
+	EventDeploymentReactivated     = "DeploymentReactivated"
 
 	// Warning events
 	EventModelNotFound                 = "ModelNotFound"

@@ -157,6 +157,35 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			"sourceDeploymentName", sourceDeploymentName,
 			"status", env.CurrentDeployment.Status)
 
+		if env.CurrentDeployment.Status == baseten.DeploymentStatusInactive {
+			logger.Info("Reactivating inactive current deployment",
+				"deploymentID", env.CurrentDeployment.ID,
+				"deploymentName", env.CurrentDeployment.Name)
+			if err := r.BasetenClient.ActivateDeployment(ctx, modelID, env.CurrentDeployment.ID); err != nil {
+				logger.Error(err, "Failed to reactivate current deployment")
+				r.logUpdateStatus(ctx, model, statusUpdate{
+					deploymentStatus:     baseten.DeploymentStatusFailed,
+					message:              fmt.Sprintf("failed to reactivate deployment %s in %s environment: %v", env.CurrentDeployment.Name, envName, err),
+					modelID:              modelID,
+					activeDeploymentName: env.CurrentDeployment.Name,
+					replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
+				})
+				if r.invalidateModelID(ctx, model, err) {
+					return ctrl.Result{RequeueAfter: time.Second}, nil
+				}
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			r.Recorder.Eventf(model, corev1.EventTypeNormal, EventDeploymentReactivated, "Reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName)
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus:     baseten.DeploymentStatusActivating,
+				message:              fmt.Sprintf("reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName),
+				modelID:              modelID,
+				activeDeploymentName: env.CurrentDeployment.Name,
+				replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
+			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
 		su := statusUpdate{
 			deploymentStatus:     env.CurrentDeployment.Status,
 			message:              steadyStateMessage(env.CurrentDeployment, envName, env.AutoscalingSettings),
