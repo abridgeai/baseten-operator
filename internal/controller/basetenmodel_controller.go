@@ -405,7 +405,7 @@ func (r *BasetenModelReconciler) reconcileOrphanCleanup(ctx context.Context, mod
 	deleted := 0
 	var deletedNames []string
 	if deleteStale {
-		deleted, deletedNames = r.deleteStaleOrphans(ctx, modelID, orphans, cleanup)
+		deleted, deletedNames = r.deleteStaleOrphans(ctx, model, modelID, orphans, cleanup)
 	}
 
 	if scaledIn > 0 {
@@ -453,12 +453,16 @@ func (r *BasetenModelReconciler) findOrphanDeployments(ctx context.Context, mode
 		if dep.IsProduction || dep.IsDevelopment {
 			continue
 		}
-		// Skip deployments matching the source deployment prefix (current desired version)
+		// Same-source variants are protected if reusable OR env-attached;
+		// INACTIVE / terminal-failure with env=null fall through as candidates.
 		sourceDepName := model.Spec.SourceDeploymentName
 		if sourceDepName == "" {
 			sourceDepName = model.Status.SourceDeploymentName
 		}
-		if sourceDepName != "" && baseten.DeploymentNameMatchesPrefix(dep.Name, sourceDepName) {
+		if sourceDepName != "" &&
+			baseten.DeploymentNameMatchesPrefix(dep.Name, sourceDepName) &&
+			(dep.Environment != nil ||
+				(dep.Status != baseten.DeploymentStatusInactive && !baseten.IsTerminalFailure(dep.Status))) {
 			continue
 		}
 		orphans = append(orphans, dep)
@@ -486,7 +490,7 @@ func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID str
 	return scaledIn, names
 }
 
-func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, modelID string, orphans []baseten.DeploymentDetail, cleanup *modelsv1alpha1.OrphanDeploymentCleanupConfig) (int, []string) {
+func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string, orphans []baseten.DeploymentDetail, cleanup *modelsv1alpha1.OrphanDeploymentCleanupConfig) (int, []string) {
 	logger := log.FromContext(ctx)
 
 	// Skip deletion if safety parameters not configured (prevents accidental mass deletion)
@@ -497,39 +501,73 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, modelID
 	staleDays := *cleanup.DeleteAfterDays
 	minKeep := *cleanup.MinToKeep
 
+	sourceDepName := model.Spec.SourceDeploymentName
+	if sourceDepName == "" {
+		sourceDepName = model.Status.SourceDeploymentName
+	}
+
+	// Protect the top minKeep newest orphans across all categories.
 	sort.Slice(orphans, func(i, j int) bool {
 		return orphans[i].CreatedAt > orphans[j].CreatedAt
 	})
+	protectedCount := int(minKeep)
+	if protectedCount > len(orphans) {
+		protectedCount = len(orphans)
+	}
+	candidates := orphans[protectedCount:]
+
+	// Non-prefix orphans delete first; prefix-match same-source variants after.
+	// (findOrphanDeployments has already filtered out env-attached prefix-match
+	// variants, so no env check is needed here.)
+	var nonPrefix, prefixMatched []baseten.DeploymentDetail
+	for _, dep := range candidates {
+		if sourceDepName != "" && baseten.DeploymentNameMatchesPrefix(dep.Name, sourceDepName) {
+			prefixMatched = append(prefixMatched, dep)
+			continue
+		}
+		nonPrefix = append(nonPrefix, dep)
+	}
+
+	oldestFirst := func(slice []baseten.DeploymentDetail) {
+		sort.Slice(slice, func(i, j int) bool {
+			return slice[i].CreatedAt < slice[j].CreatedAt
+		})
+	}
+	oldestFirst(nonPrefix)
+	oldestFirst(prefixMatched)
 
 	cutoff := time.Now().AddDate(0, 0, -int(staleDays))
 	deleted := 0
-	names := make([]string, 0, len(orphans))
-	for i, dep := range orphans {
-		// Skip the N newest orphans (safety buffer to avoid deleting recent deployments)
-		if int32(i) < minKeep {
-			continue
-		}
-		// Only delete INACTIVE or terminal failure deployments — SCALED_TO_ZERO can still wake up and serve traffic
+	names := make([]string, 0, len(candidates))
+
+	tryDelete := func(dep baseten.DeploymentDetail) {
 		if dep.Status != baseten.DeploymentStatusInactive && !baseten.IsTerminalFailure(dep.Status) {
-			continue
+			return
 		}
 		createdAt, err := time.Parse(time.RFC3339, dep.CreatedAt)
 		if err != nil {
 			logger.Error(err, "Failed to parse deployment created_at", "deploymentID", dep.ID, "createdAt", dep.CreatedAt)
-			continue
+			return
 		}
-		// Skip deployments newer than the staleness cutoff (not old enough to delete)
 		if createdAt.After(cutoff) {
-			continue
+			return
 		}
 		if err := r.BasetenClient.DeleteDeployment(ctx, modelID, dep.ID); err != nil {
 			logger.Error(err, "Failed to delete stale orphan deployment", "deploymentID", dep.ID, "deploymentName", dep.Name)
-			continue
+			return
 		}
 		logger.Info("Deleted stale orphan deployment", "deploymentID", dep.ID, "deploymentName", dep.Name)
 		deleted++
 		names = append(names, dep.Name)
 	}
+
+	for _, dep := range nonPrefix {
+		tryDelete(dep)
+	}
+	for _, dep := range prefixMatched {
+		tryDelete(dep)
+	}
+
 	return deleted, names
 }
 
