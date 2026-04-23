@@ -820,6 +820,76 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(getModelStatus(name).DeploymentStatus).To(Equal(baseten.DeploymentStatusScaledToZero))
 			})
 
+			It("should reactivate current deployment when it goes INACTIVE", func() {
+				// Baseten TTLs idle deployments to INACTIVE. If the env's current
+				// deployment is INACTIVE, we want the operator to wake it up —
+				// otherwise it stays Degraded in Argo CD.
+				name := "step3-inactive-reactivate"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "dep-inactive-id", Name: testSourceDep + ".1768269232", Status: baseten.DeploymentStatusInactive},
+					nil,
+				)
+
+				activateCalled := false
+				var activateModelID, activateDepID string
+				mockClient.ActivateDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					activateCalled = true
+					activateModelID = modelID
+					activateDepID = depID
+					return nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30*time.Second), "should requeue to poll post-activate status")
+
+				Expect(activateCalled).To(BeTrue())
+				Expect(activateModelID).To(Equal(testModelID))
+				Expect(activateDepID).To(Equal("dep-inactive-id"))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActivating))
+				Expect(status.ActiveDeploymentName).To(Equal(testSourceDep + ".1768269232"))
+
+				Expect(drainEvents()).To(ContainElement(ContainSubstring(EventDeploymentReactivated)))
+
+				progressing := getCondition(status.Conditions, "Progressing")
+				Expect(progressing).NotTo(BeNil())
+				Expect(progressing.Status).To(Equal(metav1.ConditionTrue), "ACTIVATING should be progressing")
+
+				ready := getCondition(status.Conditions, "Ready")
+				Expect(ready).NotTo(BeNil())
+				Expect(ready.Status).To(Equal(metav1.ConditionFalse), "ACTIVATING is not yet Ready")
+			})
+
+			It("should report FAILED when activate call fails for inactive current deployment", func() {
+				name := "step3-inactive-activate-fail"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "dep-inactive-id", Name: testSourceDep + ".1768269232", Status: baseten.DeploymentStatusInactive},
+					nil,
+				)
+
+				mockClient.ActivateDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					return fmt.Errorf("activate failed")
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).To(ContainSubstring("failed to reactivate"))
+			})
+
 			It("should clear candidate and emit DeploymentActive when promotion completes", func() {
 				name := "step3-clear-candidate"
 				model := newTestModel(name)
