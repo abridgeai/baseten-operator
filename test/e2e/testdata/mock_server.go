@@ -177,6 +177,16 @@ func main() {
 		for i, d := range st.deployments[modelID] {
 			if d.ID == depID {
 				st.deployments[modelID][i].Status = "ACTIVATING"
+				// Also update the env view so subsequent GET /environments reflects the transition
+				// and the controller doesn't re-detect INACTIVE on the next reconcile.
+				for _, env := range st.environments {
+					if env.CurrentDeployment != nil && env.CurrentDeployment.ID == depID {
+						env.CurrentDeployment.Status = "ACTIVATING"
+					}
+					if env.CandidateDeployment != nil && env.CandidateDeployment.ID == depID {
+						env.CandidateDeployment.Status = "ACTIVATING"
+					}
+				}
 				writeJSON(w, http.StatusOK, st.deployments[modelID][i])
 				return
 			}
@@ -384,6 +394,19 @@ func main() {
 				for i, d := range st.deployments[modelID] {
 					if d.ID == env.CandidateDeployment.ID {
 						st.deployments[modelID][i].Status = "BUILD_STOPPED"
+					}
+				}
+			}
+		case "deactivate_current":
+			// Simulate Baseten's TTL marking the env's current deployment as INACTIVE.
+			if env != nil && env.CurrentDeployment != nil {
+				env.CurrentDeployment.Status = "INACTIVE"
+				env.CurrentDeployment.ActiveReplicaCount = 0
+				// Also update the deployment in the deployments list (used by GET /deployments)
+				for i, d := range st.deployments[modelID] {
+					if d.ID == env.CurrentDeployment.ID {
+						st.deployments[modelID][i].Status = "INACTIVE"
+						st.deployments[modelID][i].ActiveReplicaCount = 0
 					}
 				}
 			}

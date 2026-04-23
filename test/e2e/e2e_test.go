@@ -1078,6 +1078,62 @@ spec:
 			Expect(nextRetry).To(BeEmpty(), "nextRetryTime should be cleared on success")
 		})
 
+		It("should reactivate env current deployment when Baseten deactivates it", func() {
+			By("applying a BasetenModel CR")
+			cr := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-reactivate
+  namespace: default
+spec:
+  modelName: "test-model"
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  environment:
+    name: "dev"`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cr)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("completing the promotion so the CR reaches Ready=True")
+			Eventually(func(g Gomega) {
+				g.Expect(getStatus("e2e-reactivate", ".status.deploymentStatus")).To(Equal("PROMOTING"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			controlMock("complete_promotion")
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-reactivate", "Ready")).To(Equal("True"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("simulating Baseten TTL marking the current deployment INACTIVE")
+			controlMock("deactivate_current")
+
+			By("nudging the CR to trigger a reconcile (happy path requeues every 5m)")
+			cmd = exec.Command("kubectl", "annotate", "bm", "e2e-reactivate", "-n", "default",
+				"e2e.baseten.com/nudge=reactivate", "--overwrite")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the operator to detect INACTIVE and transition to ACTIVATING")
+			Eventually(func(g Gomega) {
+				status := getStatus("e2e-reactivate", ".status.deploymentStatus")
+				g.Expect(status).To(Equal("ACTIVATING"),
+					"operator should call ActivateDeployment and reflect ACTIVATING in status")
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("verifying Progressing=True and Ready=False during reactivation")
+			Expect(getConditionStatus("e2e-reactivate", "Progressing")).To(Equal("True"))
+			Expect(getConditionStatus("e2e-reactivate", "Ready")).To(Equal("False"))
+
+			By("verifying the DeploymentReactivated event was emitted")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "events", "-n", "default",
+					"--field-selector", "involvedObject.name=e2e-reactivate",
+					"-o", "jsonpath={.items[*].reason}")
+				out, _ := utils.Run(cmd)
+				return out
+			}, 2*time.Minute, 2*time.Second).Should(ContainSubstring("DeploymentReactivated"))
+		})
+
 		It("should handle promotion failure", func() {
 			By("applying a BasetenModel CR")
 			cr := `apiVersion: models.baseten.com/v1alpha1

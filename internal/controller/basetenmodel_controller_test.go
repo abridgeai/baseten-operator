@@ -1659,6 +1659,8 @@ var _ = Describe("BasetenModel Controller", func() {
 		})
 
 		Describe("Orphan Deployment Cleanup", func() {
+			const cleanupSourceDep = "img-1.0-wgt-1.0-p-1.3"
+
 			mockCleanupDeps := func(deployments []baseten.DeploymentDetail, environments []baseten.Environment) {
 				mockClient.ListDeploymentsFunc = func(ctx context.Context, modelID string) ([]baseten.DeploymentDetail, error) {
 					return deployments, nil
@@ -2142,7 +2144,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				// many old promoted copies. The CR manages production with source p-1.3.
 				name := "cleanup-multi-env"
 				model := newTestModel(name)
-				model.Spec.SourceDeploymentName = "img-1.0-wgt-1.0-p-1.3"
+				model.Spec.SourceDeploymentName = cleanupSourceDep
 				model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
 					ScaleToZero:     ptr(true),
 					Delete:          ptr(true),
@@ -2178,7 +2180,7 @@ var _ = Describe("BasetenModel Controller", func() {
 						{ID: "test-dep-dev-current", Name: "img-1.0-wgt-1.0-p-1.2", Status: "SCALED_TO_ZERO", CreatedAt: "2026-01-12T23:35:08Z",
 							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0}},
 						// Source prefix-protected (matches img-1.0-wgt-1.0-p-1.3)
-						{ID: "test-dep-source-original", Name: "img-1.0-wgt-1.0-p-1.3", Status: "SCALED_TO_ZERO", CreatedAt: "2026-01-12T23:40:29Z",
+						{ID: "test-dep-source-original", Name: cleanupSourceDep, Status: "SCALED_TO_ZERO", CreatedAt: "2026-01-12T23:40:29Z",
 							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0}},
 						{ID: "test-dep-source-promoted-old", Name: "img-1.0-wgt-1.0-p-1.3.1768582860", Status: "INACTIVE", CreatedAt: "2026-01-16T17:01:00Z",
 							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0}},
@@ -2213,12 +2215,189 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
 
-				// Orphans sorted by created_at desc:
-				// test-orphan-p12-recent (2026-01-28) — newest INACTIVE orphan → kept by minToKeep=2
-				// test-orphan-p12-mid (2026-01-23) — 2nd newest → kept by minToKeep=2
-				// test-orphan-p12-old (2026-01-14) — INACTIVE, >30 days old → DELETED
-				// test-orphan-p10-ancient (2026-01-12) — INACTIVE, >30 days old → DELETED
-				Expect(deletedIDs).To(ConsistOf("test-orphan-p12-old", "test-orphan-p10-ancient"))
+				// Orphan pool (sorted newest first, with prefix-match INACTIVE variants
+				// now included): test-orphan-p12-recent and -mid kept by minToKeep=2;
+				// the other three are candidates. Deletion order is non-prefix first
+				// (oldest→newest), then prefix+env=null.
+				Expect(deletedIDs).To(Equal([]string{
+					"test-orphan-p10-ancient",      // non-prefix, oldest
+					"test-orphan-p12-old",          // non-prefix
+					"test-dep-source-promoted-old", // prefix-match last
+				}))
+			})
+
+			It("should delete non-prefix orphans before prefix-match orphans", func() {
+				// Locks in the deletion ordering invariant: non-prefix deleted
+				// first, then prefix-match same-source variants. minToKeep=0 so
+				// both candidates are eligible; assertion is on order, not set.
+				name := "cleanup-order-nonprefix-first"
+				model := newTestModel(name)
+				model.Spec.SourceDeploymentName = cleanupSourceDep
+				model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+					Delete:          ptr(true),
+					DeleteAfterDays: ptr(int32(1)),
+					MinToKeep:       ptr(int32(0)),
+					IntervalMinutes: ptr(int32(10)),
+				}
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "current-dep", Name: "img-1.0-wgt-1.0-p-1.3.999", Status: baseten.DeploymentStatusActive},
+					nil,
+				)
+
+				mockCleanupDeps(
+					[]baseten.DeploymentDetail{
+						{ID: "nonprefix-stale", Name: "img-1.0-wgt-1.0-p-1.0", Status: "INACTIVE", CreatedAt: "2025-01-01T00:00:00Z"},
+						{ID: "prefix-stale", Name: "img-1.0-wgt-1.0-p-1.3.111", Status: "INACTIVE", CreatedAt: "2025-01-01T00:00:00Z"},
+					},
+					[]baseten.Environment{{Name: "production", CurrentDeployment: &baseten.Deployment{ID: "current-dep"}}},
+				)
+
+				deletedIDs := []string{}
+				mockClient.DeleteDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					deletedIDs = append(deletedIDs, depID)
+					return nil
+				}
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(deletedIDs).To(Equal([]string{"nonprefix-stale", "prefix-stale"}),
+					"non-prefix must be deleted before prefix-match")
+			})
+
+			It("should protect prefix-match INACTIVE orphans with populated environment field", func() {
+				// Defensive: if Baseten surfaces a populated `environment` field
+				// on a deployment that isn't the env's current (legacy metadata),
+				// we leave it alone even when INACTIVE and past cutoff.
+				name := "cleanup-prefix-env-attached-protected"
+				model := newTestModel(name)
+				model.Spec.SourceDeploymentName = cleanupSourceDep
+				model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+					Delete:          ptr(true),
+					DeleteAfterDays: ptr(int32(1)),
+					MinToKeep:       ptr(int32(0)),
+					IntervalMinutes: ptr(int32(10)),
+				}
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "current-dep", Name: "img-1.0-wgt-1.0-p-1.3.999", Status: baseten.DeploymentStatusActive},
+					nil,
+				)
+
+				envName := "staging"
+				mockCleanupDeps(
+					[]baseten.DeploymentDetail{
+						{ID: "prefix-env-attached", Name: "img-1.0-wgt-1.0-p-1.3.111",
+							Status: "INACTIVE", CreatedAt: "2025-01-01T00:00:00Z", Environment: &envName},
+					},
+					[]baseten.Environment{{Name: "production", CurrentDeployment: &baseten.Deployment{ID: "current-dep"}}},
+				)
+
+				deleteCalled := false
+				mockClient.DeleteDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					deleteCalled = true
+					return nil
+				}
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(deleteCalled).To(BeFalse(), "env-attached prefix-match variants must not be deleted")
+			})
+
+			It("should protect fresh ACTIVE prefix-match pushes not yet in any env", func() {
+				// Original intent of the prefix-match skip: a freshly-pushed
+				// same-source deployment that hasn't been promoted to an env
+				// yet. Must not be deleted or scaled in.
+				name := "cleanup-fresh-push-protected"
+				model := newTestModel(name)
+				model.Spec.SourceDeploymentName = cleanupSourceDep
+				model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+					ScaleToZero:     ptr(true),
+					Delete:          ptr(true),
+					DeleteAfterDays: ptr(int32(1)),
+					MinToKeep:       ptr(int32(0)),
+					IntervalMinutes: ptr(int32(10)),
+				}
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "current-dep", Name: "img-1.0-wgt-1.0-p-1.3.999", Status: baseten.DeploymentStatusActive},
+					nil,
+				)
+
+				mockCleanupDeps(
+					[]baseten.DeploymentDetail{
+						{ID: "fresh-push", Name: cleanupSourceDep, Status: "ACTIVE",
+							CreatedAt:           "2025-01-01T00:00:00Z",
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1}},
+					},
+					[]baseten.Environment{{Name: "production", CurrentDeployment: &baseten.Deployment{ID: "current-dep"}}},
+				)
+
+				deleteCalled := false
+				scaleCalled := false
+				mockClient.DeleteDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					deleteCalled = true
+					return nil
+				}
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+					scaleCalled = true
+					return nil
+				}
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(deleteCalled).To(BeFalse(), "fresh-push prefix-match must not be deleted")
+				Expect(scaleCalled).To(BeFalse(), "fresh-push prefix-match must not be scaled in")
+			})
+
+			It("should be a no-op when minToKeep exceeds total orphan count", func() {
+				// Edge case: protectedCount clamps to len(orphans). Even an
+				// ancient INACTIVE deployment past the cutoff stays put when
+				// minToKeep is high enough.
+				name := "cleanup-mink-exceeds-total"
+				model := newTestModel(name)
+				model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+					Delete:          ptr(true),
+					DeleteAfterDays: ptr(int32(1)),
+					MinToKeep:       ptr(int32(5)),
+					IntervalMinutes: ptr(int32(10)),
+				}
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{ID: "current-dep", Name: testSourceDep + ".999", Status: baseten.DeploymentStatusActive},
+					nil,
+				)
+
+				mockCleanupDeps(
+					[]baseten.DeploymentDetail{
+						{ID: "orphan-1", Name: "img-old-wgt-1-p-1", Status: "INACTIVE", CreatedAt: "2024-01-01T00:00:00Z"},
+						{ID: "orphan-2", Name: "img-older-wgt-1-p-1", Status: "INACTIVE", CreatedAt: "2024-02-01T00:00:00Z"},
+						{ID: "orphan-3", Name: "img-oldest-wgt-1-p-1", Status: "INACTIVE", CreatedAt: "2024-03-01T00:00:00Z"},
+					},
+					[]baseten.Environment{{Name: "production", CurrentDeployment: &baseten.Deployment{ID: "current-dep"}}},
+				)
+
+				deleteCalled := false
+				mockClient.DeleteDeploymentFunc = func(ctx context.Context, modelID, depID string) error {
+					deleteCalled = true
+					return nil
+				}
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(deleteCalled).To(BeFalse(), "minToKeep=5 exceeds total=3, nothing should be deleted")
 			})
 
 			It("should handle no orphans gracefully", func() {
