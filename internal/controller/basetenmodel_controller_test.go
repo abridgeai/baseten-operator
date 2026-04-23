@@ -524,6 +524,36 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("EnvironmentCreateFailed")))
 			})
 
+			It("should invalidate cached modelID when CreateEnvironment fails with 404", func() {
+				// Regression: when status.ModelID goes stale, GetEnvironment 404s
+				// (treated as "env missing"), then CreateEnvironment also 404s
+				// (modelID invalid). Previously the error returned to Reconcile
+				// without passing through invalidateModelID, so the operator looped
+				// forever against the dead ID.
+				name := "step2-invalidate-modelid-on-create-404"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				model.Status.ModelID = testModelID
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "not found"}
+				}
+				mockClient.CreateEnvironmentFunc = func(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error {
+					return &baseten.APIError{StatusCode: 404, Message: `{"code": "NOT_FOUND", "message": "No Oracle matches the given query."}`}
+				}
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(time.Second), "should requeue quickly to re-resolve model ID")
+
+				status := getModelStatus(name)
+				Expect(status.ModelID).To(BeEmpty(), "cached model ID should be cleared")
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
+			})
+
 			It("should fail when GetEnvironment returns non-404 error", func() {
 				name := "step2-env-500"
 				model := newTestModel(name)
@@ -914,6 +944,32 @@ var _ = Describe("BasetenModel Controller", func() {
 				progressing := getCondition(status.Conditions, "Progressing")
 				Expect(progressing).NotTo(BeNil())
 				Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			})
+
+			It("should invalidate cached modelID when Promote fails with 404", func() {
+				// Regression: if modelID goes stale between validateSourceDeployment
+				// and Promote (e.g., model recreated mid-reconcile), Promote's 404
+				// used to return directly to controller-runtime without passing
+				// through invalidateModelID.
+				name := "step5-invalidate-modelid-on-promote-404"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: `{"code": "NOT_FOUND", "message": "No Oracle matches the given query."}`}
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(time.Second), "should requeue quickly to re-resolve model ID")
+
+				status := getModelStatus(name)
+				Expect(status.ModelID).To(BeEmpty(), "cached model ID should be cleared")
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
 			})
 
 			It("should promote when source is SCALED_TO_ZERO", func() {
@@ -2185,6 +2241,36 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				// Async push runs in background — give it a moment
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
+			})
+
+			It("should invalidate cached modelID when FindDeploymentIDByName returns 404", func() {
+				// Regression: previously, reconcileTrussDeployment swallowed the 404
+				// into a nil error + requeue result, so the top-level Reconcile's
+				// invalidateModelID check never fired. The cached (stale) modelID
+				// stayed pinned and the operator retried against a dead ID forever.
+				name := "truss-stale-modelid-404"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				// Pre-populate a stale cached modelID
+				model.Status.ModelID = testModelID
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				// Simulate Baseten returning 404 on GET /models/<id>/deployments —
+				// which happens when the cached modelID no longer corresponds to
+				// a live model (e.g., model recreated, migrated).
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", &baseten.APIError{StatusCode: 404, Message: `{"code": "NOT_FOUND", "message": "No Oracle matches the given query."}`}
+				}
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(time.Second), "should requeue quickly to re-resolve model ID")
+
+				status := getModelStatus(name)
+				Expect(status.ModelID).To(BeEmpty(), "cached model ID should be cleared")
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
 			})
 
 			It("should emit TrussPushCompleted when deployment appears after push", func() {
