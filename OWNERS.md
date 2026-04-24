@@ -6,10 +6,12 @@ Maintainers are responsible for reviewing and merging PRs, triaging issues, and 
 
 ### Abridge AI
 
-- @aakashpydi
+- Aakash Pydi ([@aakashpydi](https://github.com/aakashpydi))
+- Nathan Price ([@TheCodeWrangler](https://github.com/TheCodeWrangler))
 
 ### Baseten
 
+- TBD
 - TBD
 
 ## Reviewers

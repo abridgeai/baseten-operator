@@ -8,29 +8,31 @@
 
 **A Kubernetes operator for managing ML models deployed on [Baseten](https://baseten.co).**
 
-Define your model, environment, autoscaling, and promotion strategy as a `BasetenModel` Kubernetes resource. The baseten-operator continuously reconciles desired state on Baseten using the [Baseten Management API](https://docs.baseten.co/reference/management-api/overview): creating and promoting deployments, retrying deployment failures, and cleaning up any leaked GPU resources.
-
-Works with any Kubernetes workflow: `kubectl apply`, Helm, Kustomize, Argo CD, Flux, or Terraform.
-
-```mermaid
-graph LR
-    A[Desired State] --> B[BasetenModel]
-    B --> C[Baseten Operator]
-    C --> D[Baseten Management API]
-    D --> E[Baseten Model]
-```
+A `BasetenModel` Kubernetes custom resource declares the desired state of a Baseten model in a target environment. The baseten-operator uses the [Baseten Management API](https://docs.baseten.co/reference/management-api/overview) to (1) create and promote a model deployment to the target environment, (2) reconcile autoscaling and promotion settings for the environment, and (3) scale in and clean up orphaned model deployments not associated with any environment (preventing cost overruns from GPU resource leakage).
 
 ---
 
 ## Why
 
-- **Manage models at scale**: one CR per model per environment. Dev, staging, and production each get independent configs, versioned and reviewable like any other Kubernetes resource. Used for up to 50+ models at initial release.
-- **Automate promotions across environments**: update a field, and the operator handles the full promotion lifecycle. No more manual UI workflows or custom scripts per model.
-- **Prevent GPU waste**: orphan deployments from previous promotions are automatically scaled to zero and cleaned up on a schedule, reclaiming leaked GPU capacity.
-- **Keep configs from drifting**: the operator detects manual changes in the Baseten UI and corrects them back to the desired state on every reconcile.
-- **Recover from failures automatically**: failed deployments are retried with exponential backoff for up to 2 hours. No paging, no manual intervention.
-- **Operator and Baseten UI work together**: pause reconciliation per-resource to manage deployments directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the CR.
-- **Fits into existing Kubernetes CI/CD**: works natively with Argo CD, Flux, Helm, Kustomize, or plain `kubectl`. No new tooling required.
+### Kubernetes-native continuous delivery
+
+Use Kubernetes-native continuous delivery tooling (e.g. [Argo CD](https://argo-cd.readthedocs.io/en/stable/), [Flux](https://fluxcd.io/)). No need to build dedicated tooling to manage models on Baseten. 
+
+**Easily manage deployments across:**
+
+- **environments, regions, and tenants.** A single model may need to run across multiple environments (dev, staging, prod), regions (US, EU), and tenants (for subsets of customers). Each deployment is another Kubernetes custom resource in the same continuous delivery flow.
+- **in-house and managed inference infra providers.** ML teams often deploy the same model across in-house and managed infra providers. With the operator, Baseten deployments follow the same Kubernetes-based continuous delivery pattern as in-house infra running on Kubernetes.
+
+### Built by and for ML platform teams
+
+- **Prevent cost overruns from leaked GPUs.** Orphaned deployments not associated with any environment are scaled to zero and deleted on a schedule, with configurable safeguards.
+- **Self-heal on transient failures.** Failed deployments (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`) are retried with exponential backoff for a fixed time window. When a deployment attached to an environment is marked `INACTIVE` by Baseten's TTL, the operator reactivates it.
+- **Prevent drift from click-ops.** Changes made directly in the Baseten UI are detected and reverted to match the `BasetenModel` custom resource. The custom resource remains the single source of truth.
+- **Operator and Baseten UI work together.** Pause reconciliation per-resource to manage a deployment directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the `BasetenModel` custom resource.
+- **Separate ML platform ownership from model ownership.** 
+  - Model owners build, test, and tune models using the Baseten CLI or UI, then codify the working configuration as a `BasetenModel` custom resource. From that point the `BasetenModel` custom resource is version-controlled and auditable. 
+  - The ML platform team can own the operator and set common custom resource defaults for autoscaling, promotion, and cleanup. 
+  - Model owner access to production can be scoped down while the platform team retains UI access for incident response.
 
 ---
 
