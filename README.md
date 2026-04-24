@@ -14,14 +14,24 @@ A `BasetenModel` Kubernetes custom resource declares the desired state of a Base
 
 ## Why
 
-- **Use Kubernetes-native continuous delivery tooling (e.g., [Argo CD](https://argo-cd.readthedocs.io/en/stable/), [Flux](https://fluxcd.io/)).** No need to build dedicated tooling to manage models on Baseten.
-  - **Easily manage deployments across environments, regions, and tenants.** A single model may need to run across multiple environments (dev, staging, prod), regions (US, EU), and tenants (for subsets of customers). Each deployment is another Kubernetes custom resource in the same continuous delivery flow.
-  - **Easily manage deployments across in-house and managed inference providers.** ML teams often deploy the same model across in-house and managed infra providers. With the operator, Baseten deployments follow the same Kubernetes-based continuous delivery pattern as in-house infra running on Kubernetes.
-- **Built by and for ML platform teams.**
-  - **Separate platform ownership from model ownership.** Model owners build, test, and tune models using the Baseten CLI or UI, then codify the working configuration as a `BasetenModel` custom resource. From that point the `BasetenModel` custom resource is version-controlled and auditable. The ML platform team can own the operator and set common custom resource defaults for autoscaling, promotion, and cleanup. Model owner access to production can be scoped down while the platform team retains UI access for incident response.
-  - **Self-heal on transient failures.** Failed deployments (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`) are retried with exponential backoff for a fixed time window. Deployments marked `INACTIVE` by Baseten's TTL are automatically reactivated.
-  - **Prevent drift from click-ops.** Changes made directly in the Baseten UI are detected and reverted to match the `BasetenModel` custom resource. The custom resource remains the single source of truth.
-  - **Operator and Baseten UI work together.** Pause reconciliation per-resource to manage a deployment directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the `BasetenModel` custom resource.
+### Kubernetes-native continuous delivery
+
+Use Kubernetes-native continuous delivery tooling (e.g. [Argo CD](https://argo-cd.readthedocs.io/en/stable/), [Flux](https://fluxcd.io/)). No need to build dedicated tooling to manage models on Baseten. 
+
+**Easily manage deployments across:**
+
+- **environments, regions, and tenants.** A single model may need to run across multiple environments (dev, staging, prod), regions (US, EU), and tenants (for subsets of customers). Each deployment is another Kubernetes custom resource in the same continuous delivery flow.
+- **in-house and managed inference infra providers.** ML teams often deploy the same model across in-house and managed infra providers. With the operator, Baseten deployments follow the same Kubernetes-based continuous delivery pattern as in-house infra running on Kubernetes.
+
+### Built by and for ML platform teams
+
+- **Separate platform ownership from model ownership.** 
+  - Model owners build, test, and tune models using the Baseten CLI or UI, then codify the working configuration as a `BasetenModel` custom resource. From that point the `BasetenModel` custom resource is version-controlled and auditable. 
+  - The ML platform team can own the operator and set common custom resource defaults for autoscaling, promotion, and cleanup. 
+  - Model owner access to production can be scoped down while the platform team retains UI access for incident response.
+- **Self-heal on transient failures.** Failed deployments (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`) are retried with exponential backoff for a fixed time window. When a deployment attached to an environment is marked `INACTIVE` by Baseten's TTL, the operator reactivates it.
+- **Prevent drift from click-ops.** Changes made directly in the Baseten UI are detected and reverted to match the `BasetenModel` custom resource. The custom resource remains the single source of truth.
+- **Operator and Baseten UI work together.** Pause reconciliation per-resource to manage a deployment directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the `BasetenModel` custom resource.
 
 ---
 
