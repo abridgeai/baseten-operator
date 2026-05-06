@@ -15,6 +15,7 @@ const (
 	EventReconciliationPaused      = "ReconciliationPaused"
 	EventDeploymentRetried         = "DeploymentRetried"
 	EventDeploymentReactivated     = "DeploymentReactivated"
+	EventModelDeleted              = "ModelDeleted"
 
 	// Warning events
 	EventModelNotFound                 = "ModelNotFound"
@@ -29,4 +30,5 @@ const (
 	EventPromotionBlocked              = "PromotionBlocked"
 	EventDeploymentRetryFailed         = "DeploymentRetryFailed"
 	EventDeploymentRetryExhausted      = "DeploymentRetryExhausted"
+	EventModelDeleteFailed             = "ModelDeleteFailed"
 )

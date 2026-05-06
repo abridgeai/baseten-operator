@@ -504,6 +504,58 @@ func TestFindModelIDByName(t *testing.T) {
 	})
 }
 
+func TestDeleteModel(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete {
+				t.Errorf("expected DELETE, got %s", r.Method)
+			}
+			if r.URL.Path != "/models/model1" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		c := newTestClient(srv.URL)
+		if err := c.DeleteModel(context.Background(), "model1"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(t, w, http.StatusNotFound, "not found")
+		}))
+		defer srv.Close()
+
+		c := newTestClient(srv.URL)
+		err := c.DeleteModel(context.Background(), "model1")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !IsNotFoundError(err) {
+			t.Errorf("expected IsNotFoundError, got %v", err)
+		}
+	})
+
+	t.Run("server error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(t, w, http.StatusInternalServerError, "server error")
+		}))
+		defer srv.Close()
+
+		c := newTestClient(srv.URL)
+		err := c.DeleteModel(context.Background(), "model1")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if IsNotFoundError(err) {
+			t.Errorf("did not expect 404, got %v", err)
+		}
+	})
+}
+
 func TestFindDeploymentIDByName(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

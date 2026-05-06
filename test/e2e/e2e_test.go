@@ -181,6 +181,19 @@ var _ = Describe("Manager", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to send control command: "+action)
 	}
 
+	// queryMock sends a control action and returns the response body, for actions
+	// that return data (e.g. "get_model_deletes", "get_deployments").
+	queryMock := func(action string) string {
+		cmd := exec.Command("kubectl", "exec", "-n", namespace,
+			"deployment/mock-baseten-api", "--",
+			"wget", "-q", "-O-", "--post-data", fmt.Sprintf(`{"action":"%s"}`, action),
+			"--header", "Content-Type: application/json",
+			"http://localhost:8080/v1/_control")
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to query mock control: "+action)
+		return output
+	}
+
 	getStatus := func(name, jsonpath string) string {
 		cmd := exec.Command("kubectl", "get", "bm", name,
 			"-o", fmt.Sprintf("jsonpath={%s}", jsonpath), "-n", "default")
@@ -1179,6 +1192,107 @@ spec:
 			Expect(output).To(ContainSubstring("EnvironmentCreated"))
 			Expect(output).To(ContainSubstring("DeploymentPromoted"))
 			Expect(output).To(ContainSubstring("PromotionFailed"))
+		})
+
+		It("should leave the Baseten model untouched when deletionPolicy is Retain", func() {
+			By("applying a BasetenModel CR with explicit deletionPolicy: Retain")
+			cr := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-delete-retain
+  namespace: default
+spec:
+  modelName: "test-model"
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  deletionPolicy: Retain
+  environment:
+    name: "dev"`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cr)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the operator to add its finalizer")
+			Eventually(func(g Gomega) {
+				out := getStatus("e2e-delete-retain", ".metadata.finalizers")
+				g.Expect(out).To(ContainSubstring("models.baseten.com/finalizer"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+
+			By("waiting for promotion to start so status.modelID is populated")
+			Eventually(func(g Gomega) {
+				g.Expect(getStatus("e2e-delete-retain", ".status.modelID")).NotTo(BeEmpty())
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			controlMock("complete_promotion")
+
+			By("deleting the CR")
+			cmd = exec.Command("kubectl", "delete", "bm", "e2e-delete-retain", "-n", "default")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the CR to be fully removed")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "bm", "e2e-delete-retain", "-n", "default")
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred(), "expected CR to be gone")
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+
+			By("verifying the mock recorded zero DeleteModel calls")
+			out := queryMock("get_model_deletes")
+			Expect(out).To(ContainSubstring(`"deleted_model_ids":null`))
+		})
+
+		It("should cascade-delete the Baseten model when deletionPolicy is Delete", func() {
+			By("applying a BasetenModel CR with deletionPolicy: Delete")
+			cr := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-delete-cascade
+  namespace: default
+spec:
+  modelName: "test-model"
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  deletionPolicy: Delete
+  environment:
+    name: "dev"`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cr)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for promotion to start so status.modelID is populated")
+			Eventually(func(g Gomega) {
+				g.Expect(getStatus("e2e-delete-cascade", ".status.modelID")).To(Equal("model-001"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			controlMock("complete_promotion")
+
+			By("waiting for Ready=True so cleanup is happening from steady state")
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-delete-cascade", "Ready")).To(Equal("True"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("deleting the CR")
+			cmd = exec.Command("kubectl", "delete", "bm", "e2e-delete-cascade", "-n", "default")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the CR to be fully removed")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "bm", "e2e-delete-cascade", "-n", "default")
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred(), "expected CR to be gone")
+			}, 90*time.Second, 2*time.Second).Should(Succeed())
+
+			By("verifying the mock recorded a DeleteModel call for the resolved modelID")
+			out := queryMock("get_model_deletes")
+			Expect(out).To(ContainSubstring("model-001"))
+
+			By("verifying ModelDeleted event was emitted")
+			cmd = exec.Command("kubectl", "get", "events", "-n", "default",
+				"--field-selector", "involvedObject.name=e2e-delete-cascade",
+				"-o", "jsonpath={.items[*].reason}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("ModelDeleted"))
 		})
 	})
 })

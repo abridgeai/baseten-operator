@@ -1,0 +1,22 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: example-delete-cascade
+  namespace: default
+spec:
+  modelName: "my-llm-model"
+
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.3"
+
+  # Delete: kubectl delete bm cascades to Baseten — the operator calls
+  # DELETE /v1/models/{id} via finalizer, which removes the model and all
+  # its deployments + environments. Irreversible. Use with care.
+  deletionPolicy: Delete
+
+  environment:
+    name: "dev"
+
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 5
+      concurrencyTarget: 10
