@@ -73,6 +73,17 @@ spec:
           spec:
             description: spec defines the desired state of BasetenModel
             properties:
+              deletionPolicy:
+                default: Retain
+                description: |-
+                  DeletionPolicy controls cleanup of the upstream Baseten model when this CR is deleted.
+                  "Retain" (default): the Baseten model is left untouched; the CR vanishes.
+                  "Delete": the operator calls DELETE /v1/models/{model_id} before allowing the CR to be removed,
+                  which cascades to all deployments, environments, and promotion history under that model.
+                enum:
+                - Retain
+                - Delete
+                type: string
               environment:
                 description: Environment defines the target environment and its configuration
                 properties:

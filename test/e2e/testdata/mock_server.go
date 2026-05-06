@@ -57,10 +57,11 @@ type environment struct {
 }
 
 type state struct {
-	mu           sync.RWMutex
-	models       []model
-	deployments  map[string][]deployment // modelID -> deployments
-	environments map[string]*environment // modelID:envName -> environment
+	mu              sync.RWMutex
+	models          []model
+	deployments     map[string][]deployment // modelID -> deployments
+	environments    map[string]*environment // modelID:envName -> environment
+	deletedModelIDs []string                // recorded by DELETE /v1/models/{id} for test assertions
 }
 
 func newState() *state {
@@ -88,6 +89,7 @@ func (s *state) reset() {
 		},
 	}
 	s.environments = make(map[string]*environment)
+	s.deletedModelIDs = nil
 }
 
 func (s *state) envKey(modelID, envName string) string {
@@ -151,6 +153,33 @@ func main() {
 			}
 		}
 		http.Error(w, "deployment not found", http.StatusNotFound)
+	})
+
+	mux.HandleFunc("DELETE /v1/models/{model_id}", func(w http.ResponseWriter, r *http.Request) {
+		modelID := r.PathValue("model_id")
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		found := false
+		for i, m := range st.models {
+			if m.ID == modelID {
+				st.models = append(st.models[:i], st.models[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "model not found", http.StatusNotFound)
+			return
+		}
+		// Cascade: drop all deployments and environments under this model.
+		delete(st.deployments, modelID)
+		for k := range st.environments {
+			if strings.HasPrefix(k, modelID+":") {
+				delete(st.environments, k)
+			}
+		}
+		st.deletedModelIDs = append(st.deletedModelIDs, modelID)
+		w.WriteHeader(http.StatusOK)
 	})
 
 	mux.HandleFunc("DELETE /v1/models/{model_id}/deployments/{dep_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -423,6 +452,19 @@ func main() {
 			deps := st.deployments[modelID]
 			writeJSON(w, http.StatusOK, map[string]interface{}{"deployments": deps})
 			return
+		case "get_model_deletes":
+			// Return the list of model IDs that have been deleted via DELETE /v1/models/{id},
+			// for test assertions about cascading-delete behavior.
+			writeJSON(w, http.StatusOK, map[string]interface{}{"deleted_model_ids": st.deletedModelIDs})
+			return
+		case "force_model_delete_failure":
+			// Pre-delete the model so the next DeleteModel call returns 404.
+			for i, m := range st.models {
+				if m.ID == modelID {
+					st.models = append(st.models[:i], st.models[i+1:]...)
+					break
+				}
+			}
 		case "setup_cleanup_test":
 			// Add orphan deployments for cleanup e2e test
 			// After complete_promotion on "dev", the env has a current deployment.

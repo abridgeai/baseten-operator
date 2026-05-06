@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -47,6 +48,8 @@ const (
 	statusTrussPushing        = "TRUSS_PUSHING"
 	statusTrussPushDone       = "TRUSS_PUSH_DONE"
 	statusPaused              = "PAUSED"
+	statusDeleting            = "DELETING"
+	statusDeleteFailed        = "DELETE_FAILED"
 
 	conditionReady       = "Ready"
 	conditionProgressing = "Progressing"
@@ -113,9 +116,11 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Pause check: skip all reconciliation when paused
-	if model.Spec.Paused {
-		return r.reconcilePaused(ctx, model)
+	// Lifecycle prelude: pause is authoritative (skips everything, including deletion);
+	// otherwise handle DeletionTimestamp / ensure finalizer. handled=true means stop
+	// reconciling and let the next watch event drive things.
+	if handled, result, err := r.reconcileLifecycle(ctx, model); handled {
+		return result, err
 	}
 
 	// Step 1: Resolve model ID (cached in status after first lookup)
@@ -571,7 +576,96 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 	return deleted, names
 }
 
-func (r *BasetenModelReconciler) reconcilePaused(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
+// reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel: paused
+// short-circuit, deletion handling when DeletionTimestamp is set, and adding the
+// finalizer on first reconcile. Pause is authoritative — paused CRs are not deleted
+// even when DeletionTimestamp is set; they sit in Terminating until unpaused.
+// Returns handled=true when reconciliation should stop and let the next watch event
+// drive things; handled=false means the CR is in steady state and normal
+// reconciliation can continue.
+func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *modelsv1alpha1.BasetenModel) (bool, ctrl.Result, error) {
+	if model.Spec.Paused {
+		r.reconcilePaused(ctx, model)
+		return true, ctrl.Result{}, nil
+	}
+	if !model.DeletionTimestamp.IsZero() {
+		result, err := r.reconcileDeletion(ctx, model)
+		return true, result, err
+	}
+	if !controllerutil.AddFinalizer(model, modelsv1alpha1.FinalizerName) {
+		return false, ctrl.Result{}, nil
+	}
+	if err := r.Update(ctx, model); err != nil && !errors.IsConflict(err) {
+		return true, ctrl.Result{}, err
+	}
+	return true, ctrl.Result{}, nil
+}
+
+// reconcileDeletion handles the CR's termination when DeletionTimestamp is set.
+// With DeletionPolicyRetain (default), the finalizer is released immediately and the
+// upstream Baseten model is left untouched. With DeletionPolicyDelete, the operator
+// calls DeleteModel against the cached status.modelID; on success the finalizer is
+// released, on non-404 error reconcile requeues 30s and retries forever (the lingering
+// Terminating CR is the signal that something needs attention).
+func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	if !controllerutil.ContainsFinalizer(model, modelsv1alpha1.FinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	policy := model.Spec.DeletionPolicy
+	if policy == "" {
+		policy = modelsv1alpha1.DeletionPolicyRetain
+	}
+
+	if policy != modelsv1alpha1.DeletionPolicyDelete {
+		logger.Info("Releasing finalizer (deletionPolicy Retain)", "model", model.Name)
+		return r.releaseFinalizer(ctx, model)
+	}
+
+	modelID := model.Status.ModelID
+	if modelID == "" {
+		logger.Info("Releasing finalizer (deletionPolicy Delete but status.modelID empty)", "model", model.Name)
+		return r.releaseFinalizer(ctx, model)
+	}
+
+	r.logUpdateStatus(ctx, model, statusUpdate{
+		deploymentStatus: statusDeleting,
+		message:          fmt.Sprintf("deleting Baseten model %s", modelID),
+		modelID:          modelID,
+	})
+
+	if err := r.BasetenClient.DeleteModel(ctx, modelID); err != nil {
+		if baseten.IsNotFoundError(err) {
+			logger.Info("Baseten model already deleted (404), releasing finalizer", "modelID", modelID)
+			r.Recorder.Eventf(model, corev1.EventTypeNormal, EventModelDeleted, "Baseten model %s already deleted (404)", modelID)
+			return r.releaseFinalizer(ctx, model)
+		}
+		logger.Error(err, "Failed to delete Baseten model", "modelID", modelID)
+		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelDeleteFailed, "Failed to delete Baseten model %s: %v", modelID, err)
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus: statusDeleteFailed,
+			message:          fmt.Sprintf("failed to delete Baseten model %s: %v", modelID, err),
+			modelID:          modelID,
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	logger.Info("Deleted Baseten model, releasing finalizer", "modelID", modelID)
+	r.Recorder.Eventf(model, corev1.EventTypeNormal, EventModelDeleted, "Deleted Baseten model %s", modelID)
+	return r.releaseFinalizer(ctx, model)
+}
+
+// releaseFinalizer removes the operator's finalizer and persists the change.
+// Swallows NotFound errors that arise when controller-runtime fires a second
+// reconcile after the CR has already been GC'd by a prior reconcile's
+// finalizer-clear — the cleanup goal is achieved either way.
+func (r *BasetenModelReconciler) releaseFinalizer(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
+	controllerutil.RemoveFinalizer(model, modelsv1alpha1.FinalizerName)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, model))
+}
+
+func (r *BasetenModelReconciler) reconcilePaused(ctx context.Context, model *modelsv1alpha1.BasetenModel) {
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciliation paused", "name", model.Name)
 
@@ -590,7 +684,6 @@ func (r *BasetenModelReconciler) reconcilePaused(ctx context.Context, model *mod
 		deploymentStatus: statusPaused,
 		message:          msg,
 	})
-	return ctrl.Result{}, nil
 }
 
 // handleCandidateFailure handles a candidate deployment in terminal failure state.
@@ -1277,7 +1370,7 @@ func steadyStateMessage(dep *baseten.Deployment, envName string, autoscaling *ba
 
 func isProgressingStatus(status string) bool {
 	switch status {
-	case statusPromoting, statusPromotingDeployment, statusPending,
+	case statusPromoting, statusPromotingDeployment, statusPending, statusDeleting,
 		baseten.DeploymentStatusActivating,
 		baseten.DeploymentStatusBuilding,
 		baseten.DeploymentStatusDeploying,

@@ -38,3 +38,7 @@ dist/
 
 # Design documents (local reference only)
 docs/design/
+
+# Per-developer local scratch (truss configs for kind-dev test models, recreate
+# scripts, anything you don't want to commit). Stays on your machine.
+.local/

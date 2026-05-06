@@ -57,6 +57,7 @@ func IsNotFoundError(err error) bool {
 // ClientInterface defines the contract for interacting with the Baseten API.
 type ClientInterface interface {
 	FindModelIDByName(ctx context.Context, modelName string) (string, error)
+	DeleteModel(ctx context.Context, modelID string) error
 	GetEnvironment(ctx context.Context, modelID, envName string) (*Environment, error)
 	ListEnvironments(ctx context.Context, modelID string) ([]Environment, error)
 	CreateEnvironment(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error
@@ -256,6 +257,22 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName string) (strin
 	}
 
 	return "", nil
+}
+
+// DeleteModel deletes a Baseten model and cascades to all deployments and environments under it.
+func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
+	req, err := c.newRequest(ctx, "DELETE", fmt.Sprintf("%s/models/%s", c.baseURL, modelID), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.doRequest(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return nil
 }
 
 // FindDeploymentIDByName lists all deployments (GET /v1/models/{id}/deployments) and returns the ID and status matching deploymentName.

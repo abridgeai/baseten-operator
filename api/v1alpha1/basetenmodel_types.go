@@ -21,6 +21,22 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// FinalizerName is the finalizer added to BasetenModel resources so the operator
+// can perform cleanup before the resource is removed.
+const FinalizerName = "models.baseten.com/finalizer"
+
+// DeletionPolicy controls what happens to the upstream Baseten model when the
+// BasetenModel CR is deleted.
+// +kubebuilder:validation:Enum=Retain;Delete
+type DeletionPolicy string
+
+const (
+	// DeletionPolicyRetain leaves the Baseten model intact when the CR is deleted (default).
+	DeletionPolicyRetain DeletionPolicy = "Retain"
+	// DeletionPolicyDelete removes the Baseten model when the CR is deleted.
+	DeletionPolicyDelete DeletionPolicy = "Delete"
+)
+
 // BasetenModelSpec defines the desired state of BasetenModel.
 // Exactly one of sourceDeploymentName or trussConfig must be specified.
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
@@ -60,6 +76,14 @@ type BasetenModelSpec struct {
 	// calls are made and the last known status is preserved in the message.
 	// +optional
 	Paused bool `json:"paused,omitempty"`
+
+	// DeletionPolicy controls cleanup of the upstream Baseten model when this CR is deleted.
+	// "Retain" (default): the Baseten model is left untouched; the CR vanishes.
+	// "Delete": the operator calls DELETE /v1/models/{model_id} before allowing the CR to be removed,
+	// which cascades to all deployments, environments, and promotion history under that model.
+	// +optional
+	// +kubebuilder:default=Retain
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // TrussConfig defines the truss configuration for creating a deployment.

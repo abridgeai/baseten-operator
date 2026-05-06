@@ -140,11 +140,16 @@ var _ = Describe("BasetenModel Controller", func() {
 			testSourceDep    = "img-1.0-wgt-1.0-p-1.2"
 		)
 
+		// newTestModel returns a fixture with the operator's finalizer pre-attached so
+		// that tests skip the finalizer-add early-return on first reconcile and exercise
+		// real reconcile logic. The "Deletion handling" Describe block builds its own
+		// fixtures (without this finalizer) when it needs to test the add path itself.
 		newTestModel := func(name string) *modelsv1alpha1.BasetenModel {
 			return &modelsv1alpha1.BasetenModel{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
-					Namespace: "default",
+					Name:       name,
+					Namespace:  "default",
+					Finalizers: []string{modelsv1alpha1.FinalizerName},
 				},
 				Spec: modelsv1alpha1.BasetenModelSpec{
 					ModelName:            testModelName,
@@ -2439,8 +2444,9 @@ var _ = Describe("BasetenModel Controller", func() {
 			newTrussConfigModel := func(name string) *modelsv1alpha1.BasetenModel {
 				return &modelsv1alpha1.BasetenModel{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      name,
-						Namespace: "default",
+						Name:       name,
+						Namespace:  "default",
+						Finalizers: []string{modelsv1alpha1.FinalizerName},
 					},
 					Spec: modelsv1alpha1.BasetenModelSpec{
 						ModelName: testModelName,
@@ -2793,6 +2799,246 @@ var _ = Describe("BasetenModel Controller", func() {
 				result, err := reconcileByName("non-existent-resource")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result).To(Equal(ctrl.Result{}))
+			})
+		})
+
+		Describe("Deletion handling", func() {
+			// Helper that drives reconcile loops until the CR is gone (finalizer cleared
+			// and k8s GC has removed it). Bounded so tests fail fast on stuck finalizers.
+			reconcileUntilGone := func(name string) {
+				for i := 0; i < 5; i++ {
+					_, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					model := &modelsv1alpha1.BasetenModel{}
+					if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model); errors.IsNotFound(err) {
+						return
+					}
+				}
+				Fail(fmt.Sprintf("CR %s still present after 5 reconciles", name))
+			}
+
+			It("adds the finalizer on first reconcile and short-circuits real reconcile", func() {
+				name := "deletion-finalizer-add"
+				model := newTestModel(name)
+				model.Finalizers = nil // exercise the finalizer-add path
+				defer cleanupModel(name)
+
+				findCalled := false
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					findCalled = true
+					return testModelID, nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(findCalled).To(BeFalse(), "Reconcile should short-circuit after adding finalizer; the watch event triggers the next reconcile")
+
+				got := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				Expect(got.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+			})
+
+			It("with deletionPolicy Retain releases finalizer with no API call on delete", func() {
+				name := "deletion-retain"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyRetain
+				defer cleanupModel(name)
+
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel should not be called when policy is Retain")
+					return nil
+				}
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+			})
+
+			It("with deletionPolicy unset defaults to Retain", func() {
+				name := "deletion-default-retain"
+				model := newTestModel(name)
+				// DeletionPolicy intentionally unset
+				defer cleanupModel(name)
+
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel should not be called when policy is unset (defaults to Retain)")
+					return nil
+				}
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+			})
+
+			It("with deletionPolicy Delete calls DeleteModel and clears finalizer on success", func() {
+				name := "deletion-delete-happy"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+
+				deleteCalls := 0
+				var deletedModelID string
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					deleteCalls++
+					deletedModelID = modelID
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+				Expect(deleteCalls).To(Equal(1))
+				Expect(deletedModelID).To(Equal(testModelID))
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelDeleted")))
+			})
+
+			It("with deletionPolicy Delete treats 404 as success", func() {
+				name := "deletion-delete-404"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					return &baseten.APIError{StatusCode: 404, Message: "not found"}
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelDeleted")))
+			})
+
+			It("with deletionPolicy Delete requeues on 5xx and emits ModelDeleteFailed", func() {
+				name := "deletion-delete-5xx"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					return &baseten.APIError{StatusCode: 500, Message: "boom"}
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				// CR still exists in Terminating with finalizer attached.
+				got := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				Expect(got.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+				Expect(got.Status.DeploymentStatus).To(Equal(statusDeleteFailed))
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelDeleteFailed")))
+			})
+
+			It("with deletionPolicy Delete and empty status.modelID releases finalizer with no API call", func() {
+				name := "deletion-delete-no-modelid"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel should not be called when status.modelID is empty")
+					return nil
+				}
+
+				// Create the CR with finalizer pre-attached but never run a successful
+				// reconcile, so status.ModelID stays empty.
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+			})
+
+			It("does not run deletion handler when paused (CR sits in Terminating)", func() {
+				name := "deletion-paused"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				deleteCalls := 0
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					deleteCalls++
+					return nil
+				}
+
+				// Bring CR up to ACTIVE with finalizer and status.ModelID populated.
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
+
+				// Pause the CR, then delete it. Pause must short-circuit before deletion runs.
+				got := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				got.Spec.Paused = true
+				Expect(k8sClient.Update(ctx, got)).To(Succeed())
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, got)).To(Succeed())
+
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(deleteCalls).To(Equal(0), "DeleteModel must not be called while paused")
+
+				// CR still present (Terminating) with finalizer attached.
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusPaused))
+
+				// Unpause: deletion handler runs and clears finalizer.
+				stuck.Spec.Paused = false
+				Expect(k8sClient.Update(ctx, stuck)).To(Succeed())
+				reconcileUntilGone(name)
+				Expect(deleteCalls).To(Equal(1), "DeleteModel should be called exactly once after unpause")
 			})
 		})
 	})
