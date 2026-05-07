@@ -3407,7 +3407,10 @@ var _ = Describe("BasetenModel Controller", func() {
 				reconcileUntilGone(name)
 			})
 
-			It("does not run deletion handler when paused (CR sits in Terminating)", func() {
+			It("with mode Pause bypasses DeleteModel even when deletionPolicy Delete", func() {
+				// Pause never mutates Baseten. CR delete on a paused CR releases
+				// the finalizer immediately so k8s GC can complete; DeleteModel
+				// is not called regardless of deletionPolicy.
 				name := "deletion-paused"
 				model := newTestModel(name)
 				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
@@ -3418,9 +3421,8 @@ var _ = Describe("BasetenModel Controller", func() {
 					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
 					nil,
 				)
-				deleteCalls := 0
 				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
-					deleteCalls++
+					Fail("DeleteModel must not be called for Pause-mode CR even with deletionPolicy: Delete")
 					return nil
 				}
 
@@ -3431,30 +3433,80 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
 
-				// Pause the CR, then delete it. Pause must short-circuit before deletion runs.
+				// Pause the CR, then delete it. Finalizer should release without
+				// touching Baseten — CR vanishes after k8s GC.
 				got := &modelsv1alpha1.BasetenModel{}
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
-				got.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
+				got.Spec.Mode = modelsv1alpha1.ModePause
 				Expect(k8sClient.Update(ctx, got)).To(Succeed())
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
 				Expect(k8sClient.Delete(ctx, got)).To(Succeed())
 
+				reconcileUntilGone(name)
+			})
+
+			It("with mode Observe bypasses DeleteModel even when deletionPolicy Delete", func() {
+				// Observe never mutates Baseten. In a multi-region setup,
+				// deleting a secondary's Observe CR (e.g., decommissioning)
+				// must not call DeleteModel and take down the model the primary
+				// is still managing.
+				name := "deletion-observe-bypasses-delete"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				model.Status.ModelID = testModelID
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not be called for Observe-mode CR even with deletionPolicy: Delete")
+					return nil
+				}
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+			})
+
+			It("mode flip from Reconcile to Observe before delete bypasses DeleteModel", func() {
+				// Models the multi-region decommissioning flow: a CR was set up
+				// in Reconcile mode (finalizer added, modelID resolved), the user
+				// flips it to Observe to step it down to read-only, then deletes
+				// the CR. The flip is what protects the upstream model from
+				// being deleted on cleanup.
+				name := "deletion-flip-reconcile-to-observe"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not be called after flipping to Observe mode")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
 				_, err = reconcileByName(name)
 				Expect(err).NotTo(HaveOccurred())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
 
-				Expect(deleteCalls).To(Equal(0), "DeleteModel must not be called while paused")
+				got := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				got.Spec.Mode = modelsv1alpha1.ModeObserve
+				Expect(k8sClient.Update(ctx, got)).To(Succeed())
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, got)).To(Succeed())
 
-				// CR still present (Terminating) with finalizer attached.
-				stuck := &modelsv1alpha1.BasetenModel{}
-				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
-				Expect(stuck.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
-				Expect(stuck.Status.DeploymentStatus).To(Equal(statusPaused))
-
-				// Unpause: deletion handler runs and clears finalizer.
-				stuck.Spec.Paused = false //nolint:staticcheck // testing the deprecated field's back-compat behavior
-				Expect(k8sClient.Update(ctx, stuck)).To(Succeed())
 				reconcileUntilGone(name)
-				Expect(deleteCalls).To(Equal(1), "DeleteModel should be called exactly once after unpause")
 			})
 		})
 	})

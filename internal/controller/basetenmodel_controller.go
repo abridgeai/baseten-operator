@@ -581,21 +581,22 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 	return deleted, names
 }
 
-// reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel: paused
-// short-circuit, deletion handling when DeletionTimestamp is set, and adding the
-// finalizer on first reconcile. Pause is authoritative — paused CRs are not deleted
-// even when DeletionTimestamp is set; they sit in Terminating until unpaused.
-// Returns handled=true when reconciliation should stop and let the next watch event
-// drive things; handled=false means the CR is in steady state and normal
+// reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel:
+// deletion handling, paused short-circuit, and finalizer add. Deletion is
+// always allowed to proceed regardless of mode (so a paused or observe CR can
+// be cleanly removed); reconcileDeletion is mode-aware and only calls
+// DeleteModel in Reconcile mode with deletionPolicy: Delete.
+// Returns handled=true when reconciliation should stop and let the next watch
+// event drive things; handled=false means the CR is in steady state and normal
 // reconciliation can continue.
 func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *modelsv1alpha1.BasetenModel) (bool, ctrl.Result, error) {
-	if effectiveMode(model) == modelsv1alpha1.ModePause {
-		r.reconcilePaused(ctx, model)
-		return true, ctrl.Result{}, nil
-	}
 	if !model.DeletionTimestamp.IsZero() {
 		result, err := r.reconcileDeletion(ctx, model)
 		return true, result, err
+	}
+	if effectiveMode(model) == modelsv1alpha1.ModePause {
+		r.reconcilePaused(ctx, model)
+		return true, ctrl.Result{}, nil
 	}
 	if !controllerutil.AddFinalizer(model, modelsv1alpha1.FinalizerName) {
 		return false, ctrl.Result{}, nil
@@ -607,24 +608,32 @@ func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *
 }
 
 // reconcileDeletion handles the CR's termination when DeletionTimestamp is set.
-// With DeletionPolicyRetain (default), the finalizer is released immediately and the
-// upstream Baseten model is left untouched. With DeletionPolicyDelete, the operator
-// calls DeleteModel against the cached status.modelID; on success the finalizer is
-// released, on non-404 error reconcile requeues 30s and retries forever (the lingering
-// Terminating CR is the signal that something needs attention).
+// DeleteModel is only called for CRs that are simultaneously in Reconcile mode
+// AND have deletionPolicy: Delete; every other combination (Pause, Observe, or
+// Reconcile + Retain) just releases the finalizer so k8s can GC the CR without
+// mutating Baseten. This matters when a CR's mode is flipped mid-flight (e.g.,
+// Reconcile → Observe to decommission a secondary region): the prior Reconcile
+// state should not cause DeleteModel to fire on the eventual delete.
+// On Reconcile + Delete, the operator calls DeleteModel against the cached
+// status.modelID; on success the finalizer is released, on non-404 error
+// reconcile requeues 30s and retries forever (the lingering Terminating CR is
+// the signal that something needs attention).
 func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	if !controllerutil.ContainsFinalizer(model, modelsv1alpha1.FinalizerName) {
 		return ctrl.Result{}, nil
 	}
 
+	mode := effectiveMode(model)
 	policy := model.Spec.DeletionPolicy
 	if policy == "" {
 		policy = modelsv1alpha1.DeletionPolicyRetain
 	}
 
-	if policy != modelsv1alpha1.DeletionPolicyDelete {
-		logger.Info("Releasing finalizer (deletionPolicy Retain)", "model", model.Name)
+	// Only Reconcile + Delete actually mutates Baseten.
+	if mode != modelsv1alpha1.ModeReconcile || policy != modelsv1alpha1.DeletionPolicyDelete {
+		logger.Info("Releasing finalizer (no Baseten mutation)",
+			"model", model.Name, "mode", mode, "deletionPolicy", policy)
 		return r.releaseFinalizer(ctx, model)
 	}
 
