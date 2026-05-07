@@ -37,6 +37,29 @@ const (
 	DeletionPolicyDelete DeletionPolicy = "Delete"
 )
 
+// ReconcileMode controls the operator's behavior for a BasetenModel CR.
+// +kubebuilder:validation:Enum=Reconcile;Observe;Pause
+type ReconcileMode string
+
+const (
+	// ModeReconcile (default) is the normal active behavior: the operator
+	// reads desired state, reconciles drift, promotes deployments, retries
+	// failures, and runs orphan cleanup.
+	ModeReconcile ReconcileMode = "Reconcile"
+
+	// ModeObserve makes the operator read-only. It still reads Baseten state
+	// and refreshes status (including detected drift) but never mutates:
+	// no creates, promotions, updates, deletes, or truss pushes. Useful for
+	// secondary regions in a multi-region setup so they remain a single pane
+	// of glass and can be flipped to Reconcile on failover.
+	ModeObserve ReconcileMode = "Observe"
+
+	// ModePause is equivalent to spec.paused: true. No API calls, no requeue,
+	// last known status preserved. Provided here so spec.paused can be
+	// retired in a future API version.
+	ModePause ReconcileMode = "Pause"
+)
+
 // BasetenModelSpec defines the desired state of BasetenModel.
 // Exactly one of sourceDeploymentName or trussConfig must be specified.
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
@@ -70,10 +93,24 @@ type BasetenModelSpec struct {
 	// +optional
 	OrphanDeploymentCleanup *OrphanDeploymentCleanupConfig `json:"orphanDeploymentCleanup,omitempty"`
 
+	// Mode controls the operator's behavior for this resource. One of:
+	//   - Reconcile (default): normal active reconciliation.
+	//   - Observe: read-only; reports state and drift without mutating Baseten.
+	//   - Pause: equivalent to spec.paused: true.
+	// In a multi-region setup, set Reconcile in exactly one region and Observe
+	// in the others to retain visibility without dual-writes. Failover by
+	// flipping a region to Reconcile via GitOps.
+	// +optional
+	Mode ReconcileMode `json:"mode,omitempty"`
+
 	// Paused stops the controller from reconciling this resource.
 	// Use this during emergencies or click-ops to prevent the operator from making
 	// changes while you configure manually in the Baseten UI. When paused, no API
 	// calls are made and the last known status is preserved in the message.
+	//
+	// Deprecated: prefer spec.mode: Pause. spec.paused: true continues to work and
+	// is treated as Pause regardless of spec.mode. Will be removed in a future
+	// API version.
 	// +optional
 	Paused bool `json:"paused,omitempty"`
 
@@ -498,6 +535,7 @@ type BasetenModelStatus struct {
 // +kubebuilder:printcolumn:name="Active_Deployment",type=string,JSONPath=`.status.activeDeploymentName`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.activeReplicaCount`
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.deploymentStatus`
+// +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.spec.mode`
 // +kubebuilder:printcolumn:name="Paused",type=boolean,JSONPath=`.spec.paused`
 // +kubebuilder:printcolumn:name="Source_Deployment",type=string,JSONPath=`.spec.sourceDeploymentName`
 // +kubebuilder:printcolumn:name="Candidate_Deployment",type=string,JSONPath=`.status.candidateDeploymentName`

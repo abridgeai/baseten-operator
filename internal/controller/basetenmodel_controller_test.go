@@ -244,7 +244,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			It("should skip all API calls and return empty result when paused", func() {
 				name := "paused-no-api"
 				model := newTestModel(name)
-				model.Spec.Paused = true
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
 				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
@@ -264,7 +264,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			It("should set Ready=False and Progressing=False when paused", func() {
 				name := "paused-conditions"
 				model := newTestModel(name)
-				model.Spec.Paused = true
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
 				_, err := reconcileModel(model)
@@ -295,7 +295,7 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				// Now pause
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
-				model.Spec.Paused = true
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				Expect(k8sClient.Update(ctx, model)).To(Succeed())
 
 				_, err := reconcileByName(name)
@@ -309,7 +309,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			It("should emit ReconciliationPaused event only on first pause", func() {
 				name := "paused-event-once"
 				model := newTestModel(name)
-				model.Spec.Paused = true
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
 				// First reconcile — should emit event
@@ -328,7 +328,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			It("should resume normal reconciliation when unpaused", func() {
 				name := "paused-then-resume"
 				model := newTestModel(name)
-				model.Spec.Paused = true
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
 				// Reconcile while paused
@@ -340,7 +340,7 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				// Unpause
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
-				model.Spec.Paused = false
+				model.Spec.Paused = false //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				Expect(k8sClient.Update(ctx, model)).To(Succeed())
 
 				// Set up mocks for normal reconciliation
@@ -357,6 +357,254 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				status = getModelStatus(name)
 				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+			})
+		})
+
+		Describe("Observe Mode", func() {
+			// Sets all mock-mutation functions to Fail() so we can assert that
+			// nothing was mutated in any Observe-mode test, regardless of which
+			// path was exercised.
+			expectNoMutations := func() {
+				mockClient.CreateEnvironmentFunc = func(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error {
+					Fail("CreateEnvironment must not be called in Observe mode")
+					return nil
+				}
+				mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
+					Fail("UpdateEnvironmentSettings must not be called in Observe mode")
+					return nil
+				}
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, deploymentID, targetEnv string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					Fail("Promote must not be called in Observe mode")
+					return nil, nil
+				}
+				mockClient.ActivateDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) error {
+					Fail("ActivateDeployment must not be called in Observe mode")
+					return nil
+				}
+				mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+					Fail("RetryDeployment must not be called in Observe mode")
+					return nil, nil
+				}
+				mockClient.DeleteDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) error {
+					Fail("DeleteDeployment must not be called in Observe mode")
+					return nil
+				}
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
+					Fail("UpdateDeploymentAutoscaling must not be called in Observe mode")
+					return nil
+				}
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					Fail("truss push must not be called in Observe mode")
+					return nil, nil
+				}
+			}
+
+			It("should reflect steady-state Baseten state without mutating anything", func() {
+				name := "observe-steady"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+					nil,
+				)
+				expectNoMutations()
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+				Expect(status.Message).To(ContainSubstring("active: " + testSourceDep + ".123 (3 replicas"))
+				Expect(status.Message).NotTo(ContainSubstring("drift"))
+				Expect(status.ActiveDeploymentName).To(Equal(testSourceDep + ".123"))
+
+				ready := getCondition(status.Conditions, "Ready")
+				Expect(ready).NotTo(BeNil())
+				Expect(ready.Status).To(Equal(metav1.ConditionTrue), "Ready=True for ACTIVE observed state")
+			})
+
+			It("should surface drift in the status message without correcting it", func() {
+				name := "observe-drift"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				model.Spec.Environment.Autoscaling.MinReplicas = ptr(int32(2))
+				defer cleanupModel(name)
+
+				mockModelFound()
+				// Env's autoscaling has min=0 (per testAutoscalingSettings) — diverges from spec min=2
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 5},
+					nil,
+				)
+				expectNoMutations()
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.Message).To(ContainSubstring("drift:"))
+				Expect(status.Message).To(ContainSubstring("minReplicas"))
+				Expect(status.Message).To(ContainSubstring("awaiting reconciliation"))
+			})
+
+			It("should reflect promotion in progress without calling Promote", func() {
+				name := "observe-promoting"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: "img-old-wgt-old-p-old.111", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+					&baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusBuilding, ActiveReplicaCount: 0},
+				)
+				expectNoMutations()
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusBuilding))
+				Expect(status.Message).To(ContainSubstring("promoting:"))
+				Expect(status.CandidateDeploymentName).To(Equal(testSourceDep + ".222"))
+			})
+
+			It("should report not-yet-promoted state without promoting", func() {
+				name := "observe-not-yet-promoted"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: "img-old-wgt-old-p-old.111", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+					nil,
+				)
+				expectNoMutations()
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.Message).To(ContainSubstring("spec source: " + testSourceDep))
+				Expect(status.Message).To(ContainSubstring("not yet promoted"))
+				Expect(status.Message).To(ContainSubstring("awaiting reconciliation"))
+			})
+
+			It("should report missing model without creating it", func() {
+				name := "observe-model-missing"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				expectNoMutations()
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).To(ContainSubstring("observe mode does not create"))
+			})
+
+			It("should report missing environment without creating it", func() {
+				name := "observe-env-missing"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "not found"}
+				}
+				expectNoMutations()
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).To(ContainSubstring("environment \"dev\" does not exist"))
+				Expect(status.Message).To(ContainSubstring("observe mode does not create"))
+			})
+
+			It("should not push truss config when model is missing under Observe mode", func() {
+				name := "observe-truss-no-push"
+				model := &modelsv1alpha1.BasetenModel{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       name,
+						Namespace:  "default",
+						Finalizers: []string{modelsv1alpha1.FinalizerName},
+					},
+					Spec: modelsv1alpha1.BasetenModelSpec{
+						ModelName: testModelName,
+						Mode:      modelsv1alpha1.ModeObserve,
+						TrussConfig: &modelsv1alpha1.TrussConfig{
+							Resources: modelsv1alpha1.TrussResources{Accelerator: "H100:1"},
+							BaseImage: modelsv1alpha1.TrussBaseImage{Image: "test:latest"},
+						},
+						Environment: modelsv1alpha1.EnvironmentConfig{
+							Name: testEnvName,
+						},
+					},
+				}
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				expectNoMutations()
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.Message).To(ContainSubstring("observe mode does not create"))
+			})
+
+			It("treats spec.mode=Pause the same as spec.paused=true", func() {
+				name := "observe-pause-mode"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModePause
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					Fail("Pause mode must not call FindModelIDByName")
+					return "", nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal("PAUSED"))
+			})
+
+			It("spec.paused=true wins over spec.mode=Observe", func() {
+				name := "observe-paused-precedence"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					Fail("paused=true must short-circuit before Observe path")
+					return "", nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal("PAUSED"))
 			})
 		})
 
@@ -3018,7 +3266,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				// Pause the CR, then delete it. Pause must short-circuit before deletion runs.
 				got := &modelsv1alpha1.BasetenModel{}
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
-				got.Spec.Paused = true
+				got.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				Expect(k8sClient.Update(ctx, got)).To(Succeed())
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
 				Expect(k8sClient.Delete(ctx, got)).To(Succeed())
@@ -3035,7 +3283,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(stuck.Status.DeploymentStatus).To(Equal(statusPaused))
 
 				// Unpause: deletion handler runs and clears finalizer.
-				stuck.Spec.Paused = false
+				stuck.Spec.Paused = false //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				Expect(k8sClient.Update(ctx, stuck)).To(Succeed())
 				reconcileUntilGone(name)
 				Expect(deleteCalls).To(Equal(1), "DeleteModel should be called exactly once after unpause")

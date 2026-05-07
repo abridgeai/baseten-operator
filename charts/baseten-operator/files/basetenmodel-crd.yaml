@@ -32,6 +32,9 @@ spec:
     - jsonPath: .status.deploymentStatus
       name: Status
       type: string
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
     - jsonPath: .spec.paused
       name: Paused
       type: boolean
@@ -223,6 +226,20 @@ spec:
                 required:
                 - name
                 type: object
+              mode:
+                description: |-
+                  Mode controls the operator's behavior for this resource. One of:
+                    - Reconcile (default): normal active reconciliation.
+                    - Observe: read-only; reports state and drift without mutating Baseten.
+                    - Pause: equivalent to spec.paused: true.
+                  In a multi-region setup, set Reconcile in exactly one region and Observe
+                  in the others to retain visibility without dual-writes. Failover by
+                  flipping a region to Reconcile via GitOps.
+                enum:
+                - Reconcile
+                - Observe
+                - Pause
+                type: string
               modelName:
                 description: ModelName references an existing Baseten model
                 minLength: 1
@@ -270,6 +287,10 @@ spec:
                   Use this during emergencies or click-ops to prevent the operator from making
                   changes while you configure manually in the Baseten UI. When paused, no API
                   calls are made and the last known status is preserved in the message.
+
+                  Deprecated: prefer spec.mode: Pause. spec.paused: true continues to work and
+                  is treated as Pause regardless of spec.mode. Will be removed in a future
+                  API version.
                 type: boolean
               sourceDeploymentName:
                 description: |-

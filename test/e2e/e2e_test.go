@@ -1036,6 +1036,79 @@ spec:
 			Expect(output).To(ContainSubstring("ReconciliationPaused"))
 		})
 
+		It("should observe Baseten state in Observe mode without mutating", func() {
+			resetMock()
+
+			By("seeding the environment via a Reconcile-mode CR (so a deployment is active)")
+			seed := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-observe-seed
+  namespace: default
+spec:
+  modelName: "test-model"
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  environment:
+    name: "dev"`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(seed)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for promotion to start, then completing it")
+			Eventually(func(g Gomega) {
+				g.Expect(getStatus("e2e-observe-seed", ".status.deploymentStatus")).To(Equal("PROMOTING"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			controlMock("complete_promotion")
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-observe-seed", "Ready")).To(Equal("True"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("applying an Observe-mode CR pointing to the same model+environment")
+			observer := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-observe-secondary
+  namespace: default
+spec:
+  modelName: "test-model"
+  mode: Observe
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  environment:
+    name: "dev"`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(observer)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the observer reports Ready=True for the observed ACTIVE deployment")
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-observe-secondary", "Ready")).To(Equal("True"))
+				g.Expect(getStatus("e2e-observe-secondary", ".status.deploymentStatus")).To(Equal("ACTIVE"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("verifying no mutation events were emitted (no Promote, AutoscalingUpdated, etc.)")
+			cmd = exec.Command("kubectl", "get", "events", "-n", "default",
+				"--field-selector", "involvedObject.name=e2e-observe-secondary",
+				"-o", "jsonpath={.items[*].reason}")
+			events, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			for _, mutationEvent := range []string{"DeploymentPromoted", "AutoscalingUpdated", "PromotionSettingsUpdated", "EnvironmentCreated", "DeploymentReactivated"} {
+				Expect(events).NotTo(ContainSubstring(mutationEvent), "Observe mode must not emit mutation events")
+			}
+
+			By("flipping the observer to Reconcile mode and verifying it picks up reconciliation")
+			cmd = exec.Command("kubectl", "patch", "bm", "e2e-observe-secondary", "-n", "default",
+				"--type", "merge", "-p", `{"spec":{"mode":"Reconcile"}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-observe-secondary", "Ready")).To(Equal("True"))
+				g.Expect(getStatus("e2e-observe-secondary", ".spec.mode")).To(Equal("Reconcile"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		})
+
 		It("should retry failed candidate deployment and recover", func() {
 			resetMock()
 			By("applying a BasetenModel CR")

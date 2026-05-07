@@ -29,6 +29,7 @@ Use Kubernetes-native continuous delivery tooling (e.g. [Argo CD](https://argo-c
 - **Self-heal on transient failures.** Failed deployments (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`) are retried with exponential backoff for a fixed time window. When a deployment attached to an environment is marked `INACTIVE` by Baseten's TTL, the operator reactivates it.
 - **Prevent drift from click-ops.** Changes made directly in the Baseten UI are detected and reverted to match the `BasetenModel` custom resource. The custom resource remains the single source of truth.
 - **Operator and Baseten UI work together.** Pause reconciliation per-resource to manage a deployment directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the `BasetenModel` custom resource.
+- **Multi-region failover support.** For multi-region Argo setups, run one region with `spec.mode: Reconcile` and the rest with `spec.mode: Observe`. Observers report state and drift without mutating Baseten. Fail over by deactivating the primary Argo app and flipping a secondary's mode to `Reconcile`.
 - **Separate ML platform ownership from model ownership.** 
   - Model owners build, test, and tune models using the Baseten CLI or UI, then codify the working configuration as a `BasetenModel` custom resource. From that point the `BasetenModel` custom resource is version-controlled and auditable. 
   - The ML platform team can own the operator and set common custom resource defaults for autoscaling, promotion, and cleanup. 
@@ -48,7 +49,7 @@ metadata:
   name: my-model-production
 spec:
   modelName: "my-llm-model"                         # required — model name in Baseten
-  paused: false                                      # optional — set true to pause reconciliation
+  mode: Reconcile                                    # optional — Reconcile (default), Observe, or Pause
 
   # Option A: Promote a CI/CD-created deployment
   # sourceDeploymentName: "img-1.0-wgt-1.0-p-1.3"   # created by CI/CD via truss push
@@ -238,13 +239,17 @@ See [Argo CD Resource Health docs](https://argo-cd.readthedocs.io/en/latest/oper
 
 </details>
 
-### Pause Reconciliation
+### Operator Modes
 
-Pause the operator per-resource during incident response or manual operations. No API calls, no promotions, no drift correction — last known status is preserved.
+`spec.mode` controls the operator's behavior per CR:
+
+- **`Reconcile`** (default) — normal active reconciliation. Reads desired state, reconciles drift, promotes deployments, retries failures.
+- **`Observe`** — read-only. The operator reads Baseten state and refreshes status (including detected drift) but never mutates: no creates, promotions, updates, deletes, or truss pushes. Useful in a multi-region setup so secondary regions retain visibility without dual-writing alongside the primary. Failover by flipping a region to `Reconcile` via GitOps.
+- **`Pause`** — no API calls, no requeue, last known status preserved. Useful during incidents or when configuring the model manually in the Baseten UI.
 
 ```yaml
 spec:
-  paused: true
+  mode: Observe   # this region only watches; the primary region runs as Reconcile
 ```
 
 ### Rolling Deploys and Canary Promotion
@@ -274,8 +279,14 @@ active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoting: depl-vllm-0.17.0-2cb
 active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoting depl-vllm-0.17.0-2cb9685f to production
 active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoted depl-vllm-0.17.0-2cb9685f to production (DEPLOYING)
 
-# Paused
+# Pause mode
 reconciliation paused | last status: active: depl-vllm-0.17.0-2cb9685f (3 replicas, min:1 max:5) in production environment
+
+# Observe mode (read-only secondary; steady-state messages match Reconcile mode)
+active: depl-vllm-0.17.0-2cb9685f (5 replicas, min:5 max:5) in production environment | drift: minReplicas 2→5; awaiting reconciliation
+no active deployment | spec source: depl-vllm-0.17.0-2cb9685f (not yet promoted; awaiting reconciliation)
+model "my-llm-model" not found in Baseten; observe mode does not create
+environment "production" does not exist; observe mode does not create
 ```
 
 <details>
@@ -335,9 +346,18 @@ failed to update settings for {env}: {error}
 Failed to lookup model '{name}': {error}
 ```
 
-**Paused:**
+**Pause mode:**
 ```
 reconciliation paused | last status: {previous message}
+```
+
+**Observe mode:**
+```
+{steady-state message — same shape as Reconcile mode}
+{steady-state message} | drift: {field} {spec_value}→{actual_value}; awaiting reconciliation
+{state} | spec source: {expected_name} (not yet promoted; awaiting reconciliation)
+model "{name}" not found in Baseten; observe mode does not create
+environment "{name}" does not exist; observe mode does not create
 ```
 
 </details>
@@ -359,7 +379,7 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 | `DeploymentActive` | Deployment is now active after promotion |
 | `TrussPushStarted` | Truss push launched to create deployment |
 | `TrussPushCompleted` | Deployment created successfully via truss push |
-| `ReconciliationPaused` | Reconciliation paused via `spec.paused: true` |
+| `ReconciliationPaused` | Reconciliation paused via `spec.mode: Pause` |
 | `OrphanDeploymentsScaledIn` | Orphan deployments scaled to zero |
 | `OrphanDeploymentsDeleted` | Stale orphan deployments deleted |
 | `DeploymentRetried` | Failed deployment retried via Baseten API |

@@ -1,0 +1,23 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: example-model-dev-observer
+  namespace: default
+spec:
+  modelName: "my-llm-model"
+
+  # Same model+env as 01-test-model-dev.yaml — but in Observe mode.
+  # Simulates a secondary region's CR that reports state without mutating Baseten.
+  mode: Observe
+
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.3"
+
+  environment:
+    name: "dev"
+
+    # Autoscaling fields here are "expected" values for drift comparison; the
+    # observer reports drift if env's actual settings don't match these.
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 5
+      concurrencyTarget: 10
