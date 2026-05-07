@@ -227,6 +227,7 @@ spec:
                 - name
                 type: object
               mode:
+                default: Reconcile
                 description: |-
                   Mode controls the operator's behavior for this resource. One of:
                     - Reconcile (default): normal active reconciliation.

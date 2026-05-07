@@ -101,6 +101,7 @@ type BasetenModelSpec struct {
 	// in the others to retain visibility without dual-writes. Failover by
 	// flipping a region to Reconcile via GitOps.
 	// +optional
+	// +kubebuilder:default=Reconcile
 	Mode ReconcileMode `json:"mode,omitempty"`
 
 	// Paused stops the controller from reconciling this resource.

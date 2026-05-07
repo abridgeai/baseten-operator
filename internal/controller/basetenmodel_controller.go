@@ -1610,12 +1610,18 @@ func (r *BasetenModelReconciler) logUpdateStatus(ctx context.Context, model *mod
 }
 
 func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *modelsv1alpha1.BasetenModel, s statusUpdate) error {
-	// Snapshot fields that determine whether an update is needed
+	// Snapshot fields that determine whether an update is needed.
+	// modelIDResolvedTimeSet is included so a nil → non-nil transition (e.g.,
+	// when an upgraded operator first reconciles a pre-existing CR whose
+	// modelID is already cached) triggers an API server write. Without this,
+	// the timestamp would never persist for existing CRs and the
+	// deletionPolicy: Delete recreation guard would silently stay disabled.
 	prev := statusSnapshot{
 		deploymentStatus:        model.Status.DeploymentStatus,
 		message:                 model.Status.Message,
 		activeReplicaCount:      model.Status.ActiveReplicaCount,
 		modelID:                 model.Status.ModelID,
+		modelIDResolvedTimeSet:  model.Status.ModelIDResolvedTime != nil,
 		sourceDeploymentID:      model.Status.SourceDeploymentID,
 		sourceDeploymentName:    model.Status.SourceDeploymentName,
 		activeDeploymentName:    model.Status.ActiveDeploymentName,
@@ -1693,6 +1699,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		message:                 model.Status.Message,
 		activeReplicaCount:      model.Status.ActiveReplicaCount,
 		modelID:                 model.Status.ModelID,
+		modelIDResolvedTimeSet:  model.Status.ModelIDResolvedTime != nil,
 		sourceDeploymentID:      model.Status.SourceDeploymentID,
 		sourceDeploymentName:    model.Status.SourceDeploymentName,
 		activeDeploymentName:    model.Status.ActiveDeploymentName,
@@ -1711,6 +1718,7 @@ type statusSnapshot struct {
 	message                 string
 	activeReplicaCount      int32
 	modelID                 string
+	modelIDResolvedTimeSet  bool
 	sourceDeploymentID      string
 	sourceDeploymentName    string
 	activeDeploymentName    string
