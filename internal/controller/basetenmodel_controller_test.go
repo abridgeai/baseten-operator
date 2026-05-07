@@ -3040,6 +3040,64 @@ var _ = Describe("BasetenModel Controller", func() {
 				)), "event should explain block and recovery options")
 			})
 
+			It("should backfill ModelIDResolvedTime on first reconcile after operator upgrade", func() {
+				// Simulates the upgrade path: a CR created by an older operator
+				// version has status.ModelID already cached but status.ModelIDResolvedTime
+				// is nil. The newly upgraded operator must persist a timestamp on
+				// next reconcile so the deletionPolicy: Delete block-recreation
+				// guard becomes effective. Without this, the snapshot equality check
+				// would skip the API server write because modelID didn't change,
+				// and the timestamp would silently never get written.
+				name := "truss-upgrade-backfill-timestamp"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				configHash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
+				deploymentName := truss.DeploymentName(configHash, model.Spec.TrussConfig.BaseImage.Image)
+
+				// Simulate the post-upgrade steady state of an old CR: modelID is
+				// cached, conditions are populated, message and replica count match
+				// what the upgraded operator will compute, but ModelIDResolvedTime
+				// is nil. Without the fix to statusSnapshot, the snapshot equality
+				// check finds no meaningful change and the API server write is
+				// skipped, so the new timestamp never persists.
+				steadyMessage := steadyStateMessage(
+					&baseten.Deployment{Name: deploymentName + ".1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					testEnvName,
+					testAutoscalingSettings(),
+				)
+				model.Status.ModelID = testModelID
+				model.Status.ModelIDResolvedTime = nil
+				model.Status.SourceDeploymentName = deploymentName
+				model.Status.TrussPushStatus = statusTrussPushDone
+				model.Status.TrussConfigHash = configHash
+				model.Status.ActiveDeploymentName = deploymentName + ".1"
+				model.Status.DeploymentStatus = baseten.DeploymentStatusActive
+				model.Status.Message = steadyMessage
+				model.Status.ActiveReplicaCount = 1
+				model.Status.Conditions = []metav1.Condition{
+					{Type: "Ready", Status: metav1.ConditionTrue, Reason: baseten.DeploymentStatusActive, Message: steadyMessage, LastTransitionTime: metav1.Now()},
+					{Type: "Progressing", Status: metav1.ConditionFalse, Reason: baseten.DeploymentStatusActive, Message: steadyMessage, LastTransitionTime: metav1.Now()},
+				}
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: deploymentName + ".1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.ModelID).To(Equal(testModelID), "modelID should remain cached")
+				Expect(status.ModelIDResolvedTime).NotTo(BeNil(), "timestamp must persist after upgrade reconcile")
+			})
+
 			It("should resolve and proceed when deletionPolicy is Delete and user manually recreates the model", func() {
 				name := "truss-delete-policy-manual-recreate"
 				model := newTrussConfigModel(name)
