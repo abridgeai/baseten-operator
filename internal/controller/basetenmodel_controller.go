@@ -1047,6 +1047,25 @@ func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *mode
 	}
 
 	if modelID == "" {
+		// Delete policy claims sole ownership of the model lifecycle, so the operator
+		// must not auto-create the model via truss push once it has previously existed.
+		// status.ModelIDResolvedTime != nil means we've resolved this model before,
+		// so a current "not found" is a regression (deleted externally) rather than a
+		// first-create. First-create (timestamp nil) is allowed regardless of policy.
+		// User recovers by recreating the model in Baseten (we re-resolve by name on
+		// the next reconcile) or relaxes the policy.
+		if model.Spec.DeletionPolicy == modelsv1alpha1.DeletionPolicyDelete &&
+			model.Status.ModelIDResolvedTime != nil {
+			msg := fmt.Sprintf("Baseten model %q missing; deletionPolicy: Delete blocks recreation", model.Spec.ModelName)
+			logger.Info(msg)
+			r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelNotFound,
+				"%s. Recreate the model in Baseten or set deletionPolicy: Retain to recover.", msg)
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: baseten.DeploymentStatusFailed,
+				message:          msg,
+			})
+			return "", &ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		}
 		// trussConfig workflow: model will be created by truss push
 		if model.Spec.TrussConfig != nil {
 			logger.Info("Model not found, will be created by truss push", "modelName", model.Spec.ModelName)
@@ -1278,6 +1297,8 @@ func (r *BasetenModelReconciler) updatePushStatus(modelName, namespace, pushStat
 	model.Status.TrussPushTime = nil
 	if modelID != "" {
 		model.Status.ModelID = modelID
+		now := metav1.Now()
+		model.Status.ModelIDResolvedTime = &now
 	}
 	if err := r.Status().Update(ctx, model); err != nil {
 		logger.Error(err, "Failed to update push status", "pushStatus", pushStatus)
@@ -1564,7 +1585,9 @@ func isProgressingStatus(status string) bool {
 }
 
 // invalidateModelID clears the cached model ID when an API call returns a not-found error,
-// so the next reconcile re-resolves it from the model name.
+// so the next reconcile re-resolves it from the model name. status.ModelIDResolvedTime
+// is intentionally preserved so the deletionPolicy Delete guard can distinguish
+// "first create" (timestamp nil) from "model previously existed and is now missing".
 // Returns true if the model ID was invalidated (caller should requeue).
 func (r *BasetenModelReconciler) invalidateModelID(ctx context.Context, model *modelsv1alpha1.BasetenModel, err error) bool {
 	if !baseten.IsNotFoundError(err) || model.Status.ModelID == "" {
@@ -1606,6 +1629,8 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 
 	if s.modelID != "" {
 		model.Status.ModelID = s.modelID
+		now := metav1.Now()
+		model.Status.ModelIDResolvedTime = &now
 	}
 	if s.sourceDeploymentID != "" {
 		model.Status.SourceDeploymentID = s.sourceDeploymentID

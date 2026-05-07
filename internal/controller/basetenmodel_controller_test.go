@@ -2970,6 +2970,116 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(events).To(ContainElement(ContainSubstring("Creating model")), "should emit TrussPushStarted with model creation message")
 			})
 
+			It("should auto-create model on first reconcile even with deletionPolicy: Delete", func() {
+				// Intent (1): first create has no ModelIDResolvedTime, so the Delete
+				// policy guard does not fire and truss push proceeds normally.
+				name := "truss-delete-policy-first-create"
+				model := newTrussConfigModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				pushCalled := false
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					pushCalled = true
+					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10*time.Second), "should requeue 10s for push polling")
+
+				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "first-create should run push regardless of policy")
+
+				status := getModelStatus(name)
+				Expect(status.Message).NotTo(ContainSubstring("blocks recreation"))
+			})
+
+			It("should NOT auto-create model via truss push when model previously existed and deletionPolicy is Delete", func() {
+				// Intent (2): post-invalidation reconcile (ModelIDResolvedTime set,
+				// ModelID cleared) under Delete policy must not push or recreate.
+				name := "truss-delete-policy-blocks-recreate"
+				model := newTrussConfigModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				// Simulate post-invalidation state: model was previously resolved
+				// (timestamp present) but the cached ID has since been cleared.
+				prev := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+				model.Status.ModelIDResolvedTime = &prev
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				pushCalled := false
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					pushCalled = true
+					return nil, nil
+				}
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5*time.Minute), "should requeue 5m while stuck under sole-manager mode")
+
+				Consistently(func() bool { return pushCalled }, 500*time.Millisecond, 100*time.Millisecond).Should(BeFalse(), "truss push must not run for previously-existed model under Delete policy")
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).To(ContainSubstring("deletionPolicy: Delete blocks recreation"))
+				Expect(status.ModelIDResolvedTime).NotTo(BeNil(), "timestamp should be preserved across the block")
+
+				events := drainEvents()
+				Expect(events).To(ContainElement(SatisfyAll(
+					ContainSubstring("ModelNotFound"),
+					ContainSubstring("Recreate the model in Baseten"),
+					ContainSubstring("set deletionPolicy: Retain"),
+				)), "event should explain block and recovery options")
+			})
+
+			It("should resolve and proceed when deletionPolicy is Delete and user manually recreates the model", func() {
+				name := "truss-delete-policy-manual-recreate"
+				model := newTrussConfigModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				// Simulates the manual-recovery state at the moment of reconcile:
+				// the previous ModelIDResolvedTime is set (we've seen the model
+				// before), the cached ModelID was cleared by invalidateModelID,
+				// and the user has now recreated the model in Baseten so
+				// FindModelIDByName returns a fresh ID.
+				prev := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+				model.Status.ModelIDResolvedTime = &prev
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return testModelID, nil
+				}
+				configHash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
+				deploymentName := truss.DeploymentName(configHash, model.Spec.TrussConfig.BaseImage.Image)
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockEnvWithSettings(nil, nil)
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					return &baseten.Deployment{ID: "promoted-1", Name: deploymentName + ".1", Status: "DEPLOYING"}, nil
+				}
+
+				_, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				status := getModelStatus(name)
+				Expect(status.ModelID).To(Equal(testModelID), "should resolve modelID by name after manual recovery")
+				Expect(status.DeploymentStatus).NotTo(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).NotTo(ContainSubstring("blocks recreation"))
+				Expect(status.ModelIDResolvedTime).NotTo(BeNil(), "timestamp should be refreshed after re-resolution")
+				Expect(status.ModelIDResolvedTime.Time.After(prev.Time)).To(BeTrue(), "timestamp should be newer than the pre-existing one")
+			})
+
 			It("should proceed normally after push creates model and writes modelID to status", func() {
 				name := "truss-model-created-by-push"
 				model := newTrussConfigModel(name)
