@@ -123,6 +123,11 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return result, err
 	}
 
+	// Observe mode short-circuits normal reconciliation with a read-only path.
+	if effectiveMode(model) == modelsv1alpha1.ModeObserve {
+		return r.reconcileObserve(ctx, model)
+	}
+
 	// Step 1: Resolve model ID (cached in status after first lookup)
 	modelID, result, err := r.resolveModelID(ctx, model)
 	if err != nil || result != nil {
@@ -584,7 +589,7 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 // drive things; handled=false means the CR is in steady state and normal
 // reconciliation can continue.
 func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *modelsv1alpha1.BasetenModel) (bool, ctrl.Result, error) {
-	if model.Spec.Paused {
+	if effectiveMode(model) == modelsv1alpha1.ModePause {
 		r.reconcilePaused(ctx, model)
 		return true, ctrl.Result{}, nil
 	}
@@ -684,6 +689,182 @@ func (r *BasetenModelReconciler) reconcilePaused(ctx context.Context, model *mod
 		deploymentStatus: statusPaused,
 		message:          msg,
 	})
+}
+
+// effectiveMode returns the operative mode for a CR. spec.paused: true is
+// honored as Pause for back-compat, regardless of spec.mode. Empty mode
+// defaults to Reconcile.
+func effectiveMode(model *modelsv1alpha1.BasetenModel) modelsv1alpha1.ReconcileMode {
+	if model.Spec.Paused { //nolint:staticcheck // back-compat for the deprecated field
+		return modelsv1alpha1.ModePause
+	}
+	if model.Spec.Mode == "" {
+		return modelsv1alpha1.ModeReconcile
+	}
+	return model.Spec.Mode
+}
+
+// reconcileObserve runs a read-only reconcile cycle. It refreshes status from
+// Baseten state and surfaces drift, but never mutates anything in Baseten:
+// no creates, promotions, updates, deletes, retries, or truss pushes. Used by
+// secondary regions in a multi-region setup so they keep an up-to-date view
+// without dual-writing alongside the primary region.
+func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Observing BasetenModel (read-only)", "name", model.Name)
+
+	// Resolve modelID (cached if available; otherwise lookup by name). Never creates.
+	modelID := model.Status.ModelID
+	if modelID == "" {
+		var err error
+		modelID, err = r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName)
+		if err != nil {
+			logger.Error(err, "Failed to lookup model")
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: baseten.DeploymentStatusFailed,
+				message:          fmt.Sprintf("failed to lookup model %q: %v", model.Spec.ModelName, err),
+			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+	if modelID == "" {
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus: baseten.DeploymentStatusFailed,
+			message:          fmt.Sprintf("model %q not found in Baseten; observe mode does not create", model.Spec.ModelName),
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Compute expected source deployment name without any API or push calls.
+	sourceDeploymentName, err := r.expectedSourceDeploymentName(ctx, model)
+	if err != nil {
+		logger.Error(err, "Failed to compute expected source deployment name")
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus: baseten.DeploymentStatusFailed,
+			message:          fmt.Sprintf("failed to compute expected source deployment name: %v", err),
+			modelID:          modelID,
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	envName := model.Spec.Environment.Name
+
+	// Fetch environment. Never creates.
+	env, err := r.BasetenClient.GetEnvironment(ctx, modelID, envName)
+	if err != nil {
+		if baseten.IsNotFoundError(err) {
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: baseten.DeploymentStatusFailed,
+				message:          fmt.Sprintf("environment %q does not exist; observe mode does not create", envName),
+				modelID:          modelID,
+			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		logger.Error(err, "Failed to get environment")
+		return ctrl.Result{}, err
+	}
+
+	// Compose status from observed environment state.
+	su := r.composeObserveStatus(model, env, sourceDeploymentName, modelID)
+	if err := r.updateStatus(ctx, model, su); err != nil {
+		logger.Error(err, "Failed to update status")
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// expectedSourceDeploymentName returns the deployment name this CR's spec
+// declares, without any API or push calls. For sourceDeploymentName workflow
+// the spec value is returned as-is. For trussConfig workflow the name is
+// derived from the same hash function used by the Reconcile path so the
+// observer matches what the primary would produce.
+func (r *BasetenModelReconciler) expectedSourceDeploymentName(ctx context.Context, model *modelsv1alpha1.BasetenModel) (string, error) {
+	if model.Spec.SourceDeploymentName != "" {
+		return model.Spec.SourceDeploymentName, nil
+	}
+	if model.Spec.TrussConfig == nil {
+		return "", fmt.Errorf("neither sourceDeploymentName nor trussConfig set")
+	}
+	setupScript, err := r.readSetupScript(ctx, model.Spec.TrussConfig, model.Namespace)
+	if err != nil {
+		return "", err
+	}
+	hash := truss.HashTrussConfig(model.Spec.TrussConfig, setupScript)
+	return truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image), nil
+}
+
+// composeObserveStatus builds a statusUpdate that reflects observed Baseten
+// state. Mirrors the Reconcile-path status decisions for steady, promoting,
+// and not-yet-promoted scenarios, with mode-specific phrasing where Observe
+// can't act ("awaiting reconciliation", "observe mode does not create").
+func (r *BasetenModelReconciler) composeObserveStatus(model *modelsv1alpha1.BasetenModel, env *baseten.Environment, sourceDeploymentName, modelID string) statusUpdate {
+	envName := model.Spec.Environment.Name
+
+	// Current deployment matches spec source: steady state (possibly with drift).
+	if env.CurrentDeployment != nil && baseten.DeploymentNameMatchesPrefix(env.CurrentDeployment.Name, sourceDeploymentName) {
+		msg := steadyStateMessage(env.CurrentDeployment, envName, env.AutoscalingSettings)
+		msg += observeDriftSuffix(model, env)
+		if baseten.IsTerminalFailure(env.CurrentDeployment.Status) {
+			msg += "; awaiting reconciliation"
+		}
+		return statusUpdate{
+			deploymentStatus:     env.CurrentDeployment.Status,
+			message:              msg,
+			modelID:              modelID,
+			activeDeploymentName: env.CurrentDeployment.Name,
+			replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
+			clearCandidate:       true,
+		}
+	}
+
+	// Candidate matches spec source: promotion in progress.
+	if env.CandidateDeployment != nil && baseten.DeploymentNameMatchesPrefix(env.CandidateDeployment.Name, sourceDeploymentName) {
+		su := statusUpdate{
+			deploymentStatus:        env.CandidateDeployment.Status,
+			message:                 promotionMessage(env.CurrentDeployment, env.CandidateDeployment),
+			modelID:                 modelID,
+			candidateDeploymentName: env.CandidateDeployment.Name,
+			replicaCount:            env.CandidateDeployment.ActiveReplicaCount,
+		}
+		if env.CurrentDeployment != nil {
+			su.activeDeploymentName = env.CurrentDeployment.Name
+		}
+		return su
+	}
+
+	// Neither current nor candidate matches: spec source not yet promoted.
+	var msg string
+	if env.CurrentDeployment != nil {
+		msg = fmt.Sprintf("active: %s (%d replicas) | spec source: %s (not yet promoted; awaiting reconciliation)",
+			env.CurrentDeployment.Name, env.CurrentDeployment.ActiveReplicaCount, sourceDeploymentName)
+	} else {
+		msg = fmt.Sprintf("no active deployment | spec source: %s (not yet promoted; awaiting reconciliation)", sourceDeploymentName)
+	}
+	su := statusUpdate{
+		deploymentStatus: statusPending,
+		message:          msg,
+		modelID:          modelID,
+	}
+	if env.CurrentDeployment != nil {
+		su.activeDeploymentName = env.CurrentDeployment.Name
+		su.replicaCount = env.CurrentDeployment.ActiveReplicaCount
+	}
+	return su
+}
+
+// observeDriftSuffix returns the drift phrase to append to a steady-state
+// status message when spec settings diverge from observed environment
+// settings. Returns "" when there is no drift.
+func observeDriftSuffix(model *modelsv1alpha1.BasetenModel, env *baseten.Environment) string {
+	autoscalingDrift, autoscalingChanges := baseten.HasAutoscalingDrift(model.Spec.Environment.Autoscaling, env.AutoscalingSettings)
+	promotionDrift, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
+	if !autoscalingDrift && !promotionDrift {
+		return ""
+	}
+	changes := append([]string{}, autoscalingChanges...)
+	changes = append(changes, promotionChanges...)
+	return fmt.Sprintf(" | drift: %s; awaiting reconciliation", strings.Join(changes, ", "))
 }
 
 // handleCandidateFailure handles a candidate deployment in terminal failure state.

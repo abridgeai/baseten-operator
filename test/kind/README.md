@@ -51,6 +51,7 @@ make kind-dev-down
 | `04-test-promotion-settings.yaml` | Exercises `promotionSettings` (rollingDeploy, ramp-up) |
 | `05-test-delete-retain.yaml` | `deletionPolicy: Retain` — `kubectl delete bm` leaves the Baseten model alone |
 | `06-test-delete-cascade.yaml` | `deletionPolicy: Delete` — `kubectl delete bm` cascades to `DELETE /v1/models/{id}` and removes the model |
+| `07-test-model-observe.yaml` | `mode: Observe` — read-only secondary CR for the same model+env as `01-test-model-dev.yaml`; simulates a multi-region setup |
 | `truss-config-test-configmap.yaml` + `truss-config-test-cr.yaml` | Operator-created deployment via inline `trussConfig` |
 
 ## Walkthrough: testing the delete feature
@@ -100,6 +101,36 @@ If `DeleteModel` fails, the CR sits in `Terminating` with `Status.deploymentStat
 
 ```bash
 kubectl patch bm <name> -p '{"metadata":{"finalizers":[]}}' --type=merge
+```
+
+## Walkthrough: testing Observe mode (multi-region failover)
+
+Simulates two regions managing the same Baseten model: one in `Reconcile` mode (the active region) and one in `Observe` mode (a read-only secondary).
+
+```bash
+# Active CR (Reconcile mode is the default)
+kubectl apply -f test/kind/01-test-model-dev.yaml
+
+# Secondary CR (Observe mode)
+kubectl apply -f test/kind/07-test-model-observe.yaml
+
+# Watch both — each should reach Ready=True with identical state
+kubectl get bm -o custom-columns=NAME:.metadata.name,MODE:.spec.mode,STATUS:.status.deploymentStatus,READY:.status.conditions[?(@.type=='Ready')].status
+```
+
+Confirm the observer is read-only:
+
+```bash
+# No mutation events on the observer (no DeploymentPromoted, AutoscalingUpdated, etc.)
+kubectl get events --field-selector involvedObject.name=example-model-dev-observer
+```
+
+Failover — flip the observer to `Reconcile` (and remove the original active CR or its Argo app):
+
+```bash
+kubectl delete -f test/kind/01-test-model-dev.yaml
+kubectl patch bm example-model-dev-observer --type merge -p '{"spec":{"mode":"Reconcile"}}'
+kubectl get bm example-model-dev-observer -w
 ```
 
 ## Manual setup (bypassing `make kind-dev-up`)
