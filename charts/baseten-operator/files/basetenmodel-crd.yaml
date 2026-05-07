@@ -572,6 +572,15 @@ spec:
               modelID:
                 description: ModelID is the Baseten model ID
                 type: string
+              modelIDResolvedTime:
+                description: |-
+                  ModelIDResolvedTime is the timestamp of the most recent successful model ID
+                  resolution. Set whenever the operator writes a ModelID to status; preserved
+                  (not cleared) when ModelID is invalidated, so its presence indicates the
+                  operator has seen this model exist at some point. Used by the deletionPolicy
+                  Delete guard to distinguish first-create from post-invalidation reconciles.
+                format: date-time
+                type: string
               nextRetryTime:
                 description: |-
                   NextRetryTime is the earliest time the next retry attempt is allowed.

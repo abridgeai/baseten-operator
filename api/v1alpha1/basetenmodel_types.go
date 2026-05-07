@@ -445,6 +445,14 @@ type BasetenModelStatus struct {
 	// +optional
 	ModelID string `json:"modelID,omitempty"`
 
+	// ModelIDResolvedTime is the timestamp of the most recent successful model ID
+	// resolution. Set whenever the operator writes a ModelID to status; preserved
+	// (not cleared) when ModelID is invalidated, so its presence indicates the
+	// operator has seen this model exist at some point. Used by the deletionPolicy
+	// Delete guard to distinguish first-create from post-invalidation reconciles.
+	// +optional
+	ModelIDResolvedTime *metav1.Time `json:"modelIDResolvedTime,omitempty"`
+
 	// SourceDeploymentID is the resolved Baseten deployment ID for the source deployment
 	// Cached after lookup to avoid repeated API calls and to surface errors
 	// +optional
