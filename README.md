@@ -30,6 +30,7 @@ Use Kubernetes-native continuous delivery tooling (e.g. [Argo CD](https://argo-c
 - **Prevent drift from click-ops.** Changes made directly in the Baseten UI are detected and reverted to match the `BasetenModel` custom resource. The custom resource remains the single source of truth.
 - **Operator and Baseten UI work together.** Pause reconciliation per-resource to manage a deployment directly in the Baseten UI for incident response or iterative tuning, then codify the result back into the `BasetenModel` custom resource.
 - **Multi-region failover support.** For multi-region Argo setups, run one region with `spec.mode: Reconcile` and the rest with `spec.mode: Observe`. Observers report state and drift without mutating Baseten. Fail over by deactivating the primary Argo app and flipping a secondary's mode to `Reconcile`.
+- **Safely delete models.** `deletionPolicy: DeleteWithGuardrails` enables declarative model teardown with availability protections: the operator refuses to delete while any environment associated with the model has non-zero replicas, names the offending envs in status, and self-heals once they drain. The default `Retain` preserves the upstream model when CRs are removed, so a stray `kubectl delete` cannot take down a model serving production traffic. (`Delete` is also available for unconditional teardown.)
 - **Separate ML platform ownership from model ownership.** 
   - Model owners build, test, and tune models using the Baseten CLI or UI, then codify the working configuration as a `BasetenModel` custom resource. From that point the `BasetenModel` custom resource is version-controlled and auditable. 
   - The ML platform team can own the operator and set common custom resource defaults for autoscaling, promotion, and cleanup. 
@@ -50,6 +51,7 @@ metadata:
 spec:
   modelName: "my-llm-model"                         # required — model name in Baseten
   mode: Reconcile                                    # optional — Reconcile (default), Observe, or Pause
+  deletionPolicy: Retain                             # optional — Retain (default), DeleteWithGuardrails, or Delete
 
   # Option A: Promote a CI/CD-created deployment
   # sourceDeploymentName: "img-1.0-wgt-1.0-p-1.3"   # created by CI/CD via truss push
@@ -252,6 +254,19 @@ spec:
   mode: Observe   # this region only watches; the primary region runs as Reconcile
 ```
 
+### Deletion Policy
+
+`spec.deletionPolicy` controls what happens to the upstream Baseten model when the CR is deleted. Only honored in `Reconcile` mode; `Pause` and `Observe` always retain.
+
+- **`DeleteWithGuardrails`** — recommended when you want declarative deletion without availability risk. The operator calls `ListEnvironments` first and refuses to delete while any environment has `min_replica > 0` or active replicas. Blocks with `DELETE_BLOCKED` status naming the offending envs (e.g., `prod (min=2, active=4)`), emits a `ModelDeleteBlocked` event, and requeues every 30s. Once every env drains, the next reconcile proceeds with `DeleteModel`. Mitigates the case where a `Delete` cascade would nuke envs not tracked by this CR's spec, including ones that may still be serving production traffic.
+- **`Retain`** (default) — CR is removed, model is preserved in Baseten. Safe choice for click-ops models or anything you might want back.
+- **`Delete`** — CR deletion cascades to `DeleteModel`, removing the model and **all** its environments and deployments. Irrevocable, no checks.
+
+```yaml
+spec:
+  deletionPolicy: DeleteWithGuardrails
+```
+
 ### Rolling Deploys and Canary Promotion
 
 Configure rolling deployments and canary traffic ramp-up for zero-downtime promotions:
@@ -383,6 +398,7 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 | `OrphanDeploymentsScaledIn` | Orphan deployments scaled to zero |
 | `OrphanDeploymentsDeleted` | Stale orphan deployments deleted |
 | `DeploymentRetried` | Failed deployment retried via Baseten API |
+| `ModelDeleted` | Upstream model deleted from Baseten on CR teardown (`deletionPolicy: Delete` or `DeleteWithGuardrails`) |
 
 **Warning Events:**
 
@@ -400,6 +416,8 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 | `TrussPushFailed` | Truss push preparation failed or stale push timed out |
 | `DeploymentRetryFailed` | Retry API call failed or was declined |
 | `DeploymentRetryExhausted` | Failing for over 2h, operator stopped retrying |
+| `ModelDeleteBlocked` | `DeleteWithGuardrails` refused to delete: an env still has `min_replica > 0` or active replicas |
+| `ModelDeleteFailed` | `DeleteModel` API call failed during CR teardown |
 
 ---
 
