@@ -50,6 +50,7 @@ const (
 	statusPaused              = "PAUSED"
 	statusDeleting            = "DELETING"
 	statusDeleteFailed        = "DELETE_FAILED"
+	statusDeleteBlocked       = "DELETE_BLOCKED"
 
 	conditionReady       = "Ready"
 	conditionProgressing = "Progressing"
@@ -630,8 +631,9 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 		policy = modelsv1alpha1.DeletionPolicyRetain
 	}
 
-	// Only Reconcile + Delete actually mutates Baseten.
-	if mode != modelsv1alpha1.ModeReconcile || policy != modelsv1alpha1.DeletionPolicyDelete {
+	// Only Reconcile + (Delete | DeleteWithGuardrails) actually mutates Baseten.
+	deletePolicy := policy == modelsv1alpha1.DeletionPolicyDelete || policy == modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+	if mode != modelsv1alpha1.ModeReconcile || !deletePolicy {
 		logger.Info("Releasing finalizer (no Baseten mutation)",
 			"model", model.Name, "mode", mode, "deletionPolicy", policy)
 		return r.releaseFinalizer(ctx, model)
@@ -641,6 +643,36 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 	if modelID == "" {
 		logger.Info("Releasing finalizer (deletionPolicy Delete but status.modelID empty)", "model", model.Name)
 		return r.releaseFinalizer(ctx, model)
+	}
+
+	// Guardrails: refuse to delete a model with any environment still serving.
+	if policy == modelsv1alpha1.DeletionPolicyDeleteWithGuardrails {
+		blockers, err := r.checkDeleteGuardrails(ctx, modelID)
+		if err != nil {
+			logger.Error(err, "Failed to evaluate delete guardrails", "modelID", modelID)
+			msg := fmt.Sprintf("deletion blocked: failed to list environments for model %s: %v", modelID, err)
+			if model.Status.DeploymentStatus != statusDeleteBlocked {
+				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelDeleteBlocked, "%s", msg)
+			}
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: statusDeleteBlocked,
+				message:          msg,
+				modelID:          modelID,
+			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		if len(blockers) > 0 {
+			msg := fmt.Sprintf("deletion blocked: %s must be scaled to min_replicas: 0 and idle before model can be deleted", strings.Join(blockers, ", "))
+			if model.Status.DeploymentStatus != statusDeleteBlocked {
+				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelDeleteBlocked, "%s", msg)
+			}
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: statusDeleteBlocked,
+				message:          msg,
+				modelID:          modelID,
+			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 	}
 
 	r.logUpdateStatus(ctx, model, statusUpdate{
@@ -668,6 +700,46 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 	logger.Info("Deleted Baseten model, releasing finalizer", "modelID", modelID)
 	r.Recorder.Eventf(model, corev1.EventTypeNormal, EventModelDeleted, "Deleted Baseten model %s", modelID)
 	return r.releaseFinalizer(ctx, model)
+}
+
+// checkDeleteGuardrails inspects every environment under the model and returns
+// a sorted list of human-readable "name (min=N, active=M)" entries for any
+// environment that is not fully idle. An environment is considered serving if
+// either its env-level autoscaling MinReplica > 0 or any of its current/
+// candidate deployments has ActiveReplicaCount > 0. Returns an empty slice when
+// the model is safe to delete.
+//
+// A 404 on ListEnvironments means the upstream model is already gone (e.g.,
+// deleted out-of-band). Treat as "no envs blocking" so the deletion path can
+// fall through to DeleteModel, which handles 404 idempotently. All other
+// errors (5xx, network failures, etc.) are surfaced and block deletion.
+func (r *BasetenModelReconciler) checkDeleteGuardrails(ctx context.Context, modelID string) ([]string, error) {
+	envs, err := r.BasetenClient.ListEnvironments(ctx, modelID)
+	if err != nil {
+		if baseten.IsNotFoundError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var blockers []string
+	for _, env := range envs {
+		minReplica := int32(0)
+		if env.AutoscalingSettings != nil {
+			minReplica = env.AutoscalingSettings.MinReplica
+		}
+		activeReplica := int32(0)
+		if env.CurrentDeployment != nil && env.CurrentDeployment.ActiveReplicaCount > activeReplica {
+			activeReplica = env.CurrentDeployment.ActiveReplicaCount
+		}
+		if env.CandidateDeployment != nil && env.CandidateDeployment.ActiveReplicaCount > activeReplica {
+			activeReplica = env.CandidateDeployment.ActiveReplicaCount
+		}
+		if minReplica > 0 || activeReplica > 0 {
+			blockers = append(blockers, fmt.Sprintf("%s (min=%d, active=%d)", env.Name, minReplica, activeReplica))
+		}
+	}
+	sort.Strings(blockers)
+	return blockers, nil
 }
 
 // releaseFinalizer removes the operator's finalizer and persists the change.

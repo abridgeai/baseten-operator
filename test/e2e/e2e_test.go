@@ -1314,6 +1314,73 @@ spec:
 			Expect(out).To(ContainSubstring(`"deleted_model_ids":null`))
 		})
 
+		It("should block deletion when deletionPolicy is DeleteWithGuardrails and an env has active replicas", func() {
+			By("applying a BasetenModel CR with deletionPolicy: DeleteWithGuardrails")
+			cr := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-delete-guardrails
+  namespace: default
+spec:
+  modelName: "test-model"
+  sourceDeploymentName: "img-1.0-wgt-1.0-p-1.0"
+  deletionPolicy: DeleteWithGuardrails
+  environment:
+    name: "dev"`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cr)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for promotion to start so status.modelID is populated")
+			Eventually(func(g Gomega) {
+				g.Expect(getStatus("e2e-delete-guardrails", ".status.modelID")).To(Equal("model-001"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			controlMock("complete_promotion")
+
+			By("waiting for Ready=True so the env is now serving (active replicas > 0)")
+			Eventually(func(g Gomega) {
+				g.Expect(getConditionStatus("e2e-delete-guardrails", "Ready")).To(Equal("True"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("deleting the CR — guardrail should block because the env is busy")
+			cmd = exec.Command("kubectl", "delete", "bm", "e2e-delete-guardrails", "-n", "default", "--wait=false")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for status.deploymentStatus to transition to DELETE_BLOCKED")
+			Eventually(func() string {
+				return getStatus("e2e-delete-guardrails", ".status.deploymentStatus")
+			}, 60*time.Second, 2*time.Second).Should(Equal("DELETE_BLOCKED"))
+
+			By("verifying status.message names the blocking env")
+			msg := getStatus("e2e-delete-guardrails", ".status.message")
+			Expect(msg).To(ContainSubstring("dev"))
+			Expect(msg).To(ContainSubstring("active="))
+
+			By("verifying CR is still present in Terminating with finalizer attached")
+			out := getStatus("e2e-delete-guardrails", ".metadata.finalizers")
+			Expect(out).To(ContainSubstring("models.baseten.com/finalizer"))
+
+			By("verifying the mock recorded zero DeleteModel calls (block held)")
+			deletes := queryMock("get_model_deletes")
+			Expect(deletes).NotTo(ContainSubstring("model-001"),
+				"DeleteModel must not be called while a guardrail blocks deletion")
+
+			By("verifying ModelDeleteBlocked event was emitted")
+			cmd = exec.Command("kubectl", "get", "events", "-n", "default",
+				"--field-selector", "involvedObject.name=e2e-delete-guardrails",
+				"-o", "jsonpath={.items[*].reason}")
+			eventsOut, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eventsOut).To(ContainSubstring("ModelDeleteBlocked"))
+
+			By("force-removing the finalizer to clean up so subsequent specs run cleanly")
+			cmd = exec.Command("kubectl", "patch", "bm", "e2e-delete-guardrails", "-n", "default",
+				"--type=merge", "-p", `{"metadata":{"finalizers":[]}}`)
+			_, _ = utils.Run(cmd)
+		})
+
 		It("should cascade-delete the Baseten model when deletionPolicy is Delete", func() {
 			By("applying a BasetenModel CR with deletionPolicy: Delete")
 			cr := `apiVersion: models.baseten.com/v1alpha1

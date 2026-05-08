@@ -27,14 +27,23 @@ const FinalizerName = "models.baseten.com/finalizer"
 
 // DeletionPolicy controls what happens to the upstream Baseten model when the
 // BasetenModel CR is deleted.
-// +kubebuilder:validation:Enum=Retain;Delete
+// +kubebuilder:validation:Enum=Retain;Delete;DeleteWithGuardrails
 type DeletionPolicy string
 
 const (
 	// DeletionPolicyRetain leaves the Baseten model intact when the CR is deleted (default).
 	DeletionPolicyRetain DeletionPolicy = "Retain"
-	// DeletionPolicyDelete removes the Baseten model when the CR is deleted.
+	// DeletionPolicyDelete removes the Baseten model when the CR is deleted, with no
+	// pre-flight checks. Suitable for throwaway / test models where loss of serving
+	// is intentional.
 	DeletionPolicyDelete DeletionPolicy = "Delete"
+	// DeletionPolicyDeleteWithGuardrails removes the Baseten model only after
+	// every environment under the model is fully idle: spec autoscaling
+	// MinReplica == 0 AND no current/candidate deployment with ActiveReplicaCount > 0.
+	// If any environment is still serving, the operator blocks deletion, surfaces
+	// the offending environments in status, and requeues — so as soon as the user
+	// scales each env down, deletion proceeds automatically.
+	DeletionPolicyDeleteWithGuardrails DeletionPolicy = "DeleteWithGuardrails"
 )
 
 // ReconcileMode controls the operator's behavior for a BasetenModel CR.
@@ -117,8 +126,12 @@ type BasetenModelSpec struct {
 
 	// DeletionPolicy controls cleanup of the upstream Baseten model when this CR is deleted.
 	// "Retain" (default): the Baseten model is left untouched; the CR vanishes.
-	// "Delete": the operator calls DELETE /v1/models/{model_id} before allowing the CR to be removed,
-	// which cascades to all deployments, environments, and promotion history under that model.
+	// "Delete": the operator calls DELETE /v1/models/{model_id} immediately, which
+	// cascades to all deployments, environments, and promotion history under that model.
+	// "DeleteWithGuardrails": same as Delete, but only after every environment under
+	// the model is fully idle (MinReplica == 0 AND no current/candidate deployment
+	// serving traffic). If any environment is still active, deletion is blocked and
+	// the CR sits in Terminating until the user scales each env down.
 	// +optional
 	// +kubebuilder:default=Retain
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
