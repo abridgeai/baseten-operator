@@ -31,4 +31,5 @@ const (
 	EventDeploymentRetryFailed         = "DeploymentRetryFailed"
 	EventDeploymentRetryExhausted      = "DeploymentRetryExhausted"
 	EventModelDeleteFailed             = "ModelDeleteFailed"
+	EventModelDeleteBlocked            = "ModelDeleteBlocked"
 )

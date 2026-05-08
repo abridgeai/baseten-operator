@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -3405,6 +3406,376 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
 
 				reconcileUntilGone(name)
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails proceeds when all envs idle", func() {
+				name := "deletion-guardrails-idle"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return []baseten.Environment{
+						{
+							Name:                "dev",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-1", ActiveReplicaCount: 0},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5},
+						},
+						{
+							Name:                "staging",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-2", ActiveReplicaCount: 0},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5},
+						},
+					}, nil
+				}
+				deleteCalls := 0
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					deleteCalls++
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+				Expect(deleteCalls).To(Equal(1), "DeleteModel should run once when all envs are idle")
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails blocks when an env has min_replicas > 0", func() {
+				name := "deletion-guardrails-blocked-min"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return []baseten.Environment{
+						{
+							Name:                "prod",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 0},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2, MaxReplica: 10},
+						},
+					}, nil
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run while a non-idle env exists")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30*time.Second), "should requeue while waiting for env scale-down")
+
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=2, active=0)"))
+				Expect(stuck.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+
+				events := drainEvents()
+				Expect(events).To(ContainElement(ContainSubstring(EventModelDeleteBlocked)))
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails blocks when an env has active replicas > 0", func() {
+				name := "deletion-guardrails-blocked-active"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return []baseten.Environment{
+						{
+							Name:                "prod",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 3},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 10},
+						},
+					}, nil
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run while replicas are still active")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=0, active=3)"))
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails blocks on a busy env unrelated to the CR's spec", func() {
+				// CR tracks the "dev" env, but "prod" env (which this CR has
+				// nothing to do with) is still serving. DeleteModel cascades to
+				// every env under the model, so the guardrail must block on
+				// any non-idle env, not just spec.environment.name.
+				name := "deletion-guardrails-cross-env-block"
+				model := newTestModel(name) // spec.environment.name = testEnvName ("dev")
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return []baseten.Environment{
+						{
+							// dev: idle, matches CR's spec.environment.name
+							Name:                testEnvName,
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-dev", ActiveReplicaCount: 0},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5},
+						},
+						{
+							// prod: busy, NOT tracked by this CR
+							Name:                "prod",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 4},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2, MaxReplica: 20},
+						},
+					}, nil
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run while any env (even one not tracked by this CR) is busy")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=2, active=4)"),
+					"status should call out the offending env even when it's not the one this CR tracks")
+				Expect(stuck.Status.Message).NotTo(ContainSubstring(testEnvName+" ("),
+					"the idle env this CR tracks must not appear in blockers")
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails emits ModelDeleteBlocked only once across repeated reconciles", func() {
+				name := "deletion-guardrails-event-once"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return []baseten.Environment{
+						{
+							Name:                "prod",
+							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 0},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 10},
+						},
+					}, nil
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				_, _ = reconcileByName(name)
+				_, _ = reconcileByName(name)
+				_, _ = reconcileByName(name)
+
+				events := drainEvents()
+				blockedCount := 0
+				for _, e := range events {
+					if strings.Contains(e, EventModelDeleteBlocked) {
+						blockedCount++
+					}
+				}
+				Expect(blockedCount).To(Equal(1), "blocked event should fire only on transition into blocked state")
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails blocks when ListEnvironments errors with non-404 (fail-safe)", func() {
+				// Generic API errors (5xx, network, deserialization) must NOT
+				// fall through to DeleteModel; the operator can't tell whether
+				// envs are idle, so it has to block.
+				name := "deletion-guardrails-list-err"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return nil, &baseten.APIError{StatusCode: 500, Message: "baseten internal error"}
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run when guardrails cannot be evaluated")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+				Expect(stuck.Status.Message).To(ContainSubstring("failed to list environments"))
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails blocks when ListEnvironments errors with non-APIError (fail-safe)", func() {
+				// A bare error that doesn't unwrap to *baseten.APIError must NOT
+				// be treated as 404 — IsNotFoundError must reject it.
+				name := "deletion-guardrails-list-bare-err"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					return nil, fmt.Errorf("connection refused")
+				}
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					Fail("DeleteModel must not run when ListEnvironments fails with a non-404 error")
+					return nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				stuck := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stuck)).To(Succeed())
+				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+			})
+
+			It("with deletionPolicy DeleteWithGuardrails treats ListEnvironments 404 as already-gone and proceeds to DeleteModel", func() {
+				// Model was already removed out-of-band, so ListEnvironments
+				// returns 404. The guardrail check should fall through cleanly,
+				// and DeleteModel itself will then hit 404 and release the
+				// finalizer with a ModelDeleted event.
+				name := "deletion-guardrails-list-404"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 0},
+					nil,
+				)
+				listCalls := 0
+				mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+					listCalls++
+					return nil, &baseten.APIError{StatusCode: 404, Message: "model not found"}
+				}
+				deleteCalls := 0
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					deleteCalls++
+					return &baseten.APIError{StatusCode: 404, Message: "model not found"}
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				reconcileUntilGone(name)
+
+				Expect(listCalls).To(BeNumerically(">=", 1), "ListEnvironments should be called as part of guardrail check")
+				Expect(deleteCalls).To(BeNumerically(">=", 1), "DeleteModel should still be called after 404 fall-through")
+
+				events := drainEvents()
+				Expect(events).To(ContainElement(SatisfyAll(
+					ContainSubstring(EventModelDeleted),
+					ContainSubstring("already deleted"),
+				)), "should emit ModelDeleted event acknowledging 404")
+				for _, e := range events {
+					Expect(e).NotTo(ContainSubstring(EventModelDeleteBlocked), "ListEnvironments 404 must not surface as blocked")
+				}
 			})
 
 			It("with mode Pause bypasses DeleteModel even when deletionPolicy Delete", func() {
