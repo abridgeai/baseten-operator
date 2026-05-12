@@ -3041,6 +3041,79 @@ var _ = Describe("BasetenModel Controller", func() {
 				)), "event should explain block and recovery options")
 			})
 
+			It("should NOT auto-create model via truss push when model previously existed and deletionPolicy is DeleteWithGuardrails", func() {
+				// Same guarantee as Delete: DeleteWithGuardrails also claims sole
+				// ownership of the model lifecycle, so a missing model after the CR
+				// has resolved before must not be recreated by truss push. Closes the
+				// cross-cluster recreation loop where a sibling cluster's
+				// DeleteWithGuardrails CR would otherwise rebuild a model another
+				// cluster just deleted (when both share a Baseten account).
+				name := "truss-delete-with-guardrails-blocks-recreate"
+				model := newTrussConfigModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				prev := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+				model.Status.ModelIDResolvedTime = &prev
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				pushCalled := false
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					pushCalled = true
+					return nil, nil
+				}
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5*time.Minute), "should requeue 5m while stuck under sole-manager mode")
+
+				Consistently(func() bool { return pushCalled }, 500*time.Millisecond, 100*time.Millisecond).Should(BeFalse(), "truss push must not run for previously-existed model under DeleteWithGuardrails policy")
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				Expect(status.Message).To(ContainSubstring("deletionPolicy: DeleteWithGuardrails blocks recreation"))
+				Expect(status.ModelIDResolvedTime).NotTo(BeNil(), "timestamp should be preserved across the block")
+
+				events := drainEvents()
+				Expect(events).To(ContainElement(SatisfyAll(
+					ContainSubstring("ModelNotFound"),
+					ContainSubstring("Recreate the model in Baseten"),
+					ContainSubstring("set deletionPolicy: Retain"),
+				)), "event should explain block and recovery options")
+			})
+
+			It("should auto-create model on first reconcile even with deletionPolicy: DeleteWithGuardrails", func() {
+				// First create (no ModelIDResolvedTime) is allowed regardless of
+				// policy. Mirrors the Delete-policy first-create case so we never
+				// block on the legitimate initial bootstrap path.
+				name := "truss-dwg-policy-first-create"
+				model := newTrussConfigModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+				defer cleanupModel(name)
+
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+					return "", nil
+				}
+				pushCalled := false
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					pushCalled = true
+					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10*time.Second), "should requeue 10s for push polling")
+
+				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "first-create should run push regardless of policy")
+
+				status := getModelStatus(name)
+				Expect(status.Message).NotTo(ContainSubstring("blocks recreation"))
+			})
+
 			It("should backfill ModelIDResolvedTime on first reconcile after operator upgrade", func() {
 				// Simulates the upgrade path: a CR created by an older operator
 				// version has status.ModelID already cached but status.ModelIDResolvedTime

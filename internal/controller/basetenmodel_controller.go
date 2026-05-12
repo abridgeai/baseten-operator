@@ -1128,16 +1128,20 @@ func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *mode
 	}
 
 	if modelID == "" {
-		// Delete policy claims sole ownership of the model lifecycle, so the operator
-		// must not auto-create the model via truss push once it has previously existed.
-		// status.ModelIDResolvedTime != nil means we've resolved this model before,
-		// so a current "not found" is a regression (deleted externally) rather than a
-		// first-create. First-create (timestamp nil) is allowed regardless of policy.
-		// User recovers by recreating the model in Baseten (we re-resolve by name on
-		// the next reconcile) or relaxes the policy.
-		if model.Spec.DeletionPolicy == modelsv1alpha1.DeletionPolicyDelete &&
+		// Delete and DeleteWithGuardrails claim sole ownership of the model
+		// lifecycle, so the operator must not auto-create the model via truss push
+		// once it has previously existed. status.ModelIDResolvedTime != nil means
+		// we've resolved this model before, so a current "not found" is a regression
+		// (deleted externally, e.g. by a sibling cluster sharing the same Baseten
+		// account) rather than a first-create. First-create (timestamp nil) is
+		// allowed regardless of policy. User recovers by recreating the model in
+		// Baseten (we re-resolve by name on the next reconcile) or relaxes the policy
+		// to Retain.
+		if (model.Spec.DeletionPolicy == modelsv1alpha1.DeletionPolicyDelete ||
+			model.Spec.DeletionPolicy == modelsv1alpha1.DeletionPolicyDeleteWithGuardrails) &&
 			model.Status.ModelIDResolvedTime != nil {
-			msg := fmt.Sprintf("Baseten model %q missing; deletionPolicy: Delete blocks recreation", model.Spec.ModelName)
+			msg := fmt.Sprintf("Baseten model %q missing; deletionPolicy: %s blocks recreation",
+				model.Spec.ModelName, model.Spec.DeletionPolicy)
 			logger.Info(msg)
 			r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelNotFound,
 				"%s. Recreate the model in Baseten or set deletionPolicy: Retain to recover.", msg)
@@ -1695,8 +1699,8 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	// modelIDResolvedTimeSet is included so a nil → non-nil transition (e.g.,
 	// when an upgraded operator first reconciles a pre-existing CR whose
 	// modelID is already cached) triggers an API server write. Without this,
-	// the timestamp would never persist for existing CRs and the
-	// deletionPolicy: Delete recreation guard would silently stay disabled.
+	// the timestamp would never persist for existing CRs and the recreation
+	// guard for Delete / DeleteWithGuardrails policies would silently stay disabled.
 	prev := statusSnapshot{
 		deploymentStatus:        model.Status.DeploymentStatus,
 		message:                 model.Status.Message,
