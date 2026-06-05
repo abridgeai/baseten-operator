@@ -17,8 +17,6 @@ sources:
 maintainers:
   - name: Abridge AI
     url: https://github.com/abridgeai
-  - name: Baseten
-    url: https://github.com/basetenlabs
 icon: https://avatars.githubusercontent.com/u/69411042
 annotations:
   artifacthub.io/license: Apache-2.0

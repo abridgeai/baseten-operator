@@ -9,11 +9,6 @@ Maintainers are responsible for reviewing and merging PRs, triaging issues, and 
 - Aakash Pydi ([@aakashpydi](https://github.com/aakashpydi))
 - Nathan Price ([@TheCodeWrangler](https://github.com/TheCodeWrangler))
 
-### Baseten
-
-- TBD
-- TBD
-
 ## Reviewers
 
 Reviewers can approve PRs but cannot merge without maintainer approval.

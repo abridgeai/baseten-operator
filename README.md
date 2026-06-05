@@ -469,4 +469,4 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## License
 
-Copyright 2025 Abridge AI, Inc. and Baseten, Inc. Licensed under the [Apache License, Version 2.0](LICENSE).
+Copyright 2025 Abridge AI, Inc. Licensed under the [Apache License, Version 2.0](LICENSE).
