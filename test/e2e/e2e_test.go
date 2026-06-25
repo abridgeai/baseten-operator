@@ -35,11 +35,11 @@ import (
 )
 
 const (
-	namespace          = "baseten-operator-system"
-	serviceAccountName = "baseten-operator-controller-manager"
-	metricsServiceName = "baseten-operator-controller-manager-metrics-service"
+	namespace              = "baseten-operator-system"
+	serviceAccountName     = "baseten-operator-controller-manager"
+	metricsServiceName     = "baseten-operator-controller-manager-metrics-service"
 	metricsRoleBindingName = "baseten-operator-metrics-binding"
-	mockServerURL      = "http://mock-baseten-api.baseten-operator-system.svc.cluster.local:8080/v1"
+	mockServerURL          = "http://mock-baseten-api.baseten-operator-system.svc.cluster.local:8080/v1"
 )
 
 var _ = Describe("Manager", Ordered, func() {
@@ -1483,4 +1483,3 @@ type tokenRequest struct {
 		Token string `json:"token"`
 	} `json:"status"`
 }
-

@@ -32,10 +32,10 @@ import (
 )
 
 var (
-	skipCertManagerInstall       = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
+	skipCertManagerInstall        = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
 	isCertManagerAlreadyInstalled = false
 
-	projectImage   = "example.com/baseten-operator:v0.0.1"
+	projectImage    = "example.com/baseten-operator:v0.0.1"
 	mockServerImage = "mock-baseten-api:latest"
 )
 
