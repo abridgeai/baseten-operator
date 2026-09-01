@@ -179,7 +179,7 @@ func main() {
 			}
 		}
 		st.deletedModelIDs = append(st.deletedModelIDs, modelID)
-		w.WriteHeader(http.StatusOK)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"id": modelID})
 	})
 
 	mux.HandleFunc("DELETE /v1/models/{model_id}/deployments/{dep_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +191,7 @@ func main() {
 		for i, d := range deps {
 			if d.ID == depID {
 				st.deployments[modelID] = append(deps[:i], deps[i+1:]...)
-				w.WriteHeader(http.StatusOK)
+				writeJSON(w, http.StatusOK, map[string]interface{}{"id": depID})
 				return
 			}
 		}
@@ -293,7 +293,7 @@ func main() {
 			AutoscalingSettings: req.AutoscalingSettings,
 			PromotionSettings:   req.PromotionSettings,
 		}
-		writeJSON(w, http.StatusCreated, st.environments[key])
+		writeJSON(w, http.StatusOK, st.environments[key])
 	})
 
 	mux.HandleFunc("PATCH /v1/models/{model_id}/environments/{env_name}", func(w http.ResponseWriter, r *http.Request) {

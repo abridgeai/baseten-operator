@@ -3,6 +3,7 @@ module github.com/abridgeai/baseten-operator
 go 1.26.2
 
 require (
+	github.com/basetenlabs/baseten-go v0.1.1-0.20260701165513-0c85d1a410d1
 	github.com/basetenlabs/truss-go v0.12.1-0.20260226225143-03d2ee72198e
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
