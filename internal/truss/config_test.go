@@ -3,6 +3,7 @@ package truss
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
@@ -188,11 +189,18 @@ func TestDeploymentName(t *testing.T) {
 		{"c3d4e5f6", "nginx", "depl-nginx-latest-c3d4e5f6"},
 		{"d4e5f6a7", "nvcr.io/nvidia/nemo:23.03", "depl-nemo-23.03-d4e5f6a7"},
 		{"e5f6a7b8", "", "depl-e5f6a7b8"},
+		// Digest-pinned refs: the digest must not leak into the deployment name
+		// (Baseten rejects names carrying ':'/'@' — the 2026-08-26 incident).
+		{"f6a7b8c9", "us-docker.pkg.dev/repo/vllm:0.11.2.1@sha256:a3f1c9e2b8d4f6a7c5e9d1b3f8a2c4e6d8b0a2c4e6f8a0b2c4d6e8f0a1b3c5d7", "depl-vllm-0.11.2.1-f6a7b8c9"},
+		{"a7b8c9d0", "us-docker.pkg.dev/repo/vllm@sha256:a3f1c9e2b8d4f6a7c5e9d1b3f8a2c4e6d8b0a2c4e6f8a0b2c4d6e8f0a1b3c5d7", "depl-vllm-latest-a7b8c9d0"},
 	}
 	for _, tt := range tests {
 		got := DeploymentName(tt.hash, tt.imageURI)
 		if got != tt.want {
 			t.Errorf("DeploymentName(%q, %q) = %q, want %q", tt.hash, tt.imageURI, got, tt.want)
+		}
+		if strings.ContainsAny(got, ":@/") {
+			t.Errorf("DeploymentName(%q, %q) = %q contains characters invalid in a Baseten deployment name", tt.hash, tt.imageURI, got)
 		}
 	}
 }
@@ -208,6 +216,9 @@ func TestParseImage(t *testing.T) {
 		{"nginx", "nginx", "latest"},
 		{"nvcr.io/nvidia/nemo:23.03", "nemo", "23.03"},
 		{"", "", ""},
+		// Digest suffixes must be dropped, not parsed as the tag.
+		{"us-docker.pkg.dev/repo/vllm:0.11.2.1@sha256:a3f1c9e2b8d4f6a7c5e9d1b3f8a2c4e6d8b0a2c4e6f8a0b2c4d6e8f0a1b3c5d7", "vllm", "0.11.2.1"},
+		{"us-docker.pkg.dev/repo/vllm@sha256:a3f1c9e2b8d4f6a7c5e9d1b3f8a2c4e6d8b0a2c4e6f8a0b2c4d6e8f0a1b3c5d7", "vllm", "latest"},
 	}
 	for _, tt := range tests {
 		name, tag := parseImage(tt.uri)

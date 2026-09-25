@@ -127,6 +127,7 @@ func DeploymentName(configHash string, imageURI string) string {
 
 // parseImage extracts the image name and tag from a Docker image URI.
 // "us-docker.pkg.dev/repo/vllm:0.11.2.1" → ("vllm", "0.11.2.1")
+// "us-docker.pkg.dev/repo/vllm:0.11.2.1@sha256:<digest>" → ("vllm", "0.11.2.1")
 // "nginx:latest" → ("nginx", "latest")
 // "nginx" → ("nginx", "latest")
 // "" → ("", "")
@@ -138,6 +139,11 @@ func parseImage(uri string) (name, tag string) {
 	// Split off tag
 	tag = "latest"
 	ref := uri
+	// A ref may carry "@<algo>:<digest>" after the tag; drop it before the tag
+	// split, or the digest's ':' wins LastIndex and its hex becomes the tag.
+	if i := strings.Index(ref, "@"); i != -1 {
+		ref = ref[:i]
+	}
 	if i := strings.LastIndex(ref, ":"); i != -1 {
 		tag = ref[i+1:]
 		ref = ref[:i]
