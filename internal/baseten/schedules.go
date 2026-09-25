@@ -1,15 +1,14 @@
 package baseten
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"slices"
 	"time"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
+	managementapi "github.com/basetenlabs/baseten-go/client/managementapi"
 )
 
 const CadenceOneTime = "ONE_TIME"
@@ -43,7 +42,7 @@ type AutoscalingSchedule struct {
 	AutoscalingSettings ScheduleAutoscalingSettings `json:"autoscaling_settings"`
 }
 
-// ScheduleAutoscalingSettings mirrors AutoscalingScheduleSettingsRequestV1, where every key is required and nil means inherit.
+// ScheduleAutoscalingSettings holds a schedule's autoscaling overrides; nil fields inherit the environment value.
 type ScheduleAutoscalingSettings struct {
 	MinReplica                  int32  `json:"min_replica"`
 	MaxReplica                  int32  `json:"max_replica"`
@@ -71,28 +70,14 @@ func HasScheduleDrift(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *
 // UpdateAutoscalingSchedules PATCHes the environment so its schedules match spec: creates missing
 // schedules, replaces changed ones by id, and deletes schedules not in spec.
 func (c *Client) UpdateAutoscalingSchedules(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error {
-	settings := buildScheduleSettings(spec, observed)
-	if settings == nil {
-		return nil
-	}
-
-	body, err := json.Marshal(map[string]interface{}{"autoscaling_schedule_settings": settings})
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := c.newRequest(ctx, "PATCH", fmt.Sprintf("%s/models/%s/environments/%s", c.baseURL, modelID, envName), bytes.NewReader(body))
-	if err != nil {
+	settings, err := toUpdateAutoscalingScheduleSettings(spec, observed)
+	if err != nil || settings == nil {
 		return err
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	_, err = c.api.PatchModelsEnvironments(ctx, modelID, envName, managementapi.UpdateEnvironmentRequest{
+		AutoscalingScheduleSettings: settings,
+	})
+	return toAPIError(err)
 }
 
 type scheduleDiff struct {
@@ -161,27 +146,31 @@ func diffSchedules(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *Aut
 	return d
 }
 
-func buildScheduleSettings(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) map[string]interface{} {
+func toUpdateAutoscalingScheduleSettings(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) (*managementapi.UpdateAutoscalingScheduleSettings, error) {
 	d := diffSchedules(spec, observed)
 	if len(d.changes) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	settings := map[string]interface{}{}
+	out := &managementapi.UpdateAutoscalingScheduleSettings{}
 	if spec.Timezone != nil {
-		settings["timezone"] = *spec.Timezone
+		out.Timezone = managementapi.NewOptional(spec.Timezone)
 	}
 	if len(d.upserts) > 0 {
-		schedules := make([]map[string]interface{}, 0, len(d.upserts))
+		schedules := make([]managementapi.UpdateAutoscalingScheduleSettings_Schedules_Item, 0, len(d.upserts))
 		for _, s := range d.upserts {
-			schedules = append(schedules, scheduleRequest(s))
+			item, err := toScheduleUpsert(s)
+			if err != nil {
+				return nil, fmt.Errorf("schedule %s: %w", s.Name, err)
+			}
+			schedules = append(schedules, item)
 		}
-		settings["schedules"] = schedules
+		out.Schedules = &schedules
 	}
 	if len(d.deletes) > 0 {
-		settings["delete_schedules"] = d.deletes
+		out.DeleteSchedules = &d.deletes
 	}
-	return settings
+	return out, nil
 }
 
 func scheduleFromSpec(s modelsv1alpha1.AutoscalingSchedule) AutoscalingSchedule {
@@ -256,25 +245,141 @@ func canonicalTime(v string) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func scheduleRequest(s AutoscalingSchedule) map[string]interface{} {
-	req := map[string]interface{}{
-		"name":                 s.Name,
-		"enabled":              s.Enabled,
-		"cadence":              s.Cadence,
-		"autoscaling_settings": s.AutoscalingSettings,
-	}
+func toScheduleUpsert(s AutoscalingSchedule) (managementapi.UpdateAutoscalingScheduleSettings_Schedules_Item, error) {
+	var item managementapi.UpdateAutoscalingScheduleSettings_Schedules_Item
+	var id *string
 	if s.ID != "" {
-		req["id"] = s.ID
+		id = &s.ID
 	}
+	settings := toScheduleSettingsRequest(s.AutoscalingSettings)
+
 	if s.Cadence == CadenceOneTime {
-		req["start_at"] = s.StartAt
-		req["end_at"] = s.EndAt
-		return req
+		startAt, err := time.Parse(time.RFC3339, s.StartAt)
+		if err != nil {
+			return item, fmt.Errorf("invalid startAt: %w", err)
+		}
+		endAt, err := time.Parse(time.RFC3339, s.EndAt)
+		if err != nil {
+			return item, fmt.Errorf("invalid endAt: %w", err)
+		}
+		err = item.FromOneTimeAutoscalingScheduleUpsert(managementapi.OneTimeAutoscalingScheduleUpsert{
+			Id:                  id,
+			Name:                s.Name,
+			Enabled:             s.Enabled,
+			StartAt:             startAt,
+			EndAt:               endAt,
+			AutoscalingSettings: settings,
+		})
+		return item, err
 	}
-	req["weekdays"] = s.Weekdays
-	req["start_hour"] = s.StartHour
-	req["start_minute"] = s.StartMinute
-	req["end_hour"] = s.EndHour
-	req["end_minute"] = s.EndMinute
-	return req
+
+	weekdays := make([]managementapi.AutoscalingScheduleWeekday, 0, len(s.Weekdays))
+	for _, w := range s.Weekdays {
+		weekdays = append(weekdays, managementapi.AutoscalingScheduleWeekday(w))
+	}
+	err := item.FromAutoscalingScheduleUpsert(managementapi.AutoscalingScheduleUpsert{
+		Id:                  id,
+		Name:                s.Name,
+		Enabled:             s.Enabled,
+		Cadence:             managementapi.AutoscalingScheduleUpsertCadence(s.Cadence),
+		Weekdays:            weekdays,
+		StartHour:           int32PtrToIntPtr(s.StartHour),
+		StartMinute:         int(s.StartMinute),
+		EndHour:             int32PtrToIntPtr(s.EndHour),
+		EndMinute:           int(s.EndMinute),
+		AutoscalingSettings: settings,
+	})
+	return item, err
+}
+
+func toScheduleSettingsRequest(a ScheduleAutoscalingSettings) managementapi.AutoscalingScheduleSettingsRequest {
+	return managementapi.AutoscalingScheduleSettingsRequest{
+		MinReplica:                  int(a.MinReplica),
+		MaxReplica:                  int(a.MaxReplica),
+		AutoscalingWindow:           int32PtrToIntPtr(a.AutoscalingWindow),
+		ScaleDownDelay:              int32PtrToIntPtr(a.ScaleDownDelay),
+		ConcurrencyTarget:           int32PtrToIntPtr(a.ConcurrencyTarget),
+		TargetUtilizationPercentage: int32PtrToIntPtr(a.TargetUtilizationPercentage),
+		TargetInFlightTokens:        int32PtrToIntPtr(a.TargetInFlightTokens),
+		MaxScaleDownRate:            int32PtrToIntPtr(a.MaxScaleDownRate),
+	}
+}
+
+// toAutoscalingSchedules fails rather than dropping undecodable schedules, since a missing
+// schedule would be recreated or its id lost for deletion.
+func toAutoscalingSchedules(e *managementapi.EnvironmentAutoscalingSchedules) (*AutoscalingSchedules, error) {
+	if e == nil {
+		return nil, nil
+	}
+	out := &AutoscalingSchedules{Timezone: e.Timezone}
+	if e.AppliedState != nil {
+		out.AppliedState = &AutoscalingScheduleState{
+			ScheduleID:          e.AppliedState.ScheduleId,
+			AutoscalingSettings: toAutoscalingSettings(e.AppliedState.AutoscalingSettings),
+		}
+	}
+	for _, item := range e.Schedules {
+		s, err := toAutoscalingSchedule(item)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode autoscaling schedule: %w", err)
+		}
+		out.Schedules = append(out.Schedules, s)
+	}
+	return out, nil
+}
+
+func toAutoscalingSchedule(item managementapi.EnvironmentAutoscalingSchedules_Schedules_Item) (AutoscalingSchedule, error) {
+	cadence, err := item.Discriminator()
+	if err != nil {
+		return AutoscalingSchedule{}, err
+	}
+	if cadence == CadenceOneTime {
+		o, err := item.AsOneTimeAutoscalingSchedule()
+		if err != nil {
+			return AutoscalingSchedule{}, err
+		}
+		return AutoscalingSchedule{
+			ID:                  o.Id,
+			Name:                o.Name,
+			Enabled:             o.Enabled,
+			Cadence:             CadenceOneTime,
+			StartAt:             o.StartAt.Format(time.RFC3339),
+			EndAt:               o.EndAt.Format(time.RFC3339),
+			AutoscalingSettings: toScheduleAutoscalingSettings(o.AutoscalingSettings),
+		}, nil
+	}
+
+	r, err := item.AsAutoscalingSchedule()
+	if err != nil {
+		return AutoscalingSchedule{}, err
+	}
+	weekdays := make([]string, 0, len(r.Weekdays))
+	for _, w := range r.Weekdays {
+		weekdays = append(weekdays, string(w))
+	}
+	return AutoscalingSchedule{
+		ID:                  r.Id,
+		Name:                r.Name,
+		Enabled:             r.Enabled,
+		Cadence:             string(r.Cadence),
+		Weekdays:            weekdays,
+		StartHour:           intPtrToInt32Ptr(r.StartHour),
+		StartMinute:         int32(r.StartMinute),
+		EndHour:             intPtrToInt32Ptr(r.EndHour),
+		EndMinute:           int32(r.EndMinute),
+		AutoscalingSettings: toScheduleAutoscalingSettings(r.AutoscalingSettings),
+	}, nil
+}
+
+func toScheduleAutoscalingSettings(a managementapi.AutoscalingScheduleSettings) ScheduleAutoscalingSettings {
+	return ScheduleAutoscalingSettings{
+		MinReplica:                  int32(a.MinReplica),
+		MaxReplica:                  int32(a.MaxReplica),
+		AutoscalingWindow:           intPtrToInt32Ptr(a.AutoscalingWindow),
+		ScaleDownDelay:              intPtrToInt32Ptr(a.ScaleDownDelay),
+		ConcurrencyTarget:           intPtrToInt32Ptr(a.ConcurrencyTarget),
+		TargetUtilizationPercentage: intPtrToInt32Ptr(a.TargetUtilizationPercentage),
+		TargetInFlightTokens:        intPtrToInt32Ptr(a.TargetInFlightTokens),
+		MaxScaleDownRate:            intPtrToInt32Ptr(a.MaxScaleDownRate),
+	}
 }

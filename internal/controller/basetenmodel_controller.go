@@ -941,6 +941,9 @@ func observeDriftSuffix(model *modelsv1alpha1.BasetenModel, env *baseten.Environ
 	_, autoscalingChanges := baselineAutoscalingDrift(model, env)
 	_, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
 	_, scheduleChanges := baseten.HasScheduleDrift(model.Spec.Environment.AutoscalingSchedule, env.AutoscalingSchedules)
+	if model.Spec.Environment.AutoscalingSchedule != nil && env.ScheduleDecodeErr != nil {
+		scheduleChanges = []string{"autoscaling schedules unreadable"}
+	}
 	changes := append([]string{}, autoscalingChanges...)
 	changes = append(changes, promotionChanges...)
 	changes = append(changes, scheduleChanges...)
@@ -1456,6 +1459,18 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 		r.logUpdateStatus(ctx, model, statusUpdate{
 			deploymentStatus: baseten.DeploymentStatusFailed,
 			message:          fmt.Sprintf("Failed to get environment '%s': %v", envName, err),
+			modelID:          modelID,
+		})
+		return nil, &ctrl.Result{}, err
+	}
+
+	if model.Spec.Environment.AutoscalingSchedule != nil && env.ScheduleDecodeErr != nil {
+		err := env.ScheduleDecodeErr
+		logger.Error(err, "Failed to read autoscaling schedules")
+		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingScheduleUpdateFailed, "Failed to read autoscaling schedules for %s: %v", envName, err)
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus: baseten.DeploymentStatusFailed,
+			message:          fmt.Sprintf("failed to read autoscaling schedules for %s: %v", envName, err),
 			modelID:          modelID,
 		})
 		return nil, &ctrl.Result{}, err

@@ -17,6 +17,7 @@ import (
 const (
 	testStrategyReplica    = "REPLICA"
 	testCleanupScaleToZero = "SCALE_TO_ZERO"
+	testDevEnvPath         = "/v1/models/model1/environments/dev"
 )
 
 func ptr[T any](v T) *T {
@@ -669,12 +670,12 @@ func TestGetEnvironment(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/v1/models/model1/environments/dev" {
+			if r.URL.Path != testDevEnvPath {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
 			writeJSON(t, w, managementapi.Environment{
 				Name:              testEnvName,
-				CurrentDeployment: managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
+				CurrentDeployment: &managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
 			})
 		}))
 		defer srv.Close()
@@ -715,11 +716,11 @@ func TestListEnvironments(t *testing.T) {
 			Environments: []managementapi.Environment{
 				{
 					Name:              "dev",
-					CurrentDeployment: managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
+					CurrentDeployment: &managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
 				},
 				{
 					Name:              "staging",
-					CurrentDeployment: managementapi.Deployment{Id: "d2", Name: "dep-2", Status: status("ACTIVE")},
+					CurrentDeployment: &managementapi.Deployment{Id: "d2", Name: "dep-2", Status: status("ACTIVE")},
 					CandidateDeployment: &managementapi.Deployment{
 						Id: "d3", Name: "dep-3", Status: status("DEPLOYING"),
 					},
@@ -802,7 +803,7 @@ func TestUpdateEnvironmentSettings(t *testing.T) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("expected PATCH, got %s", r.Method)
 			}
-			if r.URL.Path != "/v1/models/model1/environments/dev" {
+			if r.URL.Path != testDevEnvPath {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
 			decodeJSON(t, r, &gotBody)

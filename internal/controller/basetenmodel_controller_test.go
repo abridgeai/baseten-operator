@@ -1220,6 +1220,54 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("AutoscalingUpdated")))
 			})
 
+			mockEnvWithDecodeErr := func(minReplica int32) {
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{
+						Name:                testEnvName,
+						CurrentDeployment:   &baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+						AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: minReplica, MaxReplica: 5, ConcurrencyTarget: 10},
+						ScheduleDecodeErr:   fmt.Errorf("unknown cadence"),
+					}, nil
+				}
+			}
+
+			It("should still correct baseline drift when unmanaged schedules cannot be decoded", func() {
+				name := "sched-decode-unmanaged"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithDecodeErr(3)
+				failScheduleUpdate()
+				updated := false
+				mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
+					updated = true
+					return nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+				Expect(updated).To(BeTrue())
+				Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("AutoscalingScheduleUpdateFailed")))
+			})
+
+			It("should not patch schedules when managed schedules cannot be decoded", func() {
+				name := "sched-decode-managed"
+				model := newScheduleModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithDecodeErr(0)
+				failScheduleUpdate()
+				failSettingsUpdate()
+
+				_, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred())
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("AutoscalingScheduleUpdateFailed")))
+				Expect(getModelStatus(name).Message).To(ContainSubstring("failed to read autoscaling schedules"))
+			})
+
 			It("should emit warning when schedule update fails", func() {
 				name := "sched-fail"
 				model := newScheduleModel(name)

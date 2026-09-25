@@ -2,13 +2,14 @@ package baseten
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
+	managementapi "github.com/basetenlabs/baseten-go/client/managementapi"
 )
 
 func specOvernight() modelsv1alpha1.AutoscalingSchedule {
@@ -83,8 +84,11 @@ func expiredOneTime() modelsv1alpha1.AutoscalingSchedule {
 
 func TestBuildScheduleSettingsDedupesDeletes(t *testing.T) {
 	a, b := observedOvernight(), withID(observedOvernight(), "sched-dup")
-	settings := buildScheduleSettings(&modelsv1alpha1.AutoscalingScheduleConfig{}, &AutoscalingSchedules{Schedules: []AutoscalingSchedule{a, b}})
-	if got := settings["delete_schedules"]; !reflect.DeepEqual(got, []string{"sched-dup", "sched-1"}) {
+	settings, err := toUpdateAutoscalingScheduleSettings(&modelsv1alpha1.AutoscalingScheduleConfig{}, &AutoscalingSchedules{Schedules: []AutoscalingSchedule{a, b}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := *settings.DeleteSchedules; !reflect.DeepEqual(got, []string{"sched-dup", "sched-1"}) {
 		t.Errorf("delete_schedules = %v, want each id once", got)
 	}
 }
@@ -200,13 +204,11 @@ func TestUpdateAutoscalingSchedules(t *testing.T) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("expected PATCH, got %s", r.Method)
 			}
-			if r.URL.Path != "/models/model1/environments/dev" {
+			if r.URL.Path != testDevEnvPath {
 				t.Errorf("unexpected path %s", r.URL.Path)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("failed to decode body: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
+			decodeJSON(t, r, &body)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -277,19 +279,70 @@ func TestUpdateAutoscalingSchedules(t *testing.T) {
 }
 
 func TestGetEnvironmentDecodesSchedules(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"name":"dev","autoscaling_schedules":{"timezone":"UTC","schedules":[{"id":"sched-1","name":"overnight","enabled":true,"cadence":"DAILY","weekdays":["MONDAY"],"start_hour":22,"start_minute":0,"end_hour":7,"end_minute":0,"autoscaling_settings":{"min_replica":1,"max_replica":10,"autoscaling_window":null,"scale_down_delay":null,"concurrency_target":null,"target_utilization_percentage":null,"target_in_flight_tokens":null,"max_scale_down_rate":null}}],"applied_state":{"schedule_id":"sched-1","autoscaling_settings":{"min_replica":1,"max_replica":10,"concurrency_target":1}}}}`))
-	}))
-	defer srv.Close()
+	t.Run("recurring, one-time, and applied state", func(t *testing.T) {
+		var daily, oneTime managementapi.EnvironmentAutoscalingSchedules_Schedules_Item
+		if err := daily.FromAutoscalingSchedule(managementapi.AutoscalingSchedule{
+			Id: "sched-1", Name: "overnight", Enabled: true, Cadence: "DAILY",
+			Weekdays:  []managementapi.AutoscalingScheduleWeekday{"MONDAY"},
+			StartHour: ptr(22), EndHour: ptr(7),
+			AutoscalingSettings: managementapi.AutoscalingScheduleSettings{MinReplica: 1, MaxReplica: 10},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Date(2026, 10, 1, 13, 0, 0, 0, time.UTC)
+		if err := oneTime.FromOneTimeAutoscalingSchedule(managementapi.OneTimeAutoscalingSchedule{
+			Id: "sched-2", Name: "launch", Enabled: true, StartAt: start, EndAt: start.Add(8 * time.Hour),
+			AutoscalingSettings: managementapi.AutoscalingScheduleSettings{MinReplica: 4, MaxReplica: 20, MaxScaleDownRate: ptr(10)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, managementapi.Environment{
+				Name: "dev",
+				AutoscalingSchedules: &managementapi.EnvironmentAutoscalingSchedules{
+					Timezone:     ptr("UTC"),
+					Schedules:    []managementapi.EnvironmentAutoscalingSchedules_Schedules_Item{daily, oneTime},
+					AppliedState: &managementapi.AutoscalingScheduleState{ScheduleId: ptr("sched-1")},
+				},
+			})
+		}))
+		defer srv.Close()
 
-	env, err := newTestClient(srv.URL).GetEnvironment(context.Background(), "model1", "dev")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ScheduleActive(env) {
-		t.Error("expected schedule to be active")
-	}
-	if got := env.AutoscalingSchedules.Schedules[0]; got.ID != "sched-1" || *got.StartHour != 22 || got.AutoscalingSettings.MaxReplica != 10 {
-		t.Errorf("unexpected decoded schedule: %+v", got)
-	}
+		env, err := newTestClient(srv.URL).GetEnvironment(context.Background(), "model1", "dev")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ScheduleActive(env) {
+			t.Error("expected schedule to be active")
+		}
+		if got := env.AutoscalingSchedules.Schedules[0]; got.ID != "sched-1" || *got.StartHour != 22 || got.Weekdays[0] != "MONDAY" || got.AutoscalingSettings.MaxReplica != 10 {
+			t.Errorf("unexpected decoded recurring schedule: %+v", got)
+		}
+		got := env.AutoscalingSchedules.Schedules[1]
+		if got.Cadence != CadenceOneTime || got.StartAt != "2026-10-01T13:00:00Z" || got.EndAt != "2026-10-01T21:00:00Z" || *got.AutoscalingSettings.MaxScaleDownRate != 10 {
+			t.Errorf("unexpected decoded one-time schedule: %+v", got)
+		}
+	})
+
+	t.Run("undecodable schedule is exposed without failing the environment", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"dev","autoscaling_settings":{"min_replica":2,"max_replica":5,"concurrency_target":1},"autoscaling_schedules":{"schedules":[{"id":"sched-1","cadence":"DAILY","weekdays":"MONDAY"}]}}`))
+		}))
+		defer srv.Close()
+
+		env, err := newTestClient(srv.URL).GetEnvironment(context.Background(), "model1", "dev")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if env.ScheduleDecodeErr == nil {
+			t.Error("expected ScheduleDecodeErr")
+		}
+		if env.AutoscalingSchedules != nil {
+			t.Error("expected no partial schedule view")
+		}
+		if env.AutoscalingSettings.MinReplica != 2 {
+			t.Errorf("baseline settings not mapped: %+v", env.AutoscalingSettings)
+		}
+	})
 }
