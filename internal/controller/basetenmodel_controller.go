@@ -938,14 +938,28 @@ func (r *BasetenModelReconciler) composeObserveStatus(model *modelsv1alpha1.Base
 // status message when spec settings diverge from observed environment
 // settings. Returns "" when there is no drift.
 func observeDriftSuffix(model *modelsv1alpha1.BasetenModel, env *baseten.Environment) string {
-	autoscalingDrift, autoscalingChanges := baseten.HasAutoscalingDrift(model.Spec.Environment.Autoscaling, env.AutoscalingSettings)
-	promotionDrift, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
-	if !autoscalingDrift && !promotionDrift {
-		return ""
+	_, autoscalingChanges := baselineAutoscalingDrift(model, env)
+	_, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
+	_, scheduleChanges := baseten.HasScheduleDrift(model.Spec.Environment.AutoscalingSchedule, env.AutoscalingSchedules)
+	if model.Spec.Environment.AutoscalingSchedule != nil && env.ScheduleDecodeErr != nil {
+		scheduleChanges = []string{"autoscaling schedules unreadable"}
 	}
 	changes := append([]string{}, autoscalingChanges...)
 	changes = append(changes, promotionChanges...)
+	changes = append(changes, scheduleChanges...)
+	if len(changes) == 0 {
+		return ""
+	}
 	return fmt.Sprintf(" | drift: %s; awaiting reconciliation", strings.Join(changes, ", "))
+}
+
+// baselineAutoscalingDrift skips baseline comparison while a spec-managed schedule window is applied so the
+// operator never fights a schedule, in case the API reports applied settings as the baseline.
+func baselineAutoscalingDrift(model *modelsv1alpha1.BasetenModel, env *baseten.Environment) (bool, []string) {
+	if model.Spec.Environment.AutoscalingSchedule != nil && baseten.ScheduleActive(env) {
+		return false, nil
+	}
+	return baseten.HasAutoscalingDrift(model.Spec.Environment.Autoscaling, env.AutoscalingSettings)
 }
 
 // handleCandidateFailure handles a candidate deployment in terminal failure state.
@@ -1450,12 +1464,25 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 		return nil, &ctrl.Result{}, err
 	}
 
-	// Check for both autoscaling and promotion settings drift
-	autoscalingDrift, autoscalingChanges := baseten.HasAutoscalingDrift(model.Spec.Environment.Autoscaling, env.AutoscalingSettings)
-	promotionDrift, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
+	if model.Spec.Environment.AutoscalingSchedule != nil && env.ScheduleDecodeErr != nil {
+		err := env.ScheduleDecodeErr
+		logger.Error(err, "Failed to read autoscaling schedules")
+		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingScheduleUpdateFailed, "Failed to read autoscaling schedules for %s: %v", envName, err)
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus: baseten.DeploymentStatusFailed,
+			message:          fmt.Sprintf("failed to read autoscaling schedules for %s: %v", envName, err),
+			modelID:          modelID,
+		})
+		return nil, &ctrl.Result{}, err
+	}
 
-	if autoscalingDrift || promotionDrift {
+	autoscalingDrift, autoscalingChanges := baselineAutoscalingDrift(model, env)
+	promotionDrift, promotionChanges := baseten.HasPromotionSettingsDrift(model.Spec.Environment.PromotionSettings, env.PromotionSettings)
+	scheduleDrift, scheduleChanges := baseten.HasScheduleDrift(model.Spec.Environment.AutoscalingSchedule, env.AutoscalingSchedules)
+
+	if autoscalingDrift || promotionDrift || scheduleDrift {
 		allChanges := append(autoscalingChanges, promotionChanges...)
+		allChanges = append(allChanges, scheduleChanges...)
 		logger.Info("Environment settings drift detected, updating",
 			"environment", envName,
 			"changes", allChanges)
@@ -1475,20 +1502,34 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 			promotionConfig = model.Spec.Environment.PromotionSettings
 		}
 
-		if err := r.BasetenClient.UpdateEnvironmentSettings(ctx, modelID, envName, autoscalingConfig, promotionConfig); err != nil {
-			logger.Error(err, "Failed to update environment settings")
-			if autoscalingDrift {
-				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingUpdateFailed, "Failed to update autoscaling for %s: %v", envName, err)
+		if autoscalingDrift || promotionDrift {
+			if err := r.BasetenClient.UpdateEnvironmentSettings(ctx, modelID, envName, autoscalingConfig, promotionConfig); err != nil {
+				logger.Error(err, "Failed to update environment settings")
+				if autoscalingDrift {
+					r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingUpdateFailed, "Failed to update autoscaling for %s: %v", envName, err)
+				}
+				if promotionDrift {
+					r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionSettingsUpdateFailed, "Failed to update promotion settings for %s: %v", envName, err)
+				}
+				r.logUpdateStatus(ctx, model, statusUpdate{
+					deploymentStatus: baseten.DeploymentStatusFailed,
+					message:          fmt.Sprintf("%sfailed to update settings for %s: %v", activeMsg, envName, err),
+					modelID:          modelID,
+				})
+				return nil, &ctrl.Result{}, err
 			}
-			if promotionDrift {
-				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionSettingsUpdateFailed, "Failed to update promotion settings for %s: %v", envName, err)
+		}
+		if scheduleDrift {
+			if err := r.BasetenClient.UpdateAutoscalingSchedules(ctx, modelID, envName, model.Spec.Environment.AutoscalingSchedule, env.AutoscalingSchedules); err != nil {
+				logger.Error(err, "Failed to update autoscaling schedules")
+				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingScheduleUpdateFailed, "Failed to update autoscaling schedules for %s: %v", envName, err)
+				r.logUpdateStatus(ctx, model, statusUpdate{
+					deploymentStatus: baseten.DeploymentStatusFailed,
+					message:          fmt.Sprintf("%sfailed to update autoscaling schedules for %s: %v", activeMsg, envName, err),
+					modelID:          modelID,
+				})
+				return nil, &ctrl.Result{}, err
 			}
-			r.logUpdateStatus(ctx, model, statusUpdate{
-				deploymentStatus: baseten.DeploymentStatusFailed,
-				message:          fmt.Sprintf("%sfailed to update settings for %s: %v", activeMsg, envName, err),
-				modelID:          modelID,
-			})
-			return nil, &ctrl.Result{}, err
 		}
 
 		logger.Info("Environment settings updated successfully", "environment", envName)
@@ -1507,6 +1548,13 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 				driftMsg = fmt.Sprintf("updating promotion settings: %d changes", len(promotionChanges))
 			}
 			r.Recorder.Event(model, corev1.EventTypeNormal, EventPromotionSettingsUpdated, driftMsg)
+		}
+		if scheduleDrift {
+			driftMsg := fmt.Sprintf("updating autoscaling schedules: %s", scheduleChanges[0])
+			if len(scheduleChanges) > 1 {
+				driftMsg = fmt.Sprintf("updating autoscaling schedules: %d changes", len(scheduleChanges))
+			}
+			r.Recorder.Event(model, corev1.EventTypeNormal, EventAutoscalingScheduleUpdated, driftMsg)
 		}
 
 		statusMsg := fmt.Sprintf("updating settings: %d changes", len(allChanges))

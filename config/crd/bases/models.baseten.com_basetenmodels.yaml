@@ -136,6 +136,188 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                  autoscalingSchedule:
+                    description: |-
+                      AutoscalingSchedule declares the full set of autoscaling schedules for this environment.
+                      When set, the operator owns the collection: schedules missing from spec are deleted.
+                      When absent, the operator never reads or writes schedules.
+                      Maps to Baseten API: autoscaling_schedule_settings
+                    properties:
+                      schedules:
+                        description: Schedules is the complete list of schedules,
+                          matched to Baseten schedules by name
+                        items:
+                          description: AutoscalingSchedule defines a single autoscaling
+                            window
+                          properties:
+                            autoscaling:
+                              description: |-
+                                Autoscaling is applied while the window is active. Unset optional fields inherit
+                                the environment's autoscaling settings.
+                              properties:
+                                autoscalingWindow:
+                                  description: AutoscalingWindow is the timeframe
+                                    of traffic considered for autoscaling decisions
+                                    (in seconds)
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                concurrencyTarget:
+                                  description: ConcurrencyTarget is the number of
+                                    requests per replica before scaling up
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                maxReplicas:
+                                  description: MaxReplicas is the maximum number of
+                                    replicas during the window
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                maxScaleDownRate:
+                                  description: MaxScaleDownRate caps how many replicas
+                                    can be removed per scale-down step
+                                  format: int32
+                                  maximum: 50
+                                  minimum: 1
+                                  type: integer
+                                minReplicas:
+                                  description: MinReplicas is the minimum number of
+                                    replicas during the window
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                scaleDownDelay:
+                                  description: ScaleDownDelay is the waiting period
+                                    before scaling down any active replica (in seconds)
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                targetInFlightTokens:
+                                  description: TargetInFlightTokens is the target
+                                    number of in-flight tokens per replica
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                targetUtilizationPercentage:
+                                  description: TargetUtilizationPercentage is the
+                                    target utilization percentage for scaling decisions
+                                  format: int32
+                                  maximum: 100
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - maxReplicas
+                              - minReplicas
+                              type: object
+                            cadence:
+                              description: Cadence is how often the window recurs
+                              enum:
+                              - DAILY
+                              - HOURLY
+                              - ONE_TIME
+                              type: string
+                            enabled:
+                              default: true
+                              description: Enabled toggles the schedule without removing
+                                it
+                              type: boolean
+                            endAt:
+                              description: EndAt is the RFC 3339 end time of a ONE_TIME
+                                window
+                              format: date-time
+                              type: string
+                            endHour:
+                              description: EndHour is the hour the window closes (DAILY
+                                only)
+                              format: int32
+                              maximum: 23
+                              minimum: 0
+                              type: integer
+                            endMinute:
+                              description: EndMinute is the minute the window closes
+                                (DAILY and HOURLY)
+                              format: int32
+                              maximum: 59
+                              minimum: 0
+                              type: integer
+                            name:
+                              description: Name identifies the schedule and must be
+                                unique within the environment
+                              minLength: 1
+                              type: string
+                            startAt:
+                              description: StartAt is the RFC 3339 start time of a
+                                ONE_TIME window
+                              format: date-time
+                              type: string
+                            startHour:
+                              description: StartHour is the hour the window opens
+                                (DAILY only)
+                              format: int32
+                              maximum: 23
+                              minimum: 0
+                              type: integer
+                            startMinute:
+                              description: StartMinute is the minute the window opens
+                                (DAILY and HOURLY)
+                              format: int32
+                              maximum: 59
+                              minimum: 0
+                              type: integer
+                            weekdays:
+                              description: Weekdays the window applies to (DAILY and
+                                HOURLY only)
+                              items:
+                                description: Weekday is a day of the week as named
+                                  by the Baseten API
+                                enum:
+                                - SUNDAY
+                                - MONDAY
+                                - TUESDAY
+                                - WEDNESDAY
+                                - THURSDAY
+                                - FRIDAY
+                                - SATURDAY
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - autoscaling
+                          - cadence
+                          - name
+                          type: object
+                          x-kubernetes-validations:
+                          - message: weekdays is required for DAILY and HOURLY schedules
+                            rule: self.cadence == 'ONE_TIME' || (has(self.weekdays)
+                              && size(self.weekdays) > 0)
+                          - message: startAt and endAt are required for ONE_TIME schedules
+                            rule: self.cadence != 'ONE_TIME' || (has(self.startAt)
+                              && has(self.endAt))
+                          - message: startAt and endAt are only valid for ONE_TIME
+                              schedules
+                            rule: self.cadence == 'ONE_TIME' || (!has(self.startAt)
+                              && !has(self.endAt))
+                          - message: startHour and endHour are required for DAILY
+                              schedules
+                            rule: self.cadence != 'DAILY' || (has(self.startHour)
+                              && has(self.endHour))
+                          - message: startHour and endHour are only valid for DAILY
+                              schedules
+                            rule: self.cadence == 'DAILY' || (!has(self.startHour)
+                              && !has(self.endHour))
+                        maxItems: 10
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      timezone:
+                        description: |-
+                          Timezone is the IANA timezone the schedules are evaluated in (e.g., America/New_York).
+                          Omitting it leaves the environment's current timezone unchanged.
+                        minLength: 1
+                        type: string
+                    type: object
                   name:
                     description: |-
                       Name is the environment name (e.g., dev, staging, production)

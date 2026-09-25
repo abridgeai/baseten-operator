@@ -100,6 +100,21 @@ spec:
       autoscalingWindow: 600                         # seconds
       scaleDownDelay: 120                            # seconds
       targetUtilizationPercentage: 70
+    autoscalingSchedule:                             # optional; absent means schedules are never touched
+      timezone: America/New_York                     # IANA; omit to keep current
+      schedules:                                     # max 10; matched by name; unlisted schedules are deleted
+      - name: weekday-overnight
+        enabled: true                                # default: true
+        cadence: DAILY                               # DAILY, HOURLY, ONE_TIME
+        weekdays: [MONDAY, TUESDAY]                  # DAILY/HOURLY only
+        startHour: 22
+        startMinute: 0
+        endHour: 7
+        endMinute: 0
+        # startAt / endAt: RFC 3339 times, ONE_TIME only
+        autoscaling:                                 # min/maxReplicas required; unset fields inherit the environment
+          minReplicas: 1
+          maxReplicas: 10
     promotionSettings:                               # optional — all fields optional, drift-reconciled
       # Promote-time flags (passed to POST /promote, not stored on environment)
       scaleDownPreviousDeployment: true              # default: true
@@ -172,6 +187,8 @@ spec:
 ### Drift Detection and Correction
 
 If someone changes autoscaling or promotion settings in the Baseten UI, the operator detects the drift on the next reconcile and corrects it back to the desired state defined in the CR. Both autoscaling and promotion settings are reconciled in a single API call.
+
+When `spec.environment.autoscalingSchedule` is set, the operator also owns the environment's autoscaling schedules: it creates schedules missing from Baseten, replaces changed ones, and deletes any not listed in the CR. While a schedule window is applied, baseline autoscaling drift is not corrected so the operator never fights an active schedule. Setting `schedules: []` deletes every schedule on that environment. ONE_TIME schedules whose `endAt` has passed are left alone rather than written.
 
 ### Automatic Deployment Retry
 
@@ -390,6 +407,7 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 | `EnvironmentCreated` | Environment created with autoscaling settings |
 | `AutoscalingUpdated` | Autoscaling settings corrected due to drift |
 | `PromotionSettingsUpdated` | Promotion settings corrected due to drift |
+| `AutoscalingScheduleUpdated` | Autoscaling schedules created, replaced, or deleted to match spec |
 | `DeploymentPromoted` | Deployment promoted to environment |
 | `DeploymentActive` | Deployment is now active after promotion |
 | `TrussPushStarted` | Truss push launched to create deployment |
@@ -408,6 +426,7 @@ Every operation emits standard Kubernetes events, visible via `kubectl describe`
 | `EnvironmentCreateFailed` | Environment creation failed |
 | `AutoscalingUpdateFailed` | Autoscaling settings update failed |
 | `PromotionSettingsUpdateFailed` | Promotion settings update failed |
+| `AutoscalingScheduleUpdateFailed` | Autoscaling schedules update failed |
 | `SourceDeploymentNotFound` | Source deployment not found in Baseten |
 | `SourceDeploymentFailed` | Source deployment is in terminal failure state |
 | `PromotionFailed` | Promotion API call failed or candidate failed |

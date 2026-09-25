@@ -74,6 +74,7 @@ type ClientInterface interface {
 	ListEnvironments(ctx context.Context, modelID string) ([]Environment, error)
 	CreateEnvironment(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error
 	UpdateEnvironmentSettings(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error
+	UpdateAutoscalingSchedules(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error
 	FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error)
 	ActivateDeployment(ctx context.Context, modelID, deploymentID string) error
 	Promote(ctx context.Context, modelID, deploymentID, targetEnv string, settings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error)
@@ -177,11 +178,15 @@ type Environment struct {
 	CandidateDeployment *Deployment          `json:"candidate_deployment,omitempty"`
 	AutoscalingSettings *AutoscalingSettings `json:"autoscaling_settings,omitempty"`
 	PromotionSettings   *PromotionSettings   `json:"promotion_settings,omitempty"`
+	// AutoscalingSettings is assumed to be the baseline; the active schedule's settings live in AutoscalingSchedules.AppliedState.
+	AutoscalingSchedules *AutoscalingSchedules `json:"autoscaling_schedules,omitempty"`
+	// ScheduleDecodeErr is set instead of failing the whole GET, so only CRs that manage schedules are affected.
+	ScheduleDecodeErr error `json:"-"`
 }
 
 // FindModelIDByName lists all models and returns the ID matching modelName ("" if not found).
 func (c *Client) FindModelIDByName(ctx context.Context, modelName string) (string, error) {
-	models, err := c.api.GetModels(ctx)
+	models, err := c.api.GetModels(ctx, managementapi.GetV1ModelsParams{})
 	if err != nil {
 		return "", toAPIError(err)
 	}
@@ -201,7 +206,7 @@ func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
 
 // FindDeploymentIDByName lists deployments and returns the ID and status matching deploymentName.
 func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
-	deps, err := c.api.GetModelsDeployments(ctx, modelID)
+	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
 	if err != nil {
 		return "", "", toAPIError(err)
 	}
@@ -280,7 +285,7 @@ func (c *Client) Promote(ctx context.Context, modelID, deploymentID, targetEnv s
 }
 
 func (c *Client) ListDeployments(ctx context.Context, modelID string) ([]DeploymentDetail, error) {
-	deps, err := c.api.GetModelsDeployments(ctx, modelID)
+	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
 	if err != nil {
 		return nil, toAPIError(err)
 	}
@@ -350,17 +355,20 @@ func toDeploymentDetail(d managementapi.Deployment) DeploymentDetail {
 		IsProduction:        d.IsProduction,
 		IsDevelopment:       d.IsDevelopment,
 		Environment:         d.Environment,
-		AutoscalingSettings: toAutoscalingSettings(d.AutoscalingSettings),
+		AutoscalingSettings: toAutoscalingSettingsPtr(d.AutoscalingSettings),
 	}
 }
 
 func toEnvironment(e *managementapi.Environment) *Environment {
+	schedules, err := toAutoscalingSchedules(e.AutoscalingSchedules)
 	return &Environment{
-		Name:                e.Name,
-		CurrentDeployment:   toDeploymentPtr(e.CurrentDeployment),
-		CandidateDeployment: toDeployment(e.CandidateDeployment),
-		AutoscalingSettings: toAutoscalingSettings(e.AutoscalingSettings),
-		PromotionSettings:   toPromotionSettings(e.PromotionSettings),
+		Name:                 e.Name,
+		CurrentDeployment:    toDeployment(e.CurrentDeployment),
+		CandidateDeployment:  toDeployment(e.CandidateDeployment),
+		AutoscalingSettings:  toAutoscalingSettings(e.AutoscalingSettings),
+		PromotionSettings:    toPromotionSettings(e.PromotionSettings),
+		AutoscalingSchedules: schedules,
+		ScheduleDecodeErr:    err,
 	}
 }
 
@@ -373,6 +381,13 @@ func toAutoscalingSettings(a managementapi.AutoscalingSettings) *AutoscalingSett
 		ScaleDownDelay:              intPtrToInt32Ptr(a.ScaleDownDelay),
 		TargetUtilizationPercentage: intPtrToInt32Ptr(a.TargetUtilizationPercentage),
 	}
+}
+
+func toAutoscalingSettingsPtr(a *managementapi.AutoscalingSettings) *AutoscalingSettings {
+	if a == nil {
+		return nil
+	}
+	return toAutoscalingSettings(*a)
 }
 
 func toPromotionSettings(p managementapi.PromotionSettings) *PromotionSettings {

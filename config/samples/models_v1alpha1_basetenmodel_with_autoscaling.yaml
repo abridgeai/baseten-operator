@@ -21,6 +21,21 @@ spec:
       autoscalingWindow: 600
       targetUtilizationPercentage: 70
 
+    # Scheduled overrides; the operator owns the full schedule list when set
+    autoscalingSchedule:
+      timezone: America/New_York
+      schedules:
+      - name: weekday-overnight
+        cadence: DAILY
+        weekdays: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY]
+        startHour: 22
+        startMinute: 0
+        endHour: 7
+        endMinute: 0
+        autoscaling:
+          minReplicas: 1
+          maxReplicas: 10
+
     # Production promotion settings
     promotionSettings:
       scaleDownPreviousDeployment: true
