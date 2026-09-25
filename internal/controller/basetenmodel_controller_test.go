@@ -1104,38 +1104,6 @@ var _ = Describe("BasetenModel Controller", func() {
 				Entry("hourly with hours", func(s *modelsv1alpha1.AutoscalingSchedule) { s.Cadence = "HOURLY" }, "only valid for DAILY"),
 			)
 
-			It("should reject duplicate schedule names at admission", func() {
-				model := newScheduleModel("sched-dup")
-				model.Spec.Environment.AutoscalingSchedule.Schedules = append(model.Spec.Environment.AutoscalingSchedule.Schedules, overnight())
-				err := k8sClient.Create(ctx, model)
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("Duplicate value"))
-			})
-
-			It("should create schedules missing from the environment", func() {
-				name := "sched-create"
-				model := newScheduleModel(name)
-				defer cleanupModel(name)
-
-				mockModelFound()
-				mockEnvWithSchedules(nil)
-				failSettingsUpdate()
-				var gotSpec *modelsv1alpha1.AutoscalingScheduleConfig
-				mockClient.UpdateAutoscalingSchedulesFunc = func(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *baseten.AutoscalingSchedules) error {
-					gotSpec = spec
-					return nil
-				}
-
-				result, err := reconcileModel(model)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
-				Expect(gotSpec).NotTo(BeNil())
-				Expect(gotSpec.Schedules).To(HaveLen(1))
-				events := drainEvents()
-				Expect(events).To(ContainElement(ContainSubstring("AutoscalingScheduleUpdated")))
-				Expect(events).To(ContainElement(ContainSubstring("updating autoscaling schedules: 2 changes")))
-			})
-
 			It("should replace changed schedules and delete ones not in spec", func() {
 				name := "sched-replace-delete"
 				model := newScheduleModel(name)

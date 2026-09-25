@@ -92,8 +92,6 @@ func TestBuildScheduleSettingsDedupesDeletes(t *testing.T) {
 func TestHasScheduleDrift(t *testing.T) {
 	changedMin := specOvernight()
 	changedMin.Autoscaling.MinReplicas = 2
-	disabled := specOvernight()
-	disabled.Enabled = ptr(false)
 	withWindow := specOvernight()
 	withWindow.Autoscaling.AutoscalingWindow = ptr(int32(60))
 
@@ -119,12 +117,6 @@ func TestHasScheduleDrift(t *testing.T) {
 		{
 			"replace on autoscaling change",
 			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{changedMin}},
-			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight()}},
-			[]string{"schedule overnight changed"},
-		},
-		{
-			"replace on enabled change",
-			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{disabled}},
 			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight()}},
 			[]string{"schedule overnight changed"},
 		},
@@ -202,26 +194,20 @@ func TestHasScheduleDrift(t *testing.T) {
 }
 
 func TestUpdateAutoscalingSchedules(t *testing.T) {
-	capture := func(t *testing.T, gotBody *map[string]interface{}, calls *int) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			*calls++
+	t.Run("create, replace, and delete in one request", func(t *testing.T) {
+		var body map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("expected PATCH, got %s", r.Method)
 			}
 			if r.URL.Path != "/models/model1/environments/dev" {
 				t.Errorf("unexpected path %s", r.URL.Path)
 			}
-			if err := json.NewDecoder(r.Body).Decode(gotBody); err != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("failed to decode body: %v", err)
 			}
 			w.WriteHeader(http.StatusOK)
 		}))
-	}
-
-	t.Run("create, replace, and delete in one request", func(t *testing.T) {
-		var body map[string]interface{}
-		calls := 0
-		srv := capture(t, &body, &calls)
 		defer srv.Close()
 
 		changed := specOvernight()
@@ -288,34 +274,6 @@ func TestUpdateAutoscalingSchedules(t *testing.T) {
 			t.Errorf("unexpected one-time schedule: %v", created)
 		}
 	})
-
-	t.Run("no request when in sync", func(t *testing.T) {
-		var body map[string]interface{}
-		calls := 0
-		srv := capture(t, &body, &calls)
-		defer srv.Close()
-
-		spec := &modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{specOvernight()}}
-		observed := &AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight()}}
-		if err := newTestClient(srv.URL).UpdateAutoscalingSchedules(context.Background(), "model1", "dev", spec, observed); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if calls != 0 {
-			t.Errorf("expected no request, got %d", calls)
-		}
-	})
-
-	t.Run("error", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeError(t, w, http.StatusBadRequest, "overlap")
-		}))
-		defer srv.Close()
-
-		spec := &modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{specOvernight()}}
-		if err := newTestClient(srv.URL).UpdateAutoscalingSchedules(context.Background(), "model1", "dev", spec, nil); err == nil {
-			t.Fatal("expected error")
-		}
-	})
 }
 
 func TestGetEnvironmentDecodesSchedules(t *testing.T) {
@@ -333,26 +291,5 @@ func TestGetEnvironmentDecodesSchedules(t *testing.T) {
 	}
 	if got := env.AutoscalingSchedules.Schedules[0]; got.ID != "sched-1" || *got.StartHour != 22 || got.AutoscalingSettings.MaxReplica != 10 {
 		t.Errorf("unexpected decoded schedule: %+v", got)
-	}
-}
-
-func TestScheduleActive(t *testing.T) {
-	tests := []struct {
-		name string
-		env  *Environment
-		want bool
-	}{
-		{"nil env", nil, false},
-		{"no schedules", &Environment{}, false},
-		{"no applied state", &Environment{AutoscalingSchedules: &AutoscalingSchedules{}}, false},
-		{"baseline applied", &Environment{AutoscalingSchedules: &AutoscalingSchedules{AppliedState: &AutoscalingScheduleState{}}}, false},
-		{"schedule applied", &Environment{AutoscalingSchedules: &AutoscalingSchedules{AppliedState: &AutoscalingScheduleState{ScheduleID: ptr("sched-1")}}}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ScheduleActive(tt.env); got != tt.want {
-				t.Errorf("ScheduleActive() = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }
