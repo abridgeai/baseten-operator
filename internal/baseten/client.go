@@ -74,6 +74,7 @@ type ClientInterface interface {
 	ListEnvironments(ctx context.Context, modelID string) ([]Environment, error)
 	CreateEnvironment(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error
 	UpdateEnvironmentSettings(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error
+	UpdateAutoscalingSchedules(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error
 	FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error)
 	ActivateDeployment(ctx context.Context, modelID, deploymentID string) error
 	Promote(ctx context.Context, modelID, deploymentID, targetEnv string, settings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error)
@@ -177,6 +178,8 @@ type Environment struct {
 	CandidateDeployment *Deployment          `json:"candidate_deployment,omitempty"`
 	AutoscalingSettings *AutoscalingSettings `json:"autoscaling_settings,omitempty"`
 	PromotionSettings   *PromotionSettings   `json:"promotion_settings,omitempty"`
+	// AutoscalingSettings is assumed to be the baseline; the active schedule's settings live in AutoscalingSchedules.AppliedState.
+	AutoscalingSchedules *AutoscalingSchedules `json:"autoscaling_schedules,omitempty"`
 }
 
 // FindModelIDByName lists all models and returns the ID matching modelName ("" if not found).

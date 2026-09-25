@@ -338,6 +338,144 @@ type EnvironmentConfig struct {
 	// Maps to Baseten API: promotion_settings (create) and promote operation flags
 	// +optional
 	PromotionSettings *PromotionSettingsConfig `json:"promotionSettings,omitempty"`
+
+	// AutoscalingSchedule declares the full set of autoscaling schedules for this environment.
+	// When set, the operator owns the collection: schedules missing from spec are deleted.
+	// When absent, the operator never reads or writes schedules.
+	// Maps to Baseten API: autoscaling_schedule_settings
+	// +optional
+	AutoscalingSchedule *AutoscalingScheduleConfig `json:"autoscalingSchedule,omitempty"`
+}
+
+// AutoscalingScheduleConfig defines time-windowed autoscaling overrides for an environment
+type AutoscalingScheduleConfig struct {
+	// Timezone is the IANA timezone the schedules are evaluated in (e.g., America/New_York).
+	// Omitting it leaves the environment's current timezone unchanged.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Timezone *string `json:"timezone,omitempty"`
+
+	// Schedules is the complete list of schedules, matched to Baseten schedules by name
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=10
+	Schedules []AutoscalingSchedule `json:"schedules,omitempty"`
+}
+
+// AutoscalingSchedule defines a single autoscaling window
+// +kubebuilder:validation:XValidation:rule="self.cadence == 'ONE_TIME' || (has(self.weekdays) && size(self.weekdays) > 0)",message="weekdays is required for DAILY and HOURLY schedules"
+// +kubebuilder:validation:XValidation:rule="self.cadence != 'ONE_TIME' || (has(self.startAt) && has(self.endAt))",message="startAt and endAt are required for ONE_TIME schedules"
+// +kubebuilder:validation:XValidation:rule="self.cadence == 'ONE_TIME' || (!has(self.startAt) && !has(self.endAt))",message="startAt and endAt are only valid for ONE_TIME schedules"
+type AutoscalingSchedule struct {
+	// Name identifies the schedule and must be unique within the environment
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Enabled toggles the schedule without removing it
+	// +optional
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Cadence is how often the window recurs
+	// +required
+	// +kubebuilder:validation:Enum=DAILY;HOURLY;ONE_TIME
+	Cadence string `json:"cadence"`
+
+	// Weekdays the window applies to (DAILY and HOURLY only)
+	// +optional
+	// +listType=set
+	Weekdays []Weekday `json:"weekdays,omitempty"`
+
+	// StartHour is the hour the window opens (DAILY only)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=23
+	StartHour *int32 `json:"startHour,omitempty"`
+
+	// StartMinute is the minute the window opens (DAILY and HOURLY)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=59
+	StartMinute int32 `json:"startMinute,omitempty"`
+
+	// EndHour is the hour the window closes (DAILY only)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=23
+	EndHour *int32 `json:"endHour,omitempty"`
+
+	// EndMinute is the minute the window closes (DAILY and HOURLY)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=59
+	EndMinute int32 `json:"endMinute,omitempty"`
+
+	// StartAt is the RFC 3339 start time of a ONE_TIME window
+	// +optional
+	// +kubebuilder:validation:Format=date-time
+	StartAt string `json:"startAt,omitempty"`
+
+	// EndAt is the RFC 3339 end time of a ONE_TIME window
+	// +optional
+	// +kubebuilder:validation:Format=date-time
+	EndAt string `json:"endAt,omitempty"`
+
+	// Autoscaling is applied while the window is active. Unset optional fields inherit
+	// the environment's autoscaling settings.
+	// +required
+	Autoscaling ScheduleAutoscalingConfig `json:"autoscaling"`
+}
+
+// Weekday is a day of the week as named by the Baseten API
+// +kubebuilder:validation:Enum=SUNDAY;MONDAY;TUESDAY;WEDNESDAY;THURSDAY;FRIDAY;SATURDAY
+type Weekday string
+
+// ScheduleAutoscalingConfig defines the autoscaling override applied during a schedule window
+// Maps to Baseten API: AutoscalingScheduleSettingsRequestV1
+type ScheduleAutoscalingConfig struct {
+	// MinReplicas is the minimum number of replicas during the window
+	// +required
+	// +kubebuilder:validation:Minimum=0
+	MinReplicas int32 `json:"minReplicas"`
+
+	// MaxReplicas is the maximum number of replicas during the window
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas int32 `json:"maxReplicas"`
+
+	// ConcurrencyTarget is the number of requests per replica before scaling up
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	ConcurrencyTarget *int32 `json:"concurrencyTarget,omitempty"`
+
+	// AutoscalingWindow is the timeframe of traffic considered for autoscaling decisions (in seconds)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	AutoscalingWindow *int32 `json:"autoscalingWindow,omitempty"`
+
+	// ScaleDownDelay is the waiting period before scaling down any active replica (in seconds)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ScaleDownDelay *int32 `json:"scaleDownDelay,omitempty"`
+
+	// TargetUtilizationPercentage is the target utilization percentage for scaling decisions
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	TargetUtilizationPercentage *int32 `json:"targetUtilizationPercentage,omitempty"`
+
+	// TargetInFlightTokens is the target number of in-flight tokens per replica
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	TargetInFlightTokens *int32 `json:"targetInFlightTokens,omitempty"`
+
+	// MaxScaleDownRate caps how many replicas can be removed per scale-down step
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=50
+	MaxScaleDownRate *int32 `json:"maxScaleDownRate,omitempty"`
 }
 
 // AutoscalingConfig defines autoscaling parameters

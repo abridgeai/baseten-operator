@@ -42,6 +42,9 @@ Both converge on environment reconciliation + promotion.
   `TerminalError`. BUILD_STOPPED is intentional and not retried. Always-on, no spec config.
 - **Orphan cleanup** is opt-in (`spec.orphanDeploymentCleanup`) and runs only in the steady-state
   happy path. All thresholds must be set explicitly — nil means skip.
+- **Autoscaling schedules** (`spec.environment.autoscalingSchedule`) are owned as a full collection
+  matched by name; absent means the operator never touches them. Baseline autoscaling drift is skipped
+  while `autoscaling_schedules.applied_state.schedule_id` is set.
 - **`spec.paused: true`** stops all reconciliation/API calls and preserves last status.
 
 ## Conventions

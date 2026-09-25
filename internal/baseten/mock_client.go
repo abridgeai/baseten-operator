@@ -13,6 +13,7 @@ type MockClient struct {
 	ListEnvironmentsFunc            func(ctx context.Context, modelID string) ([]Environment, error)
 	CreateEnvironmentFunc           func(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error
 	UpdateEnvironmentSettingsFunc   func(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error
+	UpdateAutoscalingSchedulesFunc  func(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error
 	FindDeploymentIDByNameFunc      func(ctx context.Context, modelID, deploymentName string) (string, string, error)
 	ActivateDeploymentFunc          func(ctx context.Context, modelID, deploymentID string) error
 	PromoteFunc                     func(ctx context.Context, modelID, deploymentID, targetEnv string, settings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error)
@@ -42,6 +43,10 @@ func (m *MockClient) CreateEnvironment(ctx context.Context, modelID string, envC
 
 func (m *MockClient) UpdateEnvironmentSettings(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error {
 	return m.UpdateEnvironmentSettingsFunc(ctx, modelID, envName, autoscalingConfig, promotionConfig)
+}
+
+func (m *MockClient) UpdateAutoscalingSchedules(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error {
+	return m.UpdateAutoscalingSchedulesFunc(ctx, modelID, envName, spec, observed)
 }
 
 func (m *MockClient) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
