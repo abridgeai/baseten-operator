@@ -114,11 +114,20 @@ func diffSchedules(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *Aut
 		d.changes = append(d.changes, fmt.Sprintf("scheduleTimezone %s→%s", derefString(observed.Timezone), *spec.Timezone))
 	}
 
+	deleted := map[string]bool{}
+	remove := func(o AutoscalingSchedule, change string) {
+		if deleted[o.ID] {
+			return
+		}
+		deleted[o.ID] = true
+		d.deletes = append(d.deletes, o.ID)
+		d.changes = append(d.changes, change)
+	}
+
 	byName := make(map[string]AutoscalingSchedule, len(observed.Schedules))
 	for _, o := range observed.Schedules {
 		if _, dup := byName[o.Name]; dup {
-			d.deletes = append(d.deletes, o.ID)
-			d.changes = append(d.changes, fmt.Sprintf("schedule %s duplicate removed", o.Name))
+			remove(o, fmt.Sprintf("schedule %s duplicate removed", o.Name))
 			continue
 		}
 		byName[o.Name] = o
@@ -127,6 +136,9 @@ func diffSchedules(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *Aut
 	inSpec := make(map[string]bool, len(spec.Schedules))
 	for _, s := range spec.Schedules {
 		inSpec[s.Name] = true
+		if expired(s) {
+			continue
+		}
 		want := scheduleFromSpec(s)
 		o, ok := byName[s.Name]
 		switch {
@@ -142,8 +154,7 @@ func diffSchedules(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *Aut
 
 	for _, o := range observed.Schedules {
 		if !inSpec[o.Name] {
-			d.deletes = append(d.deletes, o.ID)
-			d.changes = append(d.changes, fmt.Sprintf("schedule %s removed", o.Name))
+			remove(o, fmt.Sprintf("schedule %s removed", o.Name))
 		}
 	}
 
@@ -216,12 +227,24 @@ func normalizeSchedule(s AutoscalingSchedule) AutoscalingSchedule {
 		return s
 	}
 	s.StartAt, s.EndAt = "", ""
+	if s.Cadence == "HOURLY" {
+		s.StartHour, s.EndHour = nil, nil
+	}
 	if len(s.Weekdays) == 0 {
 		s.Weekdays = nil
 	} else {
 		s.Weekdays = slices.Sorted(slices.Values(s.Weekdays))
 	}
 	return s
+}
+
+// expired reports a ONE_TIME schedule whose window has already ended; Baseten rejects writing those.
+func expired(s modelsv1alpha1.AutoscalingSchedule) bool {
+	if s.Cadence != CadenceOneTime {
+		return false
+	}
+	end, err := time.Parse(time.RFC3339, s.EndAt)
+	return err == nil && end.Before(time.Now())
 }
 
 // canonicalTime lets equivalent instants in different offsets compare equal, since the API may echo a different offset.

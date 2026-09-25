@@ -950,10 +950,10 @@ func observeDriftSuffix(model *modelsv1alpha1.BasetenModel, env *baseten.Environ
 	return fmt.Sprintf(" | drift: %s; awaiting reconciliation", strings.Join(changes, ", "))
 }
 
-// baselineAutoscalingDrift skips baseline comparison while a schedule window is applied so the
+// baselineAutoscalingDrift skips baseline comparison while a spec-managed schedule window is applied so the
 // operator never fights a schedule, in case the API reports applied settings as the baseline.
 func baselineAutoscalingDrift(model *modelsv1alpha1.BasetenModel, env *baseten.Environment) (bool, []string) {
-	if baseten.ScheduleActive(env) {
+	if model.Spec.Environment.AutoscalingSchedule != nil && baseten.ScheduleActive(env) {
 		return false, nil
 	}
 	return baseten.HasAutoscalingDrift(model.Spec.Environment.Autoscaling, env.AutoscalingSettings)

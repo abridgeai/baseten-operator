@@ -188,7 +188,7 @@ spec:
 
 If someone changes autoscaling or promotion settings in the Baseten UI, the operator detects the drift on the next reconcile and corrects it back to the desired state defined in the CR. Both autoscaling and promotion settings are reconciled in a single API call.
 
-When `spec.environment.autoscalingSchedule` is set, the operator also owns the environment's autoscaling schedules: it creates schedules missing from Baseten, replaces changed ones, and deletes any not listed in the CR. While a schedule window is applied, baseline autoscaling drift is not corrected so the operator never fights an active schedule.
+When `spec.environment.autoscalingSchedule` is set, the operator also owns the environment's autoscaling schedules: it creates schedules missing from Baseten, replaces changed ones, and deletes any not listed in the CR. While a schedule window is applied, baseline autoscaling drift is not corrected so the operator never fights an active schedule. Setting `schedules: []` deletes every schedule on that environment. ONE_TIME schedules whose `endAt` has passed are left alone rather than written.
 
 ### Automatic Deployment Retry
 

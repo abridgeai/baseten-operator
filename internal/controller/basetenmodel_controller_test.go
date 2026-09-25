@@ -1095,11 +1095,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				},
 				Entry("recurring without weekdays", func(s *modelsv1alpha1.AutoscalingSchedule) { s.Weekdays = nil }, "weekdays is required"),
 				Entry("one-time without window", func(s *modelsv1alpha1.AutoscalingSchedule) {
-					s.Cadence, s.Weekdays = "ONE_TIME", nil
+					s.Cadence, s.Weekdays, s.StartHour, s.EndHour = "ONE_TIME", nil, nil, nil
 				}, "startAt and endAt are required"),
 				Entry("recurring with one-time window", func(s *modelsv1alpha1.AutoscalingSchedule) {
 					s.StartAt, s.EndAt = "2026-10-01T09:00:00Z", "2026-10-01T17:00:00Z"
 				}, "only valid for ONE_TIME"),
+				Entry("daily without hours", func(s *modelsv1alpha1.AutoscalingSchedule) { s.StartHour = nil }, "required for DAILY"),
+				Entry("hourly with hours", func(s *modelsv1alpha1.AutoscalingSchedule) { s.Cadence = "HOURLY" }, "only valid for DAILY"),
 			)
 
 			It("should reject duplicate schedule names at admission", func() {
@@ -1194,9 +1196,10 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
 			})
 
-			It("should not patch baseline autoscaling while a schedule is applied", func() {
+			It("should not patch baseline autoscaling while a managed schedule is applied", func() {
 				name := "sched-active-baseline"
-				model := newTestModel(name)
+				model := newScheduleModel(name)
+				model.Spec.Environment.AutoscalingSchedule.Timezone = nil
 				defer cleanupModel(name)
 
 				mockModelFound()
@@ -1212,10 +1215,41 @@ var _ = Describe("BasetenModel Controller", func() {
 					}, nil
 				}
 				failSettingsUpdate()
+				failScheduleUpdate()
 
 				result, err := reconcileModel(model)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+			})
+
+			It("should still correct baseline drift during an unmanaged schedule when the field is absent", func() {
+				name := "sched-active-unmanaged"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{
+						Name:                testEnvName,
+						AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 3, MaxReplica: 5, ConcurrencyTarget: 10},
+						AutoscalingSchedules: &baseten.AutoscalingSchedules{
+							Schedules:    []baseten.AutoscalingSchedule{observedOvernight()},
+							AppliedState: &baseten.AutoscalingScheduleState{ScheduleID: ptr("sched-1")},
+						},
+					}, nil
+				}
+				failScheduleUpdate()
+				var gotAutoscaling *modelsv1alpha1.AutoscalingConfig
+				mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
+					gotAutoscaling = a
+					return nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+				Expect(gotAutoscaling).NotTo(BeNil())
+				Expect(drainEvents()).To(ContainElement(ContainSubstring("AutoscalingUpdated")))
 			})
 
 			It("should emit warning when schedule update fails", func() {

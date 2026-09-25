@@ -298,6 +298,14 @@ spec:
                               schedules
                             rule: self.cadence == 'ONE_TIME' || (!has(self.startAt)
                               && !has(self.endAt))
+                          - message: startHour and endHour are required for DAILY
+                              schedules
+                            rule: self.cadence != 'DAILY' || (has(self.startHour)
+                              && has(self.endHour))
+                          - message: startHour and endHour are only valid for DAILY
+                              schedules
+                            rule: self.cadence == 'DAILY' || (!has(self.startHour)
+                              && !has(self.endHour))
                         maxItems: 10
                         type: array
                         x-kubernetes-list-map-keys:

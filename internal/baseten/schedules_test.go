@@ -51,6 +51,44 @@ func specOneTime() modelsv1alpha1.AutoscalingSchedule {
 	}
 }
 
+func withID(s AutoscalingSchedule, id string) AutoscalingSchedule {
+	s.ID = id
+	return s
+}
+
+func hourly() modelsv1alpha1.AutoscalingSchedule {
+	return modelsv1alpha1.AutoscalingSchedule{
+		Name:        "hourly-burst",
+		Cadence:     "HOURLY",
+		Weekdays:    []modelsv1alpha1.Weekday{"MONDAY"},
+		StartMinute: 0,
+		EndMinute:   15,
+		Autoscaling: modelsv1alpha1.ScheduleAutoscalingConfig{MinReplicas: 2, MaxReplicas: 4},
+	}
+}
+
+func observedHourly() AutoscalingSchedule {
+	return AutoscalingSchedule{
+		ID: "sched-h", Name: "hourly-burst", Enabled: true, Cadence: "HOURLY",
+		Weekdays: []string{"MONDAY"}, StartHour: ptr(int32(0)), EndHour: ptr(int32(0)), EndMinute: 15,
+		AutoscalingSettings: ScheduleAutoscalingSettings{MinReplica: 2, MaxReplica: 4},
+	}
+}
+
+func expiredOneTime() modelsv1alpha1.AutoscalingSchedule {
+	s := specOneTime()
+	s.Name, s.StartAt, s.EndAt = "past", "2020-01-01T09:00:00Z", "2020-01-01T17:00:00Z"
+	return s
+}
+
+func TestBuildScheduleSettingsDedupesDeletes(t *testing.T) {
+	a, b := observedOvernight(), withID(observedOvernight(), "sched-dup")
+	settings := buildScheduleSettings(&modelsv1alpha1.AutoscalingScheduleConfig{}, &AutoscalingSchedules{Schedules: []AutoscalingSchedule{a, b}})
+	if got := settings["delete_schedules"]; !reflect.DeepEqual(got, []string{"sched-dup", "sched-1"}) {
+		t.Errorf("delete_schedules = %v, want each id once", got)
+	}
+}
+
 func TestHasScheduleDrift(t *testing.T) {
 	changedMin := specOvernight()
 	changedMin.Autoscaling.MinReplicas = 2
@@ -127,8 +165,26 @@ func TestHasScheduleDrift(t *testing.T) {
 		{
 			"duplicate observed names are removed",
 			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{specOvernight()}},
-			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight(), observedOvernight()}},
+			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight(), withID(observedOvernight(), "sched-dup")}},
 			[]string{"schedule overnight duplicate removed"},
+		},
+		{
+			"hourly ignores hours echoed by the API",
+			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{hourly()}},
+			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedHourly()}},
+			nil,
+		},
+		{
+			"expired one-time is neither created nor deleted",
+			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{expiredOneTime(), specOvernight()}},
+			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{observedOvernight(), {ID: "sched-exp", Name: "past", Cadence: CadenceOneTime}}},
+			nil,
+		},
+		{
+			"expired one-time missing from Baseten is not created",
+			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{expiredOneTime()}},
+			nil,
+			nil,
 		},
 	}
 

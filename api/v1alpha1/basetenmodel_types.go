@@ -367,6 +367,8 @@ type AutoscalingScheduleConfig struct {
 // +kubebuilder:validation:XValidation:rule="self.cadence == 'ONE_TIME' || (has(self.weekdays) && size(self.weekdays) > 0)",message="weekdays is required for DAILY and HOURLY schedules"
 // +kubebuilder:validation:XValidation:rule="self.cadence != 'ONE_TIME' || (has(self.startAt) && has(self.endAt))",message="startAt and endAt are required for ONE_TIME schedules"
 // +kubebuilder:validation:XValidation:rule="self.cadence == 'ONE_TIME' || (!has(self.startAt) && !has(self.endAt))",message="startAt and endAt are only valid for ONE_TIME schedules"
+// +kubebuilder:validation:XValidation:rule="self.cadence != 'DAILY' || (has(self.startHour) && has(self.endHour))",message="startHour and endHour are required for DAILY schedules"
+// +kubebuilder:validation:XValidation:rule="self.cadence == 'DAILY' || (!has(self.startHour) && !has(self.endHour))",message="startHour and endHour are only valid for DAILY schedules"
 type AutoscalingSchedule struct {
 	// Name identifies the schedule and must be unique within the environment
 	// +required
