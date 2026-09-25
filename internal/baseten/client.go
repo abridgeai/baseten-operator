@@ -1,22 +1,21 @@
 package baseten
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
+	managementapi "github.com/basetenlabs/baseten-go/client/managementapi"
 )
 
 const (
-	defaultBaseURL = "https://api.baseten.co/v1"
+	// Host root only; the generated client appends the "/v1/..." path segments itself.
+	defaultBaseURL = "https://api.baseten.co"
 	defaultTimeout = 30 * time.Second
 	apiKeyEnvVar   = "BASETEN_API_KEY"
 
@@ -54,6 +53,19 @@ func IsNotFoundError(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+// toAPIError maps a generated-client HTTP failure (*managementapi.ResponseError) to *APIError
+// so IsNotFoundError keeps working; other errors (network, decode) pass through unchanged.
+func toAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var respErr *managementapi.ResponseError
+	if errors.As(err, &respErr) {
+		return &APIError{StatusCode: respErr.StatusCode, Message: respErr.Body}
+	}
+	return err
+}
+
 // ClientInterface defines the contract for interacting with the Baseten API.
 type ClientInterface interface {
 	FindModelIDByName(ctx context.Context, modelName string) (string, error)
@@ -71,11 +83,9 @@ type ClientInterface interface {
 	RetryDeployment(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error)
 }
 
-// Client is a REST API client for Baseten.
+// Client is a Baseten API client backed by the generated baseten-go management SDK.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	api *managementapi.Client
 }
 
 var _ ClientInterface = (*Client)(nil)
@@ -98,24 +108,15 @@ func NewClient() (*Client, error) {
 	}
 
 	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		httpClient: &http.Client{
-			Timeout:   defaultTimeout,
-			Transport: transport,
+		api: &managementapi.Client{
+			BaseURL: baseURL,
+			HTTPClient: &http.Client{
+				Timeout:   defaultTimeout,
+				Transport: transport,
+			},
+			Headers: http.Header{"Authorization": {"Api-Key " + apiKey}},
 		},
 	}, nil
-}
-
-// Model represents a Baseten model
-type Model struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-// ModelsResponse represents the response from listing models
-type ModelsResponse struct {
-	Models []Model `json:"models"`
 }
 
 // Deployment represents a Baseten deployment
@@ -137,16 +138,6 @@ type DeploymentDetail struct {
 	IsDevelopment       bool                 `json:"is_development"`
 	Environment         *string              `json:"environment"`
 	AutoscalingSettings *AutoscalingSettings `json:"autoscaling_settings"`
-}
-
-// DeploymentsResponse represents the response from listing deployments
-type DeploymentsResponse struct {
-	Deployments []Deployment `json:"deployments"`
-}
-
-// DeploymentDetailsResponse represents the response from listing deployments with full details
-type DeploymentDetailsResponse struct {
-	Deployments []DeploymentDetail `json:"deployments"`
 }
 
 // AutoscalingSettings represents the autoscaling configuration from API response
@@ -188,231 +179,80 @@ type Environment struct {
 	PromotionSettings   *PromotionSettings   `json:"promotion_settings,omitempty"`
 }
 
-// EnvironmentsResponse represents the response from listing environments
-type EnvironmentsResponse struct {
-	Environments []Environment `json:"environments"`
-}
-
-// CreateEnvironmentRequest represents the request to create an environment
-type CreateEnvironmentRequest struct {
-	Name                string                 `json:"name"`
-	AutoscalingSettings map[string]interface{} `json:"autoscaling_settings,omitempty"`
-	PromotionSettings   map[string]interface{} `json:"promotion_settings,omitempty"`
-}
-
-// PromoteRequest represents the request to promote a deployment
-type PromoteRequest struct {
-	DeploymentID                string `json:"deployment_id"`
-	ScaleDownPreviousDeployment bool   `json:"scale_down_previous_deployment"`
-	PreserveEnvInstanceType     bool   `json:"preserve_env_instance_type"`
-}
-
-func (c *Client) newRequest(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Api-Key "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	return req, nil
-}
-
-func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer func() { _ = resp.Body.Close() }()
-		body, _ := io.ReadAll(resp.Body)
-		return nil, &APIError{StatusCode: resp.StatusCode, Message: string(body)}
-	}
-
-	return resp, nil
-}
-
-// FindModelIDByName lists all models (GET /v1/models) and returns the ID matching modelName.
+// FindModelIDByName lists all models and returns the ID matching modelName ("" if not found).
 func (c *Client) FindModelIDByName(ctx context.Context, modelName string) (string, error) {
-	req, err := c.newRequest(ctx, "GET", c.baseURL+"/models", nil)
+	models, err := c.api.GetModels(ctx)
 	if err != nil {
-		return "", err
+		return "", toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var modelsResp ModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&modelsResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	for _, model := range modelsResp.Models {
-		if model.Name == modelName {
-			return model.ID, nil
+	for _, m := range models.Models {
+		if m.Name == modelName {
+			return m.Id, nil
 		}
 	}
-
 	return "", nil
 }
 
 // DeleteModel deletes a Baseten model and cascades to all deployments and environments under it.
 func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
-	req, err := c.newRequest(ctx, "DELETE", fmt.Sprintf("%s/models/%s", c.baseURL, modelID), nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	_, err := c.api.DeleteModels(ctx, modelID)
+	return toAPIError(err)
 }
 
-// FindDeploymentIDByName lists all deployments (GET /v1/models/{id}/deployments) and returns the ID and status matching deploymentName.
+// FindDeploymentIDByName lists deployments and returns the ID and status matching deploymentName.
 func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
-	req, err := c.newRequest(ctx, "GET", fmt.Sprintf("%s/models/%s/deployments", c.baseURL, modelID), nil)
+	deps, err := c.api.GetModelsDeployments(ctx, modelID)
 	if err != nil {
-		return "", "", err
+		return "", "", toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var deploymentsResp DeploymentsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&deploymentsResp); err != nil {
-		return "", "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	for _, deployment := range deploymentsResp.Deployments {
-		if deployment.Name == deploymentName {
-			return deployment.ID, deployment.Status, nil
+	for _, d := range deps.Deployments {
+		if d.Name == deploymentName {
+			return d.Id, string(d.Status), nil
 		}
 	}
-
 	return "", "", nil
 }
 
 func (c *Client) ActivateDeployment(ctx context.Context, modelID, deploymentID string) error {
-	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("%s/models/%s/deployments/%s/activate", c.baseURL, modelID, deploymentID), nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	_, err := c.api.PostModelsDeploymentsActivate(ctx, modelID, deploymentID)
+	return toAPIError(err)
 }
 
 func (c *Client) GetEnvironment(ctx context.Context, modelID, envName string) (*Environment, error) {
-	req, err := c.newRequest(ctx, "GET", fmt.Sprintf("%s/models/%s/environments/%s", c.baseURL, modelID, envName), nil)
+	env, err := c.api.GetModelsEnvironmentsEnvName(ctx, modelID, envName)
 	if err != nil {
-		return nil, err
+		return nil, toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var env Environment
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return &env, nil
+	return toEnvironment(env), nil
 }
 
 func (c *Client) ListEnvironments(ctx context.Context, modelID string) ([]Environment, error) {
-	req, err := c.newRequest(ctx, "GET", fmt.Sprintf("%s/models/%s/environments", c.baseURL, modelID), nil)
+	envs, err := c.api.GetModelsEnvironments(ctx, modelID)
 	if err != nil {
-		return nil, err
+		return nil, toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return nil, err
+	result := make([]Environment, 0, len(envs.Environments))
+	for i := range envs.Environments {
+		result = append(result, *toEnvironment(&envs.Environments[i]))
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var envsResp EnvironmentsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&envsResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return envsResp.Environments, nil
+	return result, nil
 }
 
 func (c *Client) CreateEnvironment(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error {
-	reqBody := CreateEnvironmentRequest{
+	_, err := c.api.PostModelsEnvironments(ctx, modelID, managementapi.CreateEnvironmentRequest{
 		Name:                envConfig.Name,
-		AutoscalingSettings: convertAutoscalingConfig(envConfig.Autoscaling),
-		PromotionSettings:   convertPromotionSettings(envConfig.PromotionSettings),
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("%s/models/%s/environments", c.baseURL, modelID), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+		AutoscalingSettings: toUpdateAutoscalingSettings(envConfig.Autoscaling),
+		PromotionSettings:   toUpdatePromotionSettings(envConfig.PromotionSettings),
+	})
+	return toAPIError(err)
 }
 
 func (c *Client) UpdateEnvironmentSettings(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error {
-	reqBody := map[string]interface{}{}
-	if autoscalingConfig != nil {
-		if settings := convertAutoscalingConfig(autoscalingConfig); settings != nil {
-			reqBody["autoscaling_settings"] = settings
-		}
-	}
-	if promotionConfig != nil {
-		if settings := convertPromotionSettings(promotionConfig); settings != nil {
-			reqBody["promotion_settings"] = settings
-		}
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := c.newRequest(ctx, "PATCH", fmt.Sprintf("%s/models/%s/environments/%s", c.baseURL, modelID, envName), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	_, err := c.api.PatchModelsEnvironments(ctx, modelID, envName, managementapi.UpdateEnvironmentRequest{
+		AutoscalingSettings: toUpdateAutoscalingSettings(autoscalingConfig),
+		PromotionSettings:   toUpdatePromotionSettings(promotionConfig),
+	})
+	return toAPIError(err)
 }
 
 func (c *Client) Promote(ctx context.Context, modelID, deploymentID, targetEnv string, promotionSettings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error) {
@@ -428,213 +268,263 @@ func (c *Client) Promote(ctx context.Context, modelID, deploymentID, targetEnv s
 		}
 	}
 
-	reqBody := PromoteRequest{
-		DeploymentID:                deploymentID,
-		ScaleDownPreviousDeployment: scaleDownPrevious,
-		PreserveEnvInstanceType:     preserveInstanceType,
-	}
-
-	body, err := json.Marshal(reqBody)
+	dep, err := c.api.PostModelsEnvironmentsPromote(ctx, modelID, targetEnv, managementapi.PromoteToEnvironmentRequest{
+		DeploymentId:                deploymentID,
+		ScaleDownPreviousDeployment: &scaleDownPrevious,
+		PreserveEnvInstanceType:     &preserveInstanceType,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, toAPIError(err)
 	}
-
-	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("%s/models/%s/environments/%s/promote", c.baseURL, modelID, targetEnv), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var promotedDeployment Deployment
-	if err := json.NewDecoder(resp.Body).Decode(&promotedDeployment); err != nil {
-		return nil, fmt.Errorf("failed to decode promotion response: %w", err)
-	}
-
-	return &promotedDeployment, nil
+	return toDeployment(dep), nil
 }
 
 func (c *Client) ListDeployments(ctx context.Context, modelID string) ([]DeploymentDetail, error) {
-	req, err := c.newRequest(ctx, "GET", fmt.Sprintf("%s/models/%s/deployments", c.baseURL, modelID), nil)
+	deps, err := c.api.GetModelsDeployments(ctx, modelID)
 	if err != nil {
-		return nil, err
+		return nil, toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return nil, err
+	result := make([]DeploymentDetail, 0, len(deps.Deployments))
+	for _, d := range deps.Deployments {
+		result = append(result, toDeploymentDetail(d))
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var deploymentsResp DeploymentDetailsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&deploymentsResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return deploymentsResp.Deployments, nil
+	return result, nil
 }
 
 func (c *Client) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
-	reqBody := map[string]interface{}{
-		"min_replica": minReplica,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := c.newRequest(ctx, "PATCH", fmt.Sprintf("%s/models/%s/deployments/%s/autoscaling_settings", c.baseURL, modelID, deploymentID), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	mr := int(minReplica)
+	_, err := c.api.PatchModelsDeploymentsAutoscalingSettings(ctx, modelID, deploymentID, managementapi.UpdateAutoscalingSettings{
+		MinReplica: &mr,
+	})
+	return toAPIError(err)
 }
 
 func (c *Client) DeleteDeployment(ctx context.Context, modelID, deploymentID string) error {
-	req, err := c.newRequest(ctx, "DELETE", fmt.Sprintf("%s/models/%s/deployments/%s", c.baseURL, modelID, deploymentID), nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return nil
+	_, err := c.api.DeleteModelsDeployments(ctx, modelID, deploymentID)
+	return toAPIError(err)
 }
 
 func (c *Client) RetryDeployment(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error) {
-	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("%s/models/%s/deployments/%s/retry", c.baseURL, modelID, deploymentID), nil)
+	resp, err := c.api.PostModelsDeploymentsRetry(ctx, modelID, deploymentID)
 	if err != nil {
-		return nil, err
+		return nil, toAPIError(err)
 	}
-
-	resp, err := c.doRequest(req)
-	if err != nil {
-		return nil, err
+	out := &RetryResponse{
+		Retried:    resp.Retried,
+		Deployment: toDeploymentPtr(resp.Deployment),
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var retryResp RetryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&retryResp); err != nil {
-		return nil, fmt.Errorf("failed to decode retry response: %w", err)
+	if resp.Reason != nil {
+		out.Reason = *resp.Reason
 	}
-	return &retryResp, nil
+	return out, nil
 }
 
-// convertAutoscalingConfig converts CRD autoscaling config to API format
-func convertAutoscalingConfig(config *modelsv1alpha1.AutoscalingConfig) map[string]interface{} {
-	if config == nil {
+func toDeployment(d *managementapi.Deployment) *Deployment {
+	if d == nil {
 		return nil
 	}
-
-	result := make(map[string]interface{})
-
-	if config.MinReplicas != nil {
-		result["min_replica"] = *config.MinReplicas
+	return &Deployment{
+		ID:                 d.Id,
+		Name:               d.Name,
+		Status:             string(d.Status),
+		ActiveReplicaCount: int32(d.ActiveReplicaCount),
 	}
-	if config.MaxReplicas != nil {
-		result["max_replica"] = *config.MaxReplicas
-	}
-	if config.ConcurrencyTarget != nil {
-		result["concurrency_target"] = *config.ConcurrencyTarget
-	}
-	if config.AutoscalingWindow != nil {
-		result["autoscaling_window"] = *config.AutoscalingWindow
-	}
-	if config.ScaleDownDelay != nil {
-		result["scale_down_delay"] = *config.ScaleDownDelay
-	}
-	if config.TargetUtilizationPercentage != nil {
-		result["target_utilization_percentage"] = *config.TargetUtilizationPercentage
-	}
-
-	if len(result) == 0 {
-		return nil
-	}
-	return result
 }
 
-// convertPromotionSettings converts CRD promotion settings to API format (UpdatePromotionSettingsV1).
-// Used for environment creation (POST). promotion_cleanup_strategy is a top-level field in the API,
-// sourced from spec.rollingDeployConfig.promotionCleanupStrategy in the CRD.
-func convertPromotionSettings(config *modelsv1alpha1.PromotionSettingsConfig) map[string]interface{} {
-	if config == nil {
+// toDeploymentPtr returns nil for an empty (absent) deployment, matching the operator's
+// nil-means-no-deployment semantics.
+func toDeploymentPtr(d managementapi.Deployment) *Deployment {
+	if d.Id == "" {
 		return nil
 	}
+	return toDeployment(&d)
+}
 
-	result := make(map[string]interface{})
+func toDeploymentDetail(d managementapi.Deployment) DeploymentDetail {
+	return DeploymentDetail{
+		ID:                  d.Id,
+		Name:                d.Name,
+		Status:              string(d.Status),
+		ActiveReplicaCount:  int32(d.ActiveReplicaCount),
+		CreatedAt:           d.CreatedAt.Format(time.RFC3339),
+		IsProduction:        d.IsProduction,
+		IsDevelopment:       d.IsDevelopment,
+		Environment:         d.Environment,
+		AutoscalingSettings: toAutoscalingSettings(d.AutoscalingSettings),
+	}
+}
 
-	if config.RedeployOnPromotion != nil {
-		result["redeploy_on_promotion"] = *config.RedeployOnPromotion
+func toEnvironment(e *managementapi.Environment) *Environment {
+	return &Environment{
+		Name:                e.Name,
+		CurrentDeployment:   toDeploymentPtr(e.CurrentDeployment),
+		CandidateDeployment: toDeployment(e.CandidateDeployment),
+		AutoscalingSettings: toAutoscalingSettings(e.AutoscalingSettings),
+		PromotionSettings:   toPromotionSettings(e.PromotionSettings),
 	}
-	if config.RollingDeploy != nil {
-		result["rolling_deploy"] = *config.RollingDeploy
-	}
-	if config.RampUpWhilePromoting != nil {
-		result["ramp_up_while_promoting"] = *config.RampUpWhilePromoting
-	}
-	if config.RampUpDurationSeconds != nil {
-		result["ramp_up_duration_seconds"] = *config.RampUpDurationSeconds
-	}
+}
 
-	if config.PromotionCleanupStrategy != nil {
-		result["promotion_cleanup_strategy"] = *config.PromotionCleanupStrategy
+func toAutoscalingSettings(a managementapi.AutoscalingSettings) *AutoscalingSettings {
+	return &AutoscalingSettings{
+		MinReplica:                  int32(a.MinReplica),
+		MaxReplica:                  int32(a.MaxReplica),
+		ConcurrencyTarget:           int32(a.ConcurrencyTarget),
+		AutoscalingWindow:           intPtrToInt32Ptr(a.AutoscalingWindow),
+		ScaleDownDelay:              intPtrToInt32Ptr(a.ScaleDownDelay),
+		TargetUtilizationPercentage: intPtrToInt32Ptr(a.TargetUtilizationPercentage),
 	}
+}
 
-	// Convert rolling deploy config if present
-	if config.RollingDeployConfig != nil {
-		rollingConfig := convertRollingDeployConfig(config.RollingDeployConfig)
-		if rollingConfig != nil {
-			result["rolling_deploy_config"] = rollingConfig
+func toPromotionSettings(p managementapi.PromotionSettings) *PromotionSettings {
+	out := &PromotionSettings{
+		RedeployOnPromotion:   p.RedeployOnPromotion,
+		RollingDeploy:         p.RollingDeploy,
+		RampUpWhilePromoting:  p.RampUpWhilePromoting,
+		RampUpDurationSeconds: intPtrToInt32Ptr(p.RampUpDurationSeconds),
+	}
+	if p.PromotionCleanupStrategy != nil {
+		s := string(*p.PromotionCleanupStrategy)
+		out.PromotionCleanupStrategy = &s
+	}
+	if p.RollingDeployConfig != nil {
+		out.RollingDeployConfig = toRollingDeploySettings(p.RollingDeployConfig)
+	}
+	return out
+}
+
+func toRollingDeploySettings(rc *managementapi.RollingDeployConfig) *RollingDeploySettings {
+	out := &RollingDeploySettings{
+		MaxSurgePercent:          intPtrToInt32Ptr(rc.MaxSurgePercent),
+		MaxUnavailablePercent:    intPtrToInt32Ptr(rc.MaxUnavailablePercent),
+		StabilizationTimeSeconds: intPtrToInt32Ptr(rc.StabilizationTimeSeconds),
+	}
+	if rc.RollingDeployStrategy != nil {
+		s := string(*rc.RollingDeployStrategy)
+		out.Strategy = &s
+	}
+	return out
+}
+
+// The builders below return nil when no fields are set, so the settings object is omitted
+// from the request body rather than sent as an empty object.
+func toUpdateAutoscalingSettings(c *modelsv1alpha1.AutoscalingConfig) *managementapi.UpdateAutoscalingSettings {
+	if c == nil {
+		return nil
+	}
+	out := &managementapi.UpdateAutoscalingSettings{}
+	set := false
+	if c.MinReplicas != nil {
+		out.MinReplica = int32PtrToIntPtr(c.MinReplicas)
+		set = true
+	}
+	if c.MaxReplicas != nil {
+		out.MaxReplica = int32PtrToIntPtr(c.MaxReplicas)
+		set = true
+	}
+	if c.ConcurrencyTarget != nil {
+		out.ConcurrencyTarget = int32PtrToIntPtr(c.ConcurrencyTarget)
+		set = true
+	}
+	if c.AutoscalingWindow != nil {
+		out.AutoscalingWindow = int32PtrToIntPtr(c.AutoscalingWindow)
+		set = true
+	}
+	if c.ScaleDownDelay != nil {
+		out.ScaleDownDelay = int32PtrToIntPtr(c.ScaleDownDelay)
+		set = true
+	}
+	if c.TargetUtilizationPercentage != nil {
+		out.TargetUtilizationPercentage = int32PtrToIntPtr(c.TargetUtilizationPercentage)
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return out
+}
+
+func toUpdatePromotionSettings(c *modelsv1alpha1.PromotionSettingsConfig) *managementapi.UpdatePromotionSettings {
+	if c == nil {
+		return nil
+	}
+	out := &managementapi.UpdatePromotionSettings{}
+	set := false
+	if c.RedeployOnPromotion != nil {
+		out.RedeployOnPromotion = c.RedeployOnPromotion
+		set = true
+	}
+	if c.RollingDeploy != nil {
+		out.RollingDeploy = c.RollingDeploy
+		set = true
+	}
+	if c.RampUpWhilePromoting != nil {
+		out.RampUpWhilePromoting = c.RampUpWhilePromoting
+		set = true
+	}
+	if c.RampUpDurationSeconds != nil {
+		out.RampUpDurationSeconds = int32PtrToIntPtr(c.RampUpDurationSeconds)
+		set = true
+	}
+	if c.PromotionCleanupStrategy != nil {
+		s := managementapi.PromotionCleanupStrategy(*c.PromotionCleanupStrategy)
+		out.PromotionCleanupStrategy = &s
+		set = true
+	}
+	if c.RollingDeployConfig != nil {
+		if rc := toUpdateRollingDeployConfig(c.RollingDeployConfig); rc != nil {
+			out.RollingDeployConfig = rc
+			set = true
 		}
 	}
-
-	if len(result) == 0 {
+	if !set {
 		return nil
 	}
-	return result
+	return out
 }
 
-// convertRollingDeployConfig converts CRD rolling deploy config to API format (UpdateRollingDeployConfigV1).
-func convertRollingDeployConfig(config *modelsv1alpha1.RollingDeployConfig) map[string]interface{} {
-	if config == nil {
+func toUpdateRollingDeployConfig(c *modelsv1alpha1.RollingDeployConfig) *managementapi.UpdateRollingDeployConfig {
+	if c == nil {
 		return nil
 	}
-
-	result := make(map[string]interface{})
-
-	if config.Strategy != nil {
-		result["rolling_deploy_strategy"] = *config.Strategy
+	out := &managementapi.UpdateRollingDeployConfig{}
+	set := false
+	if c.Strategy != nil {
+		s := managementapi.RollingDeployStrategy(*c.Strategy)
+		out.RollingDeployStrategy = &s
+		set = true
 	}
-	if config.MaxSurgePercent != nil {
-		result["max_surge_percent"] = *config.MaxSurgePercent
+	if c.MaxSurgePercent != nil {
+		out.MaxSurgePercent = int32PtrToIntPtr(c.MaxSurgePercent)
+		set = true
 	}
-	if config.MaxUnavailablePercent != nil {
-		result["max_unavailable_percent"] = *config.MaxUnavailablePercent
+	if c.MaxUnavailablePercent != nil {
+		out.MaxUnavailablePercent = int32PtrToIntPtr(c.MaxUnavailablePercent)
+		set = true
 	}
-	if config.StabilizationTimeSeconds != nil {
-		result["stabilization_time_seconds"] = *config.StabilizationTimeSeconds
+	if c.StabilizationTimeSeconds != nil {
+		out.StabilizationTimeSeconds = int32PtrToIntPtr(c.StabilizationTimeSeconds)
+		set = true
 	}
-
-	if len(result) == 0 {
+	if !set {
 		return nil
 	}
-	return result
+	return out
+}
+
+func intPtrToInt32Ptr(p *int) *int32 {
+	if p == nil {
+		return nil
+	}
+	v := int32(*p)
+	return &v
+}
+
+func int32PtrToIntPtr(p *int32) *int {
+	if p == nil {
+		return nil
+	}
+	v := int(*p)
+	return &v
 }
 
 // DeploymentNameMatchesPrefix checks if a deployment name matches the given prefix,

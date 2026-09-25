@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
+	managementapi "github.com/basetenlabs/baseten-go/client/managementapi"
 )
 
 const (
@@ -22,11 +23,16 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+// newTestClient builds a Client whose generated management API points at a test server.
+// The server URL must NOT include "/v1" — the generated client prepends it, so handler
+// path assertions below expect the "/v1/..." prefix.
 func newTestClient(serverURL string) *Client {
 	return &Client{
-		baseURL:    serverURL,
-		apiKey:     "test-key",
-		httpClient: http.DefaultClient,
+		api: &managementapi.Client{
+			BaseURL:    serverURL,
+			HTTPClient: http.DefaultClient,
+			Headers:    http.Header{"Authorization": {"Api-Key test-key"}},
+		},
 	}
 }
 
@@ -118,7 +124,7 @@ func TestRetryDeployment(t *testing.T) {
 		if r.Method != "POST" {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if !strings.Contains(r.URL.Path, "/models/m1/deployments/d1/retry") {
+		if !strings.Contains(r.URL.Path, "/v1/models/m1/deployments/d1/retry") {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -243,15 +249,28 @@ func TestHasAutoscalingDrift(t *testing.T) {
 func TestNewClient(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		t.Setenv("BASETEN_API_KEY", "test-api-key")
+		t.Setenv("BASETEN_API_BASE_URL", "")
 		client, err := NewClient()
 		if err != nil {
 			t.Fatalf("NewClient() error = %v", err)
 		}
-		if client.apiKey != "test-api-key" {
-			t.Errorf("apiKey = %q, want %q", client.apiKey, "test-api-key")
+		if got := client.api.Headers.Get("Authorization"); got != "Api-Key test-api-key" {
+			t.Errorf("Authorization header = %q, want %q", got, "Api-Key test-api-key")
 		}
-		if client.baseURL != defaultBaseURL {
-			t.Errorf("baseURL = %q, want %q", client.baseURL, defaultBaseURL)
+		if client.api.BaseURL != defaultBaseURL {
+			t.Errorf("BaseURL = %q, want %q", client.api.BaseURL, defaultBaseURL)
+		}
+	})
+
+	t.Run("base url override used verbatim", func(t *testing.T) {
+		t.Setenv("BASETEN_API_KEY", "test-api-key")
+		t.Setenv("BASETEN_API_BASE_URL", "https://example.com")
+		client, err := NewClient()
+		if err != nil {
+			t.Fatalf("NewClient() error = %v", err)
+		}
+		if client.api.BaseURL != "https://example.com" {
+			t.Errorf("BaseURL = %q, want %q", client.api.BaseURL, "https://example.com")
 		}
 	})
 
@@ -264,23 +283,21 @@ func TestNewClient(t *testing.T) {
 	})
 }
 
-func TestConvertAutoscalingConfig(t *testing.T) {
+func TestToUpdateAutoscalingSettings(t *testing.T) {
 	t.Run("nil config", func(t *testing.T) {
-		result := convertAutoscalingConfig(nil)
-		if result != nil {
+		if result := toUpdateAutoscalingSettings(nil); result != nil {
 			t.Errorf("expected nil, got %v", result)
 		}
 	})
 
 	t.Run("empty config (all nil fields)", func(t *testing.T) {
-		result := convertAutoscalingConfig(&modelsv1alpha1.AutoscalingConfig{})
-		if result != nil {
+		if result := toUpdateAutoscalingSettings(&modelsv1alpha1.AutoscalingConfig{}); result != nil {
 			t.Errorf("expected nil for empty config, got %v", result)
 		}
 	})
 
 	t.Run("all fields set", func(t *testing.T) {
-		result := convertAutoscalingConfig(&modelsv1alpha1.AutoscalingConfig{
+		result := toUpdateAutoscalingSettings(&modelsv1alpha1.AutoscalingConfig{
 			MinReplicas:                 ptr(int32(0)),
 			MaxReplicas:                 ptr(int32(5)),
 			ConcurrencyTarget:           ptr(int32(10)),
@@ -291,39 +308,37 @@ func TestConvertAutoscalingConfig(t *testing.T) {
 		if result == nil {
 			t.Fatal("expected non-nil result")
 		}
-		assertMapField(t, result, "min_replica", int32(0))
-		assertMapField(t, result, "max_replica", int32(5))
-		assertMapField(t, result, "concurrency_target", int32(10))
-		assertMapField(t, result, "autoscaling_window", int32(60))
-		assertMapField(t, result, "scale_down_delay", int32(120))
-		assertMapField(t, result, "target_utilization_percentage", int32(80))
+		assertIntPtr(t, "min_replica", result.MinReplica, 0)
+		assertIntPtr(t, "max_replica", result.MaxReplica, 5)
+		assertIntPtr(t, "concurrency_target", result.ConcurrencyTarget, 10)
+		assertIntPtr(t, "autoscaling_window", result.AutoscalingWindow, 60)
+		assertIntPtr(t, "scale_down_delay", result.ScaleDownDelay, 120)
+		assertIntPtr(t, "target_utilization_percentage", result.TargetUtilizationPercentage, 80)
 	})
 
 	t.Run("partial fields", func(t *testing.T) {
-		result := convertAutoscalingConfig(&modelsv1alpha1.AutoscalingConfig{
+		result := toUpdateAutoscalingSettings(&modelsv1alpha1.AutoscalingConfig{
 			MinReplicas: ptr(int32(1)),
 		})
 		if result == nil {
 			t.Fatal("expected non-nil result")
 		}
-		if len(result) != 1 {
-			t.Errorf("expected 1 field, got %d", len(result))
+		assertIntPtr(t, "min_replica", result.MinReplica, 1)
+		if result.MaxReplica != nil {
+			t.Errorf("expected max_replica nil, got %v", *result.MaxReplica)
 		}
-		assertMapField(t, result, "min_replica", int32(1))
 	})
 }
 
-func TestConvertPromotionSettings(t *testing.T) {
+func TestToUpdatePromotionSettings(t *testing.T) {
 	t.Run("nil config", func(t *testing.T) {
-		result := convertPromotionSettings(nil)
-		if result != nil {
+		if result := toUpdatePromotionSettings(nil); result != nil {
 			t.Errorf("expected nil, got %v", result)
 		}
 	})
 
 	t.Run("empty config", func(t *testing.T) {
-		result := convertPromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{})
-		if result != nil {
+		if result := toUpdatePromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{}); result != nil {
 			t.Errorf("expected nil for empty config, got %v", result)
 		}
 	})
@@ -331,7 +346,7 @@ func TestConvertPromotionSettings(t *testing.T) {
 	t.Run("all fields set", func(t *testing.T) {
 		strategy := testStrategyReplica
 		cleanup := testCleanupScaleToZero
-		result := convertPromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{
+		result := toUpdatePromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{
 			RedeployOnPromotion:      ptr(true),
 			RollingDeploy:            ptr(true),
 			PromotionCleanupStrategy: &cleanup,
@@ -344,57 +359,56 @@ func TestConvertPromotionSettings(t *testing.T) {
 		if result == nil {
 			t.Fatal("expected non-nil result")
 		}
-		if _, ok := result["redeploy_on_promotion"]; !ok {
-			t.Error("missing redeploy_on_promotion")
+		if result.RedeployOnPromotion == nil || !*result.RedeployOnPromotion {
+			t.Error("missing/incorrect redeploy_on_promotion")
 		}
-		if _, ok := result["rolling_deploy"]; !ok {
-			t.Error("missing rolling_deploy")
+		if result.RollingDeploy == nil || !*result.RollingDeploy {
+			t.Error("missing/incorrect rolling_deploy")
 		}
-		if _, ok := result["promotion_cleanup_strategy"]; !ok {
-			t.Error("missing promotion_cleanup_strategy")
+		if result.PromotionCleanupStrategy == nil || string(*result.PromotionCleanupStrategy) != testCleanupScaleToZero {
+			t.Error("missing/incorrect promotion_cleanup_strategy")
 		}
-		if _, ok := result["ramp_up_while_promoting"]; !ok {
-			t.Error("missing ramp_up_while_promoting")
+		if result.RampUpWhilePromoting == nil || *result.RampUpWhilePromoting {
+			t.Error("missing/incorrect ramp_up_while_promoting")
 		}
-		if _, ok := result["ramp_up_duration_seconds"]; !ok {
-			t.Error("missing ramp_up_duration_seconds")
-		}
-		if _, ok := result["rolling_deploy_config"]; !ok {
+		assertIntPtr(t, "ramp_up_duration_seconds", result.RampUpDurationSeconds, 300)
+		if result.RollingDeployConfig == nil {
 			t.Error("missing rolling_deploy_config")
 		}
 	})
 
 	t.Run("partial fields without rolling deploy config", func(t *testing.T) {
-		result := convertPromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{
+		result := toUpdatePromotionSettings(&modelsv1alpha1.PromotionSettingsConfig{
 			RedeployOnPromotion: ptr(true),
 		})
 		if result == nil {
 			t.Fatal("expected non-nil result")
 		}
-		if len(result) != 1 {
-			t.Errorf("expected 1 field, got %d", len(result))
+		if result.RollingDeployConfig != nil {
+			t.Error("expected no rolling_deploy_config")
+		}
+		if result.RollingDeploy != nil {
+			t.Error("expected no rolling_deploy")
 		}
 	})
 }
 
-func TestConvertRollingDeployConfig(t *testing.T) {
+func TestToUpdateRollingDeployConfig(t *testing.T) {
 	t.Run("nil config", func(t *testing.T) {
-		result := convertRollingDeployConfig(nil)
-		if result != nil {
+		if result := toUpdateRollingDeployConfig(nil); result != nil {
 			t.Errorf("expected nil, got %v", result)
 		}
 	})
 
 	t.Run("empty config", func(t *testing.T) {
-		result := convertRollingDeployConfig(&modelsv1alpha1.RollingDeployConfig{})
-		if result != nil {
+		if result := toUpdateRollingDeployConfig(&modelsv1alpha1.RollingDeployConfig{}); result != nil {
 			t.Errorf("expected nil for empty config, got %v", result)
 		}
 	})
 
 	t.Run("all fields set", func(t *testing.T) {
 		strategy := testStrategyReplica
-		result := convertRollingDeployConfig(&modelsv1alpha1.RollingDeployConfig{
+		result := toUpdateRollingDeployConfig(&modelsv1alpha1.RollingDeployConfig{
 			Strategy:                 &strategy,
 			MaxSurgePercent:          ptr(int32(25)),
 			MaxUnavailablePercent:    ptr(int32(25)),
@@ -403,30 +417,41 @@ func TestConvertRollingDeployConfig(t *testing.T) {
 		if result == nil {
 			t.Fatal("expected non-nil result")
 		}
-		if len(result) != 4 {
-			t.Errorf("expected 4 fields, got %d", len(result))
+		if result.RollingDeployStrategy == nil || string(*result.RollingDeployStrategy) != testStrategyReplica {
+			t.Error("missing/incorrect rolling_deploy_strategy")
 		}
+		assertIntPtr(t, "max_surge_percent", result.MaxSurgePercent, 25)
+		assertIntPtr(t, "max_unavailable_percent", result.MaxUnavailablePercent, 25)
+		assertIntPtr(t, "stabilization_time_seconds", result.StabilizationTimeSeconds, 60)
 	})
-
 }
 
-func assertMapField(t *testing.T, m map[string]interface{}, key string, expected int32) {
+func assertIntPtr(t *testing.T, name string, got *int, want int) {
 	t.Helper()
-	val, ok := m[key]
-	if !ok {
-		t.Errorf("missing key %q", key)
+	if got == nil {
+		t.Errorf("%s: expected %d, got nil", name, want)
 		return
 	}
-	if val != expected {
-		t.Errorf("key %q = %v, want %v", key, val, expected)
+	if *got != want {
+		t.Errorf("%s = %d, want %d", name, *got, want)
 	}
 }
 
+// writeJSON encodes v as the response body with the application/json content type the
+// generated management client requires on success responses.
 func writeJSON(t *testing.T, w http.ResponseWriter, v interface{}) {
 	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		t.Fatalf("failed to encode JSON: %v", err)
 	}
+}
+
+// writeEmptyOK writes a minimal successful JSON response for endpoints whose body the
+// client ignores but which the generated client still decodes.
+func writeEmptyOK(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	writeJSON(t, w, struct{}{})
 }
 
 func writeError(t *testing.T, w http.ResponseWriter, status int, body string) {
@@ -444,16 +469,20 @@ func decodeJSON(t *testing.T, r *http.Request, v interface{}) {
 	}
 }
 
+func status(s string) managementapi.DeploymentStatus {
+	return managementapi.DeploymentStatus(s)
+}
+
 func TestFindModelIDByName(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/models" {
+			if r.URL.Path != "/v1/models" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
 			if r.Header.Get("Authorization") != "Api-Key test-key" {
 				t.Error("missing or wrong authorization header")
 			}
-			writeJSON(t, w, ModelsResponse{Models: []Model{{ID: "m1", Name: "my-model"}}})
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{{Id: "m1", Name: "my-model"}}})
 		}))
 		defer srv.Close()
 
@@ -469,7 +498,7 @@ func TestFindModelIDByName(t *testing.T) {
 
 	t.Run("not found returns empty", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(t, w, ModelsResponse{Models: []Model{{ID: "m1", Name: "other-model"}}})
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{{Id: "m1", Name: "other-model"}}})
 		}))
 		defer srv.Close()
 
@@ -510,10 +539,10 @@ func TestDeleteModel(t *testing.T) {
 			if r.Method != http.MethodDelete {
 				t.Errorf("expected DELETE, got %s", r.Method)
 			}
-			if r.URL.Path != "/models/model1" {
+			if r.URL.Path != "/v1/models/model1" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
-			w.WriteHeader(http.StatusOK)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -559,39 +588,44 @@ func TestDeleteModel(t *testing.T) {
 func TestFindDeploymentIDByName(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(t, w, DeploymentsResponse{Deployments: []Deployment{{ID: "d1", Name: "my-dep", Status: "ACTIVE"}}})
+			if r.URL.Path != "/v1/models/model1/deployments" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			writeJSON(t, w, managementapi.Deployments{Deployments: []managementapi.Deployment{
+				{Id: "d1", Name: "my-dep", Status: status("ACTIVE")},
+			}})
 		}))
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		id, status, err := c.FindDeploymentIDByName(context.Background(), "model1", "my-dep")
+		id, st, err := c.FindDeploymentIDByName(context.Background(), "model1", "my-dep")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if id != "d1" {
 			t.Errorf("got id %q, want %q", id, "d1")
 		}
-		if status != "ACTIVE" {
-			t.Errorf("got status %q, want %q", status, "ACTIVE")
+		if st != "ACTIVE" {
+			t.Errorf("got status %q, want %q", st, "ACTIVE")
 		}
 	})
 
 	t.Run("not found", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(t, w, DeploymentsResponse{Deployments: []Deployment{}})
+			writeJSON(t, w, managementapi.Deployments{Deployments: []managementapi.Deployment{}})
 		}))
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		id, status, err := c.FindDeploymentIDByName(context.Background(), "model1", "missing")
+		id, st, err := c.FindDeploymentIDByName(context.Background(), "model1", "missing")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if id != "" {
 			t.Errorf("expected empty id, got %q", id)
 		}
-		if status != "" {
-			t.Errorf("expected empty status, got %q", status)
+		if st != "" {
+			t.Errorf("expected empty status, got %q", st)
 		}
 	})
 }
@@ -602,7 +636,10 @@ func TestActivateDeployment(t *testing.T) {
 			if r.Method != http.MethodPost {
 				t.Errorf("expected POST, got %s", r.Method)
 			}
-			w.WriteHeader(http.StatusOK)
+			if r.URL.Path != "/v1/models/model1/deployments/d1/activate" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -632,9 +669,12 @@ func TestGetEnvironment(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(t, w, Environment{
+			if r.URL.Path != "/v1/models/model1/environments/dev" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			writeJSON(t, w, managementapi.Environment{
 				Name:              testEnvName,
-				CurrentDeployment: &Deployment{ID: "d1", Name: "dep-1", Status: "ACTIVE"},
+				CurrentDeployment: managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
 			})
 		}))
 		defer srv.Close()
@@ -671,16 +711,18 @@ func TestGetEnvironment(t *testing.T) {
 
 func TestListEnvironments(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, EnvironmentsResponse{
-			Environments: []Environment{
+		writeJSON(t, w, managementapi.Environments{
+			Environments: []managementapi.Environment{
 				{
 					Name:              "dev",
-					CurrentDeployment: &Deployment{ID: "d1", Name: "dep-1", Status: "ACTIVE"},
+					CurrentDeployment: managementapi.Deployment{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
 				},
 				{
-					Name:                "staging",
-					CurrentDeployment:   &Deployment{ID: "d2", Name: "dep-2", Status: "ACTIVE"},
-					CandidateDeployment: &Deployment{ID: "d3", Name: "dep-3", Status: "DEPLOYING"},
+					Name:              "staging",
+					CurrentDeployment: managementapi.Deployment{Id: "d2", Name: "dep-2", Status: status("ACTIVE")},
+					CandidateDeployment: &managementapi.Deployment{
+						Id: "d3", Name: "dep-3", Status: status("DEPLOYING"),
+					},
 				},
 			},
 		})
@@ -708,13 +750,16 @@ func TestListEnvironments(t *testing.T) {
 
 func TestCreateEnvironment(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		var gotBody CreateEnvironmentRequest
+		var gotBody managementapi.CreateEnvironmentRequest
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				t.Errorf("expected POST, got %s", r.Method)
 			}
+			if r.URL.Path != "/v1/models/model1/environments" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
 			decodeJSON(t, r, &gotBody)
-			w.WriteHeader(http.StatusCreated)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -730,6 +775,9 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 		if gotBody.Name != "dev" {
 			t.Errorf("body.Name = %q, want %q", gotBody.Name, "dev")
+		}
+		if gotBody.AutoscalingSettings == nil || gotBody.AutoscalingSettings.MinReplica == nil || *gotBody.AutoscalingSettings.MinReplica != 1 {
+			t.Errorf("expected autoscaling min_replica=1, got %+v", gotBody.AutoscalingSettings)
 		}
 	})
 
@@ -754,10 +802,11 @@ func TestUpdateEnvironmentSettings(t *testing.T) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("expected PATCH, got %s", r.Method)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				t.Fatalf("failed to decode body: %v", err)
+			if r.URL.Path != "/v1/models/model1/environments/dev" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
-			w.WriteHeader(http.StatusOK)
+			decodeJSON(t, r, &gotBody)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -780,10 +829,8 @@ func TestUpdateEnvironmentSettings(t *testing.T) {
 	t.Run("promotion only", func(t *testing.T) {
 		var gotBody map[string]interface{}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				t.Fatalf("failed to decode body: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
+			decodeJSON(t, r, &gotBody)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -806,10 +853,8 @@ func TestUpdateEnvironmentSettings(t *testing.T) {
 	t.Run("both autoscaling and promotion", func(t *testing.T) {
 		var gotBody map[string]interface{}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				t.Fatalf("failed to decode body: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
+			decodeJSON(t, r, &gotBody)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -848,13 +893,16 @@ func TestUpdateEnvironmentSettings(t *testing.T) {
 
 func TestPromote(t *testing.T) {
 	t.Run("success with defaults", func(t *testing.T) {
-		var gotBody PromoteRequest
+		var gotBody managementapi.PromoteToEnvironmentRequest
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				t.Errorf("expected POST, got %s", r.Method)
 			}
+			if r.URL.Path != "/v1/models/model1/environments/dev/promote" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
 			decodeJSON(t, r, &gotBody)
-			writeJSON(t, w, Deployment{ID: "promoted-1", Name: "dep.123", Status: "DEPLOYING"})
+			writeJSON(t, w, managementapi.Deployment{Id: "promoted-1", Name: "dep.123", Status: status("DEPLOYING")})
 		}))
 		defer srv.Close()
 
@@ -866,19 +914,22 @@ func TestPromote(t *testing.T) {
 		if dep.ID != "promoted-1" {
 			t.Errorf("ID = %q, want %q", dep.ID, "promoted-1")
 		}
-		if !gotBody.ScaleDownPreviousDeployment {
+		if gotBody.DeploymentId != "d1" {
+			t.Errorf("DeploymentId = %q, want %q", gotBody.DeploymentId, "d1")
+		}
+		if gotBody.ScaleDownPreviousDeployment == nil || !*gotBody.ScaleDownPreviousDeployment {
 			t.Error("expected ScaleDownPreviousDeployment=true by default")
 		}
-		if !gotBody.PreserveEnvInstanceType {
+		if gotBody.PreserveEnvInstanceType == nil || !*gotBody.PreserveEnvInstanceType {
 			t.Error("expected PreserveEnvInstanceType=true by default")
 		}
 	})
 
 	t.Run("success with custom settings", func(t *testing.T) {
-		var gotBody PromoteRequest
+		var gotBody managementapi.PromoteToEnvironmentRequest
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			decodeJSON(t, r, &gotBody)
-			writeJSON(t, w, Deployment{ID: "promoted-2", Name: "dep.456", Status: "DEPLOYING"})
+			writeJSON(t, w, managementapi.Deployment{Id: "promoted-2", Name: "dep.456", Status: status("DEPLOYING")})
 		}))
 		defer srv.Close()
 
@@ -891,10 +942,10 @@ func TestPromote(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if gotBody.ScaleDownPreviousDeployment {
+		if gotBody.ScaleDownPreviousDeployment == nil || *gotBody.ScaleDownPreviousDeployment {
 			t.Error("expected ScaleDownPreviousDeployment=false")
 		}
-		if gotBody.PreserveEnvInstanceType {
+		if gotBody.PreserveEnvInstanceType == nil || *gotBody.PreserveEnvInstanceType {
 			t.Error("expected PreserveEnvInstanceType=false")
 		}
 	})
@@ -923,13 +974,13 @@ func TestPromote(t *testing.T) {
 func TestListDeployments(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/models/model1/deployments" {
+			if r.URL.Path != "/v1/models/model1/deployments" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
-			writeJSON(t, w, DeploymentDetailsResponse{
-				Deployments: []DeploymentDetail{
-					{ID: "d1", Name: "dep-1", Status: "ACTIVE", CreatedAt: "2025-01-01T00:00:00Z"},
-					{ID: "d2", Name: "dep-2", Status: "SCALED_TO_ZERO", CreatedAt: "2025-01-15T00:00:00Z"},
+			writeJSON(t, w, managementapi.Deployments{
+				Deployments: []managementapi.Deployment{
+					{Id: "d1", Name: "dep-1", Status: status("ACTIVE")},
+					{Id: "d2", Name: "dep-2", Status: status("SCALED_TO_ZERO")},
 				},
 			})
 		}))
@@ -969,13 +1020,11 @@ func TestUpdateDeploymentAutoscaling(t *testing.T) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("expected PATCH, got %s", r.Method)
 			}
-			if r.URL.Path != "/models/model1/deployments/d1/autoscaling_settings" {
+			if r.URL.Path != "/v1/models/model1/deployments/d1/autoscaling_settings" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				t.Fatalf("failed to decode body: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
+			decodeJSON(t, r, &gotBody)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -1009,10 +1058,10 @@ func TestDeleteDeployment(t *testing.T) {
 			if r.Method != http.MethodDelete {
 				t.Errorf("expected DELETE, got %s", r.Method)
 			}
-			if r.URL.Path != "/models/model1/deployments/d1" {
+			if r.URL.Path != "/v1/models/model1/deployments/d1" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
-			w.WriteHeader(http.StatusOK)
+			writeEmptyOK(t, w)
 		}))
 		defer srv.Close()
 
@@ -1137,17 +1186,14 @@ func TestHasPromotionSettingsDrift(t *testing.T) {
 	}
 }
 
-func TestDoRequest_NetworkError(t *testing.T) {
+// TestNetworkError verifies that a transport-level failure (unreachable server) does not
+// surface as an *APIError, so IsNotFoundError and friends treat it as a generic error.
+func TestNetworkError(t *testing.T) {
 	c := newTestClient("http://127.0.0.1:1") // unreachable port
-	req, err := c.newRequest(context.Background(), "GET", c.baseURL+"/models", nil)
-	if err != nil {
-		t.Fatalf("newRequest error: %v", err)
-	}
-	_, err = c.doRequest(req)
+	_, err := c.FindModelIDByName(context.Background(), "my-model")
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
 	}
-	// Should not be an APIError (network error, not HTTP error)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		t.Error("network error should not be APIError")

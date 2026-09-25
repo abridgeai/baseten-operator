@@ -40,6 +40,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.26.5 h1:5UYvv8JUvllZsRnfrcMQ+hJ9jNIC
 github.com/aws/aws-sdk-go-v2/service/sts v1.26.5/go.mod h1:XX5gh4CB7wAs4KhcF46G6C8a2i7eupU19dcAAE+EydU=
 github.com/aws/smithy-go v1.19.0 h1:KWFKQV80DpP3vJrrA9sVAHQ5gc2z8i4EzrLhLlWXcBM=
 github.com/aws/smithy-go v1.19.0/go.mod h1:NukqUGpCZIILqqiV0NIjeFh24kd/FAa4beRb6nbIUPE=
+github.com/basetenlabs/baseten-go v0.1.1-0.20260701165513-0c85d1a410d1 h1:GI3CkX1rpfih1h/790c+w1Fx4J5sGTouYSSJ7H5SkOQ=
+github.com/basetenlabs/baseten-go v0.1.1-0.20260701165513-0c85d1a410d1/go.mod h1:V1hYwZ/70xV0s2sZ6ZXzB/QgAXGcCf9KRX3sWEvZH/I=
 github.com/basetenlabs/truss-go v0.12.1-0.20260226225143-03d2ee72198e h1:rGotGfZj58pa3N2sjQROuh8yPkh8xcw2BdC7HjfljPI=
 github.com/basetenlabs/truss-go v0.12.1-0.20260226225143-03d2ee72198e/go.mod h1:/tJ4pgxgF3U/IZisU2WPkapMtF0nqdhKf72T30kmFOY=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=

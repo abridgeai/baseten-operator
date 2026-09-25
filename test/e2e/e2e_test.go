@@ -39,7 +39,7 @@ const (
 	serviceAccountName     = "baseten-operator-controller-manager"
 	metricsServiceName     = "baseten-operator-controller-manager-metrics-service"
 	metricsRoleBindingName = "baseten-operator-metrics-binding"
-	mockServerURL          = "http://mock-baseten-api.baseten-operator-system.svc.cluster.local:8080/v1"
+	mockServerURL          = "http://mock-baseten-api.baseten-operator-system.svc.cluster.local:8080"
 )
 
 var _ = Describe("Manager", Ordered, func() {
