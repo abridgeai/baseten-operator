@@ -50,6 +50,7 @@ metadata:
   name: my-model-production
 spec:
   modelName: "my-llm-model"                         # required — model name in Baseten
+  # team: "My Team"                                 # optional — Baseten team name; required for team-scoped API keys, immutable once set
   mode: Reconcile                                    # optional — Reconcile (default), Observe, or Pause
   deletionPolicy: Retain                             # optional — Retain (default), DeleteWithGuardrails, or Delete
 
@@ -213,6 +214,8 @@ When a deployment fails (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`), the operato
 | Concurrency | Safe across multiple CRs on the same model |
 
 After 2 hours the operator stops retrying and emits a `DeploymentRetryExhausted` warning. `BUILD_STOPPED` is never retried (intentional user action).
+
+A failed `truss push` (for example, an API key without permission to create models) is also retried with the same backoff schedule. The CR reports `FAILED` with the error, `status.trussPushLastError`, and `status.trussPushNextRetryTime`, and a `TrussPushFailed` warning is emitted per attempt. Push retries continue at the 30m cap until they succeed; changing `trussConfig` pushes the new config immediately.
 
 ### Orphan Deployment Cleanup
 

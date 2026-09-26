@@ -59,6 +59,8 @@ make kind-dev-down
 
 ## Walkthrough: testing a CPU-only deployment
 
+If your API key is team-scoped, uncomment `team` in the CR first; otherwise the push fails with `UNAUTHORIZED_ACCESS` (see `status.trussPushLastError`).
+
 ```bash
 kubectl apply -f test/kind/08-test-cpu-vllm.yaml
 kubectl get bm hello-vllm-cpu -w     # DEPLOYING -> ACTIVE once vLLM passes /health

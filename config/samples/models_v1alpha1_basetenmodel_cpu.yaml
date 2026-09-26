@@ -7,6 +7,8 @@ metadata:
   name: basetenmodel-cpu-example
 spec:
   modelName: "hello-vllm-cpu"
+  # Set when your API key is team-scoped (the Baseten team name, as in `truss push --team`).
+  # team: "My Team"
 
   # CPU-only deployment: omit accelerator and set cpu/memory instead.
   # Baseten picks the smallest CPU instance that fits (cpu: 2 / memory: 4Gi lands on 2 vCPU / 8 GiB).

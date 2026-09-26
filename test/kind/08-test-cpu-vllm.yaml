@@ -4,6 +4,8 @@ metadata:
   name: hello-vllm-cpu
 spec:
   modelName: "hello-vllm-cpu-kind"
+  # Required if your API key is team-scoped, otherwise truss push fails with UNAUTHORIZED_ACCESS.
+  # team: "My Team"
   # Throwaway model: `kubectl delete bm hello-vllm-cpu` deletes it from Baseten.
   deletionPolicy: Delete
 
