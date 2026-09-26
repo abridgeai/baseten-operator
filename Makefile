@@ -70,9 +70,13 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= baseten-operator-test-e2e
+# The suite shells out to kubectl/helm; a dedicated kubeconfig keeps it off ~/.kube/config's
+# current context, which could be a real cluster (teardown deletes namespaces).
+E2E_KUBECONFIG ?= $(LOCALBIN)/e2e-kubeconfig
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+	@mkdir -p $(LOCALBIN)
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
@@ -82,12 +86,13 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --kubeconfig $(E2E_KUBECONFIG) ;; \
 	esac
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=20m ./test/e2e/ -v -ginkgo.v
+	@mkdir -p $(LOCALBIN) && $(KIND) get kubeconfig --name $(KIND_CLUSTER) > $(E2E_KUBECONFIG)
+	KUBECONFIG=$(E2E_KUBECONFIG) KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=20m ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
