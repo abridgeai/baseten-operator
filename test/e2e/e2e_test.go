@@ -202,6 +202,24 @@ var _ = Describe("Manager", Ordered, func() {
 		return output
 	}
 
+	// The mock can't serve truss-go's push, so every push fails; the operator must
+	// record it and back off rather than immediately re-pushing.
+	expectPushFailedWithBackoff := func(name string) {
+		Eventually(func(g Gomega) {
+			g.Expect(getStatus(name, ".status.trussPushStatus")).To(Equal("TRUSS_PUSH_FAILED"))
+			g.Expect(getStatus(name, ".status.trussPushFailureCount")).To(Equal("1"))
+			g.Expect(getStatus(name, ".status.deploymentStatus")).To(Equal("FAILED"))
+			g.Expect(getStatus(name, ".status.message")).To(ContainSubstring("next retry at"))
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+		Expect(getStatus(name, ".status.trussPushLastError")).NotTo(BeEmpty())
+
+		cmd := exec.Command("kubectl", "get", "events", "-n", "default",
+			"--field-selector", "involvedObject.name="+name+",reason=TrussPushFailed", "-o", "name")
+		out, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(out)).NotTo(BeEmpty(), "expected a TrussPushFailed event")
+	}
+
 	getConditionStatus := func(name, condType string) string {
 		jsonpath := fmt.Sprintf(".status.conditions[?(@.type=='%s')].status", condType)
 		return getStatus(name, jsonpath)
@@ -831,9 +849,11 @@ spec:
 				g.Expect(msg).To(ContainSubstring("depl-"), "should include deployment name with depl- prefix")
 			}, 60*time.Second, 2*time.Second).Should(Succeed())
 
-			By("verifying status is DEPLOYING (creating deployment)")
-			status := getStatus("e2e-trussconfig", ".status.deploymentStatus")
-			Expect(status).To(Equal("DEPLOYING"))
+			By("verifying the failed push is recorded and backed off")
+			expectPushFailedWithBackoff("e2e-trussconfig")
+			Consistently(func() string {
+				return getStatus("e2e-trussconfig", ".status.trussPushFailureCount")
+			}, 15*time.Second, 3*time.Second).Should(Equal("1"), "no new push attempts during backoff")
 
 			By("cleanup")
 			cmd = exec.Command("kubectl", "delete", "bm", "--all", "-n", "default", "--ignore-not-found")
@@ -892,7 +912,7 @@ spec:
 				g.Expect(msg).To(ContainSubstring("truss push"))
 				g.Expect(msg).To(ContainSubstring("depl-vllm-cpu-release-repo-v0.29.0-"))
 			}, 60*time.Second, 2*time.Second).Should(Succeed())
-			Expect(getStatus("e2e-trussconfig-cpu", ".status.deploymentStatus")).To(Equal("DEPLOYING"))
+			expectPushFailedWithBackoff("e2e-trussconfig-cpu")
 			Expect(getStatus("e2e-trussconfig-cpu", ".status.trussConfigHash")).To(HaveLen(8))
 
 			By("cleanup")

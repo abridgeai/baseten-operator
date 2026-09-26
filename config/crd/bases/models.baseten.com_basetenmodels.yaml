@@ -817,10 +817,26 @@ spec:
                   TrussConfigHash is the hash of the trussConfig + setup script content.
                   Used for change detection — a new hash triggers a new truss push.
                 type: string
+              trussPushFailureCount:
+                description: |-
+                  TrussPushFailureCount counts consecutive failed truss pushes for the current config.
+                  Drives exponential backoff between attempts. Reset on success or config change.
+                format: int32
+                type: integer
+              trussPushLastError:
+                description: TrussPushLastError is the error from the most recent
+                  failed truss push.
+                type: string
+              trussPushNextRetryTime:
+                description: TrussPushNextRetryTime is the earliest time the next
+                  truss push is allowed after a failure.
+                format: date-time
+                type: string
               trussPushStatus:
                 description: |-
                   TrussPushStatus tracks the internal state of the truss push operation.
-                  Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created)
+                  Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created),
+                  TRUSS_PUSH_FAILED (last push failed; retried after trussPushNextRetryTime)
                 type: string
               trussPushTime:
                 description: |-

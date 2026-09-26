@@ -225,6 +225,10 @@ func (in *BasetenModelStatus) DeepCopyInto(out *BasetenModelStatus) {
 		in, out := &in.ModelIDResolvedTime, &out.ModelIDResolvedTime
 		*out = (*in).DeepCopy()
 	}
+	if in.TrussPushNextRetryTime != nil {
+		in, out := &in.TrussPushNextRetryTime, &out.TrussPushNextRetryTime
+		*out = (*in).DeepCopy()
+	}
 	if in.TrussPushTime != nil {
 		in, out := &in.TrussPushTime, &out.TrussPushTime
 		*out = (*in).DeepCopy()

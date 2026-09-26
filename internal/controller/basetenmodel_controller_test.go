@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -3200,6 +3201,136 @@ var _ = Describe("BasetenModel Controller", func() {
 				status := getModelStatus(name)
 				Expect(status.ModelID).To(BeEmpty(), "cached model ID should be cleared")
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
+			})
+
+			Describe("push failure backoff", func() {
+				failingPush := func(calls *int32) {
+					mockModelFound()
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return "", "", nil
+					}
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+						atomic.AddInt32(calls, 1)
+						return nil, fmt.Errorf("truss push failed: API error (UNAUTHORIZED_ACCESS)")
+					}
+				}
+				waitForFailure := func(name string, attempt int32) modelsv1alpha1.BasetenModelStatus {
+					var status modelsv1alpha1.BasetenModelStatus
+					Eventually(func(g Gomega) {
+						status = getModelStatus(name)
+						g.Expect(status.TrussPushStatus).To(Equal(statusTrussPushFailed))
+						g.Expect(status.TrussPushFailureCount).To(Equal(attempt))
+					}, 2*time.Second, 50*time.Millisecond).Should(Succeed())
+					return status
+				}
+
+				It("should record the failure and not push again until the backoff elapses", func() {
+					name := "truss-push-backoff"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					status := waitForFailure(name, 1)
+					Expect(status.TrussPushLastError).To(ContainSubstring("UNAUTHORIZED_ACCESS"))
+					Expect(status.TrussPushNextRetryTime).NotTo(BeNil())
+					Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">=", retryBaseInterval-time.Second))
+					Expect(drainEvents()).To(ContainElement(And(ContainSubstring(EventTrussPushFailed), ContainSubstring("attempt 1"))))
+
+					By("reconciling repeatedly during the backoff window")
+					for range 5 {
+						result, err := reconcileByName(name)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(result.RequeueAfter).To(BeNumerically(">", time.Minute), "should wait for the backoff, not hot-loop")
+					}
+					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(1)), "no new push during backoff")
+
+					status = getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+					Expect(status.Message).To(ContainSubstring("UNAUTHORIZED_ACCESS"))
+					Expect(status.Message).To(ContainSubstring("next retry at"))
+				})
+
+				It("should retry after the backoff elapses and grow the attempt count", func() {
+					name := "truss-push-backoff-retry"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					By("fast-forwarding past the retry time")
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					past := metav1.NewTime(time.Now().Add(-time.Second))
+					m.Status.TrussPushNextRetryTime = &past
+					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					status := waitForFailure(name, 2)
+					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(2)))
+					Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">=", 2*retryBaseInterval-time.Second), "backoff should double")
+				})
+
+				It("should push a changed config immediately and reset the failure count", func() {
+					name := "truss-push-backoff-config-change"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					By("changing the image while still in backoff")
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					m.Spec.TrussConfig.BaseImage.Image = "test:v2"
+					Expect(k8sClient.Update(ctx, m)).To(Succeed())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() int32 { return atomic.LoadInt32(&calls) }, 2*time.Second).Should(Equal(int32(2)))
+					waitForFailure(name, 1) // new config starts its own count
+				})
+
+				It("should clear failure state after a successful push", func() {
+					name := "truss-push-backoff-recover"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					past := metav1.NewTime(time.Now().Add(-time.Second))
+					m.Status.TrussPushNextRetryTime = &past
+					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+						return &truss.PushResult{ModelID: testModelID, DeploymentID: "ok"}, nil
+					}
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Eventually(func(g Gomega) {
+						s := getModelStatus(name)
+						g.Expect(s.TrussPushStatus).To(Equal(statusTrussPushDone))
+						g.Expect(s.TrussPushFailureCount).To(BeZero())
+						g.Expect(s.TrussPushNextRetryTime).To(BeNil())
+						g.Expect(s.TrussPushLastError).To(BeEmpty())
+					}, 2*time.Second, 50*time.Millisecond).Should(Succeed())
+				})
 			})
 
 			It("should emit TrussPushCompleted when deployment appears after push", func() {

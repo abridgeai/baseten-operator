@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -47,6 +48,7 @@ const (
 	statusPending             = "PENDING"
 	statusTrussPushing        = "TRUSS_PUSHING"
 	statusTrussPushDone       = "TRUSS_PUSH_DONE"
+	statusTrussPushFailed     = "TRUSS_PUSH_FAILED"
 	statusPaused              = "PAUSED"
 	statusDeleting            = "DELETING"
 	statusDeleteFailed        = "DELETE_FAILED"
@@ -58,6 +60,8 @@ const (
 	// trussPushStaleTimeout is the safety net for clearing stale TRUSS_PUSHING state
 	// if the goroutine is killed before it can write back (e.g., pod restart).
 	trussPushStaleTimeout = 5 * time.Minute
+
+	maxPushErrorLen = 512
 
 	// deploymentRetryDeadline is how long the operator retries failed deployments
 	// before giving up with a TerminalError. After this, the resource stops requeueing
@@ -1257,6 +1261,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 			model.Status.TrussConfigHash = configHash
 			model.Status.SourceDeploymentName = deploymentName
 			model.Status.TrussPushStatus = statusTrussPushDone
+			clearPushFailure(&model.Status)
 			if err := r.Status().Update(ctx, model); err != nil {
 				logger.Error(err, "Failed to update status after finding existing deployment")
 			}
@@ -1289,6 +1294,26 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 				modelID:          modelID,
 			})
 			result := ctrl.Result{RequeueAfter: 10 * time.Second}
+			return "", &result, nil
+		}
+	}
+
+	// Back off after a failed push. Without this, the failure's status write
+	// triggers an immediate reconcile and a fast-failing push (e.g. auth) hot-loops.
+	if model.Status.TrussPushStatus == statusTrussPushFailed {
+		next := model.Status.TrussPushNextRetryTime
+		switch {
+		case model.Status.SourceDeploymentName != deploymentName:
+			// Config changed since the failure: push the new config now.
+			clearPushFailure(&model.Status)
+		case next != nil && time.Now().Before(next.Time):
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: baseten.DeploymentStatusFailed,
+				message: fmt.Sprintf("%struss push failed for %s (attempt %d): %s; next retry at %s", ap, deploymentName,
+					model.Status.TrussPushFailureCount, model.Status.TrussPushLastError, next.UTC().Format(time.RFC3339)),
+				modelID: modelID,
+			})
+			result := ctrl.Result{RequeueAfter: time.Until(next.Time)}
 			return "", &result, nil
 		}
 	}
@@ -1370,7 +1395,7 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName)
 	if err != nil {
 		logger.Error(err, "Create deployment failed", "deploymentName", deploymentName)
-		r.updatePushStatus(modelName, namespace, "", "")
+		r.recordPushFailure(modelName, namespace, deploymentName, err)
 		return
 	}
 
@@ -1378,7 +1403,7 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	r.updatePushStatus(modelName, namespace, statusTrussPushDone, result.ModelID)
 }
 
-// updatePushStatus writes push outcome back to CR status. Empty pushStatus = failure (triggers retry).
+// updatePushStatus writes push outcome back to CR status.
 // modelID is written to status.ModelID if non-empty (populated when truss push creates a new model).
 func (r *BasetenModelReconciler) updatePushStatus(modelName, namespace, pushStatus, modelID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1386,22 +1411,72 @@ func (r *BasetenModelReconciler) updatePushStatus(modelName, namespace, pushStat
 
 	logger := log.FromContext(ctx).WithValues("model", modelName)
 
-	model := &modelsv1alpha1.BasetenModel{}
-	if err := r.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, model); err != nil {
-		logger.Error(err, "Failed to fetch CR for push status update")
-		return
-	}
-
-	model.Status.TrussPushStatus = pushStatus
-	model.Status.TrussPushTime = nil
-	if modelID != "" {
-		model.Status.ModelID = modelID
-		now := metav1.Now()
-		model.Status.ModelIDResolvedTime = &now
-	}
-	if err := r.Status().Update(ctx, model); err != nil {
+	// Retry on conflict: the reconcile loop writes status concurrently with this goroutine.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		model := &modelsv1alpha1.BasetenModel{}
+		if err := r.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, model); err != nil {
+			return err
+		}
+		model.Status.TrussPushStatus = pushStatus
+		model.Status.TrussPushTime = nil
+		if pushStatus == statusTrussPushDone {
+			clearPushFailure(&model.Status)
+		}
+		if modelID != "" {
+			model.Status.ModelID = modelID
+			now := metav1.Now()
+			model.Status.ModelIDResolvedTime = &now
+		}
+		return r.Status().Update(ctx, model)
+	})
+	if err != nil {
 		logger.Error(err, "Failed to update push status", "pushStatus", pushStatus)
 	}
+}
+
+// recordPushFailure marks the push failed and schedules the next attempt with
+// exponential backoff (retryBackoff). If this write is lost, the stale-push
+// timeout still recovers the CR.
+func (r *BasetenModelReconciler) recordPushFailure(modelName, namespace, deploymentName string, pushErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	logger := log.FromContext(ctx).WithValues("model", modelName)
+
+	model := &modelsv1alpha1.BasetenModel{}
+	var backoff time.Duration
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, model); err != nil {
+			return err
+		}
+		model.Status.TrussPushStatus = statusTrussPushFailed
+		model.Status.TrussPushTime = nil
+		model.Status.TrussPushFailureCount++
+		backoff = retryBackoff(model.Status.TrussPushFailureCount)
+		next := metav1.NewTime(time.Now().Add(backoff))
+		model.Status.TrussPushNextRetryTime = &next
+		model.Status.TrussPushLastError = truncateString(pushErr.Error(), maxPushErrorLen)
+		return r.Status().Update(ctx, model)
+	})
+	if err != nil {
+		logger.Error(err, "Failed to record push failure")
+		return
+	}
+	r.Recorder.Eventf(model, corev1.EventTypeWarning, EventTrussPushFailed, "Truss push for '%s' failed (attempt %d), retrying in %s: %v",
+		deploymentName, model.Status.TrussPushFailureCount, backoff.Truncate(time.Second), pushErr)
+}
+
+func clearPushFailure(s *modelsv1alpha1.BasetenModelStatus) {
+	s.TrussPushFailureCount = 0
+	s.TrussPushNextRetryTime = nil
+	s.TrussPushLastError = ""
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // readSetupScript reads the setup script from a ConfigMap or inline spec.

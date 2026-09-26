@@ -675,9 +675,23 @@ type BasetenModelStatus struct {
 	TrussConfigHash string `json:"trussConfigHash,omitempty"`
 
 	// TrussPushStatus tracks the internal state of the truss push operation.
-	// Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created)
+	// Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created),
+	// TRUSS_PUSH_FAILED (last push failed; retried after trussPushNextRetryTime)
 	// +optional
 	TrussPushStatus string `json:"trussPushStatus,omitempty"`
+
+	// TrussPushFailureCount counts consecutive failed truss pushes for the current config.
+	// Drives exponential backoff between attempts. Reset on success or config change.
+	// +optional
+	TrussPushFailureCount int32 `json:"trussPushFailureCount,omitempty"`
+
+	// TrussPushNextRetryTime is the earliest time the next truss push is allowed after a failure.
+	// +optional
+	TrussPushNextRetryTime *metav1.Time `json:"trussPushNextRetryTime,omitempty"`
+
+	// TrussPushLastError is the error from the most recent failed truss push.
+	// +optional
+	TrussPushLastError string `json:"trussPushLastError,omitempty"`
 
 	// TrussPushTime is the last time a truss push was initiated.
 	// Used to detect stale TRUSS_PUSHING state and retry after timeout.
