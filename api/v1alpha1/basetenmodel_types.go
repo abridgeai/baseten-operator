@@ -73,11 +73,19 @@ const (
 // Exactly one of sourceDeploymentName or trussConfig must be specified.
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
 type BasetenModelSpec struct {
 	// ModelName references an existing Baseten model
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	ModelName string `json:"modelName"`
+
+	// Team is the Baseten team name the model belongs to (as in `truss push --team`).
+	// Model lookup and truss push are scoped to it; required when the API key is
+	// team-scoped. Model names are unique only within a team. Immutable once set.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Team string `json:"team,omitempty"`
 
 	// SourceDeploymentName is the deployment to promote (created by CI/CD via truss push).
 	// Mutually exclusive with trussConfig.

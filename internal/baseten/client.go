@@ -68,7 +68,7 @@ func toAPIError(err error) error {
 
 // ClientInterface defines the contract for interacting with the Baseten API.
 type ClientInterface interface {
-	FindModelIDByName(ctx context.Context, modelName string) (string, error)
+	FindModelIDByName(ctx context.Context, modelName, team string) (string, error)
 	DeleteModel(ctx context.Context, modelID string) error
 	GetEnvironment(ctx context.Context, modelID, envName string) (*Environment, error)
 	ListEnvironments(ctx context.Context, modelID string) ([]Environment, error)
@@ -184,9 +184,20 @@ type Environment struct {
 	ScheduleDecodeErr error `json:"-"`
 }
 
-// FindModelIDByName lists all models and returns the ID matching modelName ("" if not found).
-func (c *Client) FindModelIDByName(ctx context.Context, modelName string) (string, error) {
-	models, err := c.api.GetModels(ctx, managementapi.GetV1ModelsParams{})
+// FindModelIDByName returns the ID of the model named modelName ("" if not found).
+// A non-empty team scopes the lookup to that team.
+func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) (string, error) {
+	var models *managementapi.Models
+	var err error
+	if team == "" {
+		models, err = c.api.GetModels(ctx, managementapi.GetV1ModelsParams{})
+	} else {
+		var teamID string
+		if teamID, err = c.findTeamID(ctx, team); err != nil {
+			return "", err
+		}
+		models, err = c.api.GetTeamsModels(ctx, teamID, managementapi.GetV1TeamsTeamIdModelsParams{Name: &modelName})
+	}
 	if err != nil {
 		return "", toAPIError(err)
 	}
@@ -196,6 +207,19 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName string) (strin
 		}
 	}
 	return "", nil
+}
+
+func (c *Client) findTeamID(ctx context.Context, team string) (string, error) {
+	teams, err := c.api.GetTeams(ctx, managementapi.GetV1TeamsParams{Name: &team})
+	if err != nil {
+		return "", toAPIError(err)
+	}
+	for _, t := range teams.Teams {
+		if t.Name == team {
+			return t.Id, nil
+		}
+	}
+	return "", fmt.Errorf("baseten team %q not found or not accessible with this API key", team)
 }
 
 // DeleteModel deletes a Baseten model and cascades to all deployments and environments under it.

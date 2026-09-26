@@ -7,7 +7,7 @@ import (
 )
 
 type MockClient struct {
-	FindModelIDByNameFunc           func(ctx context.Context, modelName string) (string, error)
+	FindModelIDByNameFunc           func(ctx context.Context, modelName, team string) (string, error)
 	DeleteModelFunc                 func(ctx context.Context, modelID string) error
 	GetEnvironmentFunc              func(ctx context.Context, modelID, envName string) (*Environment, error)
 	ListEnvironmentsFunc            func(ctx context.Context, modelID string) ([]Environment, error)
@@ -25,8 +25,8 @@ type MockClient struct {
 
 var _ ClientInterface = (*MockClient)(nil)
 
-func (m *MockClient) FindModelIDByName(ctx context.Context, modelName string) (string, error) {
-	return m.FindModelIDByNameFunc(ctx, modelName)
+func (m *MockClient) FindModelIDByName(ctx context.Context, modelName, team string) (string, error) {
+	return m.FindModelIDByNameFunc(ctx, modelName, team)
 }
 
 func (m *MockClient) DeleteModel(ctx context.Context, modelID string) error {

@@ -798,7 +798,7 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 	modelID := model.Status.ModelID
 	if modelID == "" {
 		var err error
-		modelID, err = r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName)
+		modelID, err = r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName, model.Spec.Team)
 		if err != nil {
 			logger.Error(err, "Failed to lookup model")
 			r.logUpdateStatus(ctx, model, statusUpdate{
@@ -1130,7 +1130,7 @@ func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *mode
 		return model.Status.ModelID, nil, nil
 	}
 
-	modelID, err := r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName)
+	modelID, err := r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName, model.Spec.Team)
 	if err != nil {
 		logger.Error(err, "Failed to lookup model in Baseten")
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelNotFound, "Failed to lookup model %q: %v", model.Spec.ModelName, err)
@@ -1345,7 +1345,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	} else {
 		r.Recorder.Eventf(model, corev1.EventTypeNormal, EventTrussPushStarted, "Creating deployment '%s' via truss push", deploymentName)
 	}
-	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, deploymentName)
+	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, model.Spec.Team, deploymentName)
 
 	r.logUpdateStatus(ctx, model, statusUpdate{
 		deploymentStatus: baseten.DeploymentStatusDeploying,
@@ -1357,7 +1357,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 }
 
 // asyncPush runs truss push in the background and writes result back to CR status.
-func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, deploymentName string) {
+func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, team, deploymentName string) {
 	if r.PushSemaphore != nil {
 		defer func() { <-r.PushSemaphore }()
 	}
@@ -1367,7 +1367,7 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, deploymentName)
+	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName)
 	if err != nil {
 		logger.Error(err, "Create deployment failed", "deploymentName", deploymentName)
 		r.updatePushStatus(modelName, namespace, "", "")

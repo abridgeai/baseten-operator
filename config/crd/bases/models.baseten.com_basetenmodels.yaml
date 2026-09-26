@@ -486,6 +486,13 @@ spec:
                   Mutually exclusive with trussConfig.
                   Format: img-{container-img-version}-wgt-{model-weight-version}-p-{platform-config-version}
                 type: string
+              team:
+                description: |-
+                  Team is the Baseten team name the model belongs to (as in `truss push --team`).
+                  Model lookup and truss push are scoped to it; required when the API key is
+                  team-scoped. Model names are unique only within a team. Immutable once set.
+                minLength: 1
+                type: string
               trussConfig:
                 description: |-
                   TrussConfig specifies the truss configuration for the operator to create a deployment
@@ -662,6 +669,8 @@ spec:
               rule: has(self.sourceDeploymentName) || has(self.trussConfig)
             - message: sourceDeploymentName and trussConfig are mutually exclusive
               rule: '!(has(self.sourceDeploymentName) && has(self.trussConfig))'
+            - message: team is immutable once set
+              rule: '!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)'
           status:
             description: status defines the observed state of BasetenModel
             properties:
