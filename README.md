@@ -1,7 +1,6 @@
 # Baseten Operator
 
 [![CI](https://github.com/abridgeai/baseten-operator/actions/workflows/test.yml/badge.svg)](https://github.com/abridgeai/baseten-operator/actions/workflows/test.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/abridgeai/baseten-operator)](https://goreportcard.com/report/github.com/abridgeai/baseten-operator)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > **Note:** This project is a work in progress. The API is `v1alpha1` and may change between versions. If you run into issues, please [open a GitHub issue](https://github.com/abridgeai/baseten-operator/issues).
