@@ -99,6 +99,9 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 # running for interactive testing. Requires BASETEN_API_KEY env var and a real
 # test model in your Baseten account.
 KIND_DEV_CLUSTER ?= baseten-operator-dev
+# Pinned so a reused cluster never falls through to the current (possibly real) kubectl context.
+KIND_DEV_CONTEXT := kind-$(KIND_DEV_CLUSTER)
+KIND_DEV_KUBECTL = $(KUBECTL) --context $(KIND_DEV_CONTEXT)
 DEV_IMG ?= baseten-operator:dev
 DEV_NAMESPACE ?= baseten-operator-system
 
@@ -114,24 +117,27 @@ kind-dev-up: manifests generate ## Stand up a kind cluster + operator pointed at
 		*"$(KIND_DEV_CLUSTER)"*) echo "Cluster '$(KIND_DEV_CLUSTER)' already exists. Reusing." ;; \
 		*) $(KIND) create cluster --name $(KIND_DEV_CLUSTER) ;; \
 	esac
+	@$(KIND_DEV_KUBECTL) cluster-info >/dev/null 2>&1 || { echo "ERROR: kubectl context $(KIND_DEV_CONTEXT) not reachable."; exit 1; }
 	@echo ">>> Building operator image $(DEV_IMG)"
 	$(CONTAINER_TOOL) build -t $(DEV_IMG) .
 	@echo ">>> Loading operator image into kind"
 	$(KIND) load docker-image $(DEV_IMG) --name $(KIND_DEV_CLUSTER)
 	@echo ">>> Creating namespace + api-key secret from BASETEN_API_KEY"
-	$(KUBECTL) create ns $(DEV_NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
-	$(KUBECTL) create secret generic baseten-operator-api-key -n $(DEV_NAMESPACE) \
-		--from-literal=api-key="$$BASETEN_API_KEY" --dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KIND_DEV_KUBECTL) create ns $(DEV_NAMESPACE) --dry-run=client -o yaml | $(KIND_DEV_KUBECTL) apply -f -
+	$(KIND_DEV_KUBECTL) create secret generic baseten-operator-api-key -n $(DEV_NAMESPACE) \
+		--from-literal=api-key="$$BASETEN_API_KEY" --dry-run=client -o yaml | $(KIND_DEV_KUBECTL) apply -f -
 	@echo ">>> Deploying operator (Helm)"
-	$(MAKE) deploy IMG=$(DEV_IMG)
-	$(KUBECTL) rollout status deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE) --timeout=120s
+	$(MAKE) deploy IMG=$(DEV_IMG) HELM="$(HELM) --kube-context $(KIND_DEV_CONTEXT)"
+	@# Same :dev tag every time, so helm sees no spec change; restart to pick up the new image.
+	$(KIND_DEV_KUBECTL) rollout restart deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE)
+	$(KIND_DEV_KUBECTL) rollout status deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE) --timeout=120s
 	@echo
 	@echo "Cluster ready, pointed at https://api.baseten.co/v1."
 	@echo "Edit a sample CR to reference one of YOUR Baseten models, then:"
-	@echo "  $(KUBECTL) apply -f test/kind/01-test-model-dev.yaml"
-	@echo "  $(KUBECTL) get bm -w"
-	@echo "  $(KUBECTL) describe bm <name>"
-	@echo "  $(KUBECTL) logs -n $(DEV_NAMESPACE) deployment/baseten-operator-controller-manager -f"
+	@echo "  $(KIND_DEV_KUBECTL) apply -f test/kind/01-test-model-dev.yaml"
+	@echo "  $(KIND_DEV_KUBECTL) get bm -w"
+	@echo "  $(KIND_DEV_KUBECTL) describe bm <name>"
+	@echo "  $(KIND_DEV_KUBECTL) logs -n $(DEV_NAMESPACE) deployment/baseten-operator-controller-manager -f"
 	@echo "  make kind-dev-restart   # rebuild operator and reload"
 	@echo "  make kind-dev-down      # tear down"
 
@@ -141,10 +147,11 @@ kind-dev-down: ## Tear down the local dev kind cluster.
 
 .PHONY: kind-dev-restart
 kind-dev-restart: ## Rebuild operator image, reload into kind, and restart the deployment for fast iteration.
+	@$(KIND_DEV_KUBECTL) cluster-info >/dev/null 2>&1 || { echo "ERROR: kubectl context $(KIND_DEV_CONTEXT) not reachable."; exit 1; }
 	$(CONTAINER_TOOL) build -t $(DEV_IMG) .
 	$(KIND) load docker-image $(DEV_IMG) --name $(KIND_DEV_CLUSTER)
-	$(KUBECTL) rollout restart deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE)
-	$(KUBECTL) rollout status deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE) --timeout=120s
+	$(KIND_DEV_KUBECTL) rollout restart deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE)
+	$(KIND_DEV_KUBECTL) rollout status deployment/baseten-operator-controller-manager -n $(DEV_NAMESPACE) --timeout=120s
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

@@ -19,6 +19,8 @@ make kind-dev-up
 
 `kind-dev-up` creates the cluster, builds and loads the operator image, deploys the operator pointed at `api.baseten.co`, and waits for the rollout. Re-running it on an existing cluster is a no-op for the cluster step and reapplies image + Helm release.
 
+> **Check your kubectl context first.** The `kubectl` commands below use your current context. `kind-dev-up` only switches it when it creates the cluster, so if you last used a real cluster, run `kubectl config use-context kind-baseten-operator-dev` (or pass `--context kind-baseten-operator-dev`).
+
 Apply a test resource:
 
 ```bash
