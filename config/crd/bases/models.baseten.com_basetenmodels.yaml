@@ -583,15 +583,32 @@ spec:
                     description: Resources defines compute resources for the deployment
                     properties:
                       accelerator:
-                        description: Accelerator specifies GPU type and count (e.g.,
-                          "H100:2", "A100:4", "L4")
+                        description: |-
+                          Accelerator specifies GPU type and count (e.g., "H100:2", "A100:4", "L4").
+                          Omit for CPU-only deployments.
+                        minLength: 1
+                        type: string
+                      cpu:
+                        description: |-
+                          CPU is the number of CPU cores in truss format (e.g., "2", "500m").
+                          Baseten picks the smallest instance type that fits cpu and memory.
+                        minLength: 1
+                        type: string
+                      memory:
+                        description: Memory is the memory request in truss format
+                          (e.g., "8Gi").
+                        minLength: 1
                         type: string
                       useGpu:
-                        description: UseGpu enables GPU support
+                        description: UseGpu enables GPU support. Requires accelerator
+                          when true.
                         type: boolean
-                    required:
-                    - accelerator
                     type: object
+                    x-kubernetes-validations:
+                    - message: one of accelerator or cpu must be set
+                      rule: has(self.accelerator) || has(self.cpu)
+                    - message: useGpu requires accelerator
+                      rule: '!has(self.useGpu) || !self.useGpu || has(self.accelerator)'
                   runtime:
                     description: Runtime configures runtime behavior
                     properties:

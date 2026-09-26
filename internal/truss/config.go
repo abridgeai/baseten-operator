@@ -23,11 +23,19 @@ func GenerateConfigYAML(tc *modelsv1alpha1.TrussConfig, modelName string) ([]byt
 	}
 
 	// Resources
-	resources := map[string]any{
-		"accelerator": tc.Resources.Accelerator,
+	// truss rejects an empty accelerator; CPU-only configs must omit the key.
+	resources := map[string]any{}
+	if tc.Resources.Accelerator != "" {
+		resources["accelerator"] = tc.Resources.Accelerator
 	}
 	if tc.Resources.UseGpu != nil {
 		resources["use_gpu"] = *tc.Resources.UseGpu
+	}
+	if tc.Resources.CPU != "" {
+		resources["cpu"] = tc.Resources.CPU
+	}
+	if tc.Resources.Memory != "" {
+		resources["memory"] = tc.Resources.Memory
 	}
 	config["resources"] = resources
 

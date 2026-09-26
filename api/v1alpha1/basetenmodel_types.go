@@ -180,15 +180,31 @@ type TrussConfig struct {
 	SetupScript *SetupScriptSource `json:"setupScript,omitempty"`
 }
 
-// TrussResources defines compute resources for the deployment
+// TrussResources defines compute resources for the deployment.
+// Set accelerator for a GPU deployment, or cpu (and optionally memory) for a CPU-only one.
+// +kubebuilder:validation:XValidation:rule="has(self.accelerator) || has(self.cpu)",message="one of accelerator or cpu must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.useGpu) || !self.useGpu || has(self.accelerator)",message="useGpu requires accelerator"
 type TrussResources struct {
-	// Accelerator specifies GPU type and count (e.g., "H100:2", "A100:4", "L4")
-	// +required
-	Accelerator string `json:"accelerator"`
+	// Accelerator specifies GPU type and count (e.g., "H100:2", "A100:4", "L4").
+	// Omit for CPU-only deployments.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Accelerator string `json:"accelerator,omitempty"`
 
-	// UseGpu enables GPU support
+	// UseGpu enables GPU support. Requires accelerator when true.
 	// +optional
 	UseGpu *bool `json:"useGpu,omitempty"`
+
+	// CPU is the number of CPU cores in truss format (e.g., "2", "500m").
+	// Baseten picks the smallest instance type that fits cpu and memory.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	CPU string `json:"cpu,omitempty"`
+
+	// Memory is the memory request in truss format (e.g., "8Gi").
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Memory string `json:"memory,omitempty"`
 }
 
 // TrussBaseImage specifies the Docker base image

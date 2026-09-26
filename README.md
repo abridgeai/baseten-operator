@@ -60,8 +60,10 @@ spec:
   trussConfig:
     pythonVersion: "py312"                           # optional (e.g., py311, py312)
     resources:                                       # required
-      accelerator: "H100:1"                          # required (e.g., H100:2, A100:4, L4)
-      # useGpu: true                                 # optional
+      accelerator: "H100:1"                          # GPU: type and count (e.g., H100:2, A100:4, L4)
+      # useGpu: true                                 # optional; useGpu: true requires accelerator
+      # cpu: "2"                                     # CPU-only: set cpu (and memory) instead of accelerator
+      # memory: "4Gi"
     baseImage:                                       # required
       image: "us-docker.pkg.dev/my-project/my-repo/vllm:0.16.0"
       dockerAuth:                                    # optional — only if private registry
@@ -182,6 +184,15 @@ spec:
         key: setup.sh
   environment:
     name: production
+```
+
+For a CPU-only deployment, omit `accelerator` and set `cpu`/`memory`; Baseten picks the smallest CPU instance that fits. See `config/samples/models_v1alpha1_basetenmodel_cpu.yaml` for a minimal vLLM-on-CPU example.
+
+```yaml
+    resources:
+      cpu: "2"
+      memory: 4Gi
+      useGpu: false
 ```
 
 ### Drift Detection and Correction

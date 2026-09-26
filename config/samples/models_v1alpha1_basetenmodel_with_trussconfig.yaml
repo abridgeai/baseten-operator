@@ -10,12 +10,13 @@ spec:
 
   # Inline truss configuration — operator creates deployment automatically.
   # Mutually exclusive with sourceDeploymentName.
-  # Deployment name is deterministic: depl-{8char-sha256-hash}
+  # Deployment name is deterministic: depl-{imageName}-{imageTag}-{8char-hash}
   trussConfig:
     pythonVersion: "py312"
 
     resources:
       accelerator: "H100:1"
+      # For CPU-only, omit accelerator and set cpu/memory (see models_v1alpha1_basetenmodel_cpu.yaml)
       # useGpu: true
 
     baseImage:

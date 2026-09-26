@@ -53,6 +53,23 @@ make kind-dev-down
 | `06-test-delete-cascade.yaml` | `deletionPolicy: Delete` — `kubectl delete bm` cascades to `DELETE /v1/models/{id}` and removes the model |
 | `07-test-model-observe.yaml` | `mode: Observe` — read-only secondary CR for the same model+env as `01-test-model-dev.yaml`; simulates a multi-region setup |
 | `truss-config-test-configmap.yaml` + `truss-config-test-cr.yaml` | Operator-created deployment via inline `trussConfig` |
+| `08-test-cpu-vllm.yaml` | CPU-only `trussConfig` (no accelerator): operator creates a throwaway `hello-vllm-cpu-kind` model running vLLM on a 2 vCPU instance, `deletionPolicy: Delete` |
+
+## Walkthrough: testing a CPU-only deployment
+
+```bash
+kubectl apply -f test/kind/08-test-cpu-vllm.yaml
+kubectl get bm hello-vllm-cpu -w     # DEPLOYING -> ACTIVE once vLLM passes /health
+
+MODEL_ID=$(kubectl get bm hello-vllm-cpu -o jsonpath='{.status.modelID}')
+curl -s https://model-$MODEL_ID.api.baseten.co/environments/dev/sync/v1/chat/completions \
+  -H "Authorization: Api-Key $BASETEN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"hello-vllm","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+
+kubectl delete bm hello-vllm-cpu     # deletes the Baseten model
+```
+
+In the Baseten UI the deployment's instance type should be a CPU type (2 vCPU / 8 GiB), not a GPU.
 
 ## Walkthrough: testing the delete feature
 

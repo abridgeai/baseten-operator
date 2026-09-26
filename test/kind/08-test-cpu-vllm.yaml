@@ -1,0 +1,49 @@
+apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: hello-vllm-cpu
+spec:
+  modelName: "hello-vllm-cpu-kind"
+  # Throwaway model: `kubectl delete bm hello-vllm-cpu` deletes it from Baseten.
+  deletionPolicy: Delete
+
+  # CPU-only deployment: omit accelerator and set cpu/memory instead.
+  # Baseten picks the smallest CPU instance that fits (cpu: 2 / memory: 4Gi lands on 2 vCPU / 8 GiB).
+  trussConfig:
+    resources:
+      cpu: "2"
+      memory: 4Gi
+      useGpu: false
+
+    baseImage:
+      image: "public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.29.0"
+
+    dockerServer:
+      startCommand: >-
+        sh -c "vllm serve HuggingFaceTB/SmolLM2-135M-Instruct
+        --revision 12fd25f77366fa6b3b4b768ec3050bf629380bac
+        --served-model-name hello-vllm --host 0.0.0.0 --port 8000
+        --dtype float32 --enforce-eager --max-model-len 1024 --max-num-seqs 2
+        --disable-log-stats"
+      readinessEndpoint: "/health"
+      livenessEndpoint: "/health"
+      predictEndpoint: "/v1/chat/completions"
+      serverPort: 8000
+
+    environmentVariables:
+      VLLM_CPU_KVCACHE_SPACE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+
+    runtime:
+      predictConcurrency: 2
+
+    modelMetadata:
+      tags:
+        - "openai-compatible"
+
+  environment:
+    name: "dev"
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 1
+      concurrencyTarget: 2

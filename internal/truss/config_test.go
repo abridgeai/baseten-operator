@@ -81,6 +81,11 @@ func TestGenerateConfigYAML(t *testing.T) {
 	if resources["use_gpu"] != true {
 		t.Errorf("resources.use_gpu = %v, want true", resources["use_gpu"])
 	}
+	for _, key := range []string{"cpu", "memory"} {
+		if _, ok := resources[key]; ok {
+			t.Errorf("resources.%s should be omitted when unset, got %v", key, resources[key])
+		}
+	}
 
 	// Base image (snake_case)
 	baseImage, ok := parsed["base_image"].(map[string]any)
@@ -154,6 +159,106 @@ func TestGenerateConfigYAML_Minimal(t *testing.T) {
 	}
 	if parsed["docker_server"] != nil {
 		t.Errorf("docker_server should be omitted, got %v", parsed["docker_server"])
+	}
+}
+
+func TestGenerateConfigYAML_CPUOnly(t *testing.T) {
+	tc := &modelsv1alpha1.TrussConfig{
+		Resources: modelsv1alpha1.TrussResources{
+			CPU:    "2",
+			Memory: "4Gi",
+			UseGpu: ptr(false),
+		},
+		BaseImage: modelsv1alpha1.TrussBaseImage{
+			Image: "public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.29.0",
+		},
+	}
+
+	data, err := GenerateConfigYAML(tc, "cpu-model")
+	if err != nil {
+		t.Fatalf("GenerateConfigYAML() error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	resources, ok := parsed["resources"].(map[string]any)
+	if !ok {
+		t.Fatal("resources missing or wrong type")
+	}
+	if _, ok := resources["accelerator"]; ok {
+		t.Errorf("resources.accelerator must be omitted for CPU-only (truss rejects empty), got %v", resources["accelerator"])
+	}
+	if resources["cpu"] != "2" {
+		t.Errorf("resources.cpu = %v, want \"2\"", resources["cpu"])
+	}
+	if resources["memory"] != "4Gi" {
+		t.Errorf("resources.memory = %v, want 4Gi", resources["memory"])
+	}
+	if resources["use_gpu"] != false {
+		t.Errorf("resources.use_gpu = %v, want false", resources["use_gpu"])
+	}
+	// cpu must stay a YAML string: truss parses "2" and 2 differently from "500m".
+	if !strings.Contains(string(data), `cpu: "2"`) {
+		t.Errorf("cpu should be emitted as a quoted string, got:\n%s", data)
+	}
+}
+
+// Deployment names embed this hash, so any drift re-pushes every existing
+// trussConfig model. Values captured before cpu/memory were added.
+func TestHashTrussConfig_StableForExistingGPUSpecs(t *testing.T) {
+	tests := []struct {
+		name   string
+		tc     *modelsv1alpha1.TrussConfig
+		script string
+		want   string
+	}{
+		{
+			name: "accelerator only",
+			tc: &modelsv1alpha1.TrussConfig{
+				Resources: modelsv1alpha1.TrussResources{Accelerator: "H100:2"},
+				BaseImage: modelsv1alpha1.TrussBaseImage{Image: "test:latest"},
+			},
+			script: "echo hello",
+			want:   "60c81d3c",
+		},
+		{
+			name: "accelerator with useGpu",
+			tc: &modelsv1alpha1.TrussConfig{
+				PythonVersion: "py312",
+				Resources:     modelsv1alpha1.TrussResources{Accelerator: "H100:1", UseGpu: ptr(true)},
+				BaseImage:     modelsv1alpha1.TrussBaseImage{Image: "us-docker.pkg.dev/img:v6"},
+			},
+			want: "f88ab883",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HashTrussConfig(tt.tc, tt.script); got != tt.want {
+				t.Errorf("HashTrussConfig() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHashTrussConfig_CPUFieldsChangeHash(t *testing.T) {
+	base := modelsv1alpha1.TrussConfig{
+		Resources: modelsv1alpha1.TrussResources{CPU: "2", Memory: "4Gi"},
+		BaseImage: modelsv1alpha1.TrussBaseImage{Image: "test:latest"},
+	}
+	moreCPU := base
+	moreCPU.Resources.CPU = "4"
+	moreMem := base
+	moreMem.Resources.Memory = "8Gi"
+
+	h := HashTrussConfig(&base, "")
+	if h == HashTrussConfig(&moreCPU, "") {
+		t.Error("changing cpu should change the hash")
+	}
+	if h == HashTrussConfig(&moreMem, "") {
+		t.Error("changing memory should change the hash")
 	}
 }
 

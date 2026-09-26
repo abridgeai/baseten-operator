@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -120,6 +121,53 @@ var _ = Describe("BasetenModel Controller", func() {
 			Expect(*found.Spec.Environment.Autoscaling.MaxReplicas).To(Equal(int32(5)))
 			Expect(*found.Spec.Environment.Autoscaling.ConcurrencyTarget).To(Equal(int32(10)))
 		})
+	})
+
+	Context("TrussResources admission validation", func() {
+		ctx := context.Background()
+
+		// Unstructured so an explicit `accelerator: ""` survives serialization
+		// (the typed struct's omitempty would drop it before it reaches the API server).
+		newTrussCR := func(name string, resources map[string]any) *unstructured.Unstructured {
+			return &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "models.baseten.com/v1alpha1",
+				"kind":       "BasetenModel",
+				"metadata":   map[string]any{"name": name, "namespace": "default"},
+				"spec": map[string]any{
+					"modelName": "test-model",
+					"trussConfig": map[string]any{
+						"resources": resources,
+						"baseImage": map[string]any{"image": "test:latest"},
+					},
+					"environment": map[string]any{"name": "dev"},
+				},
+			}}
+		}
+
+		DescribeTable("accepts valid resources",
+			func(name string, resources map[string]any) {
+				cr := newTrussCR(name, resources)
+				Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
+			},
+			Entry("GPU with accelerator", "res-gpu", map[string]any{"accelerator": "H100:1", "useGpu": true}),
+			Entry("accelerator without useGpu", "res-gpu-no-flag", map[string]any{"accelerator": "L4"}),
+			Entry("CPU with cpu and memory", "res-cpu", map[string]any{"cpu": "2", "memory": "4Gi", "useGpu": false}),
+			Entry("CPU with cpu only", "res-cpu-only", map[string]any{"cpu": "1"}),
+		)
+
+		DescribeTable("rejects invalid resources",
+			func(name string, resources map[string]any, wantMsg string) {
+				err := k8sClient.Create(ctx, newTrussCR(name, resources))
+				Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+				Expect(err.Error()).To(ContainSubstring(wantMsg))
+			},
+			Entry("empty resources", "res-empty", map[string]any{}, "one of accelerator or cpu must be set"),
+			Entry("memory only", "res-mem-only", map[string]any{"memory": "4Gi"}, "one of accelerator or cpu must be set"),
+			Entry("useGpu without accelerator", "res-gpu-flag-only", map[string]any{"cpu": "2", "useGpu": true}, "useGpu requires accelerator"),
+			Entry("empty accelerator", "res-empty-accel", map[string]any{"accelerator": ""}, "spec.trussConfig.resources.accelerator"),
+			Entry("empty cpu", "res-empty-cpu", map[string]any{"cpu": ""}, "spec.trussConfig.resources.cpu"),
+		)
 	})
 
 	// Reconciliation tests using mock client
@@ -3022,6 +3070,40 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				// Async push runs in background — give it a moment
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
+			})
+
+			It("should push a CPU-only config with cpu/memory and no accelerator", func() {
+				name := "truss-push-cpu-only"
+				model := newTrussConfigModel(name)
+				model.Spec.TrussConfig.Resources = modelsv1alpha1.TrussResources{
+					CPU:    "2",
+					Memory: "4Gi",
+					UseGpu: ptr(false),
+				}
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", nil
+				}
+
+				pushed := make(chan string, 1)
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+					Expect(deploymentName).To(HavePrefix("depl-test-latest-"))
+					pushed <- string(configYAML)
+					return &truss.PushResult{ModelID: testModelID, DeploymentID: "cpu-dep-id"}, nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				var configYAML string
+				Eventually(pushed, 2*time.Second).Should(Receive(&configYAML))
+				Expect(configYAML).NotTo(ContainSubstring("accelerator"))
+				Expect(configYAML).To(ContainSubstring(`cpu: "2"`))
+				Expect(configYAML).To(ContainSubstring("memory: 4Gi"))
+				Expect(configYAML).To(ContainSubstring("use_gpu: false"))
 			})
 
 			It("should invalidate cached modelID when FindDeploymentIDByName returns 404", func() {
