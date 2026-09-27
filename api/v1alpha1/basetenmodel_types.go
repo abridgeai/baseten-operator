@@ -73,11 +73,19 @@ const (
 // Exactly one of sourceDeploymentName or trussConfig must be specified.
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
 type BasetenModelSpec struct {
 	// ModelName references an existing Baseten model
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	ModelName string `json:"modelName"`
+
+	// Team is the Baseten team name the model belongs to (as in `truss push --team`).
+	// Model lookup and truss push are scoped to it; required when the API key is
+	// team-scoped. Model names are unique only within a team. Immutable once set.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Team string `json:"team,omitempty"`
 
 	// SourceDeploymentName is the deployment to promote (created by CI/CD via truss push).
 	// Mutually exclusive with trussConfig.
@@ -180,15 +188,31 @@ type TrussConfig struct {
 	SetupScript *SetupScriptSource `json:"setupScript,omitempty"`
 }
 
-// TrussResources defines compute resources for the deployment
+// TrussResources defines compute resources for the deployment.
+// Set accelerator for a GPU deployment, or cpu (and optionally memory) for a CPU-only one.
+// +kubebuilder:validation:XValidation:rule="has(self.accelerator) || has(self.cpu)",message="one of accelerator or cpu must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.useGpu) || !self.useGpu || has(self.accelerator)",message="useGpu requires accelerator"
 type TrussResources struct {
-	// Accelerator specifies GPU type and count (e.g., "H100:2", "A100:4", "L4")
-	// +required
-	Accelerator string `json:"accelerator"`
+	// Accelerator specifies GPU type and count (e.g., "H100:2", "A100:4", "L4").
+	// Omit for CPU-only deployments.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Accelerator string `json:"accelerator,omitempty"`
 
-	// UseGpu enables GPU support
+	// UseGpu enables GPU support. Requires accelerator when true.
 	// +optional
 	UseGpu *bool `json:"useGpu,omitempty"`
+
+	// CPU is the number of CPU cores in truss format (e.g., "2", "500m").
+	// Baseten picks the smallest instance type that fits cpu and memory.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	CPU string `json:"cpu,omitempty"`
+
+	// Memory is the memory request in truss format (e.g., "8Gi").
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Memory string `json:"memory,omitempty"`
 }
 
 // TrussBaseImage specifies the Docker base image
@@ -651,9 +675,23 @@ type BasetenModelStatus struct {
 	TrussConfigHash string `json:"trussConfigHash,omitempty"`
 
 	// TrussPushStatus tracks the internal state of the truss push operation.
-	// Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created)
+	// Values: TRUSS_PUSHING (async push in flight), TRUSS_PUSH_DONE (deployment created),
+	// TRUSS_PUSH_FAILED (last push failed; retried after trussPushNextRetryTime)
 	// +optional
 	TrussPushStatus string `json:"trussPushStatus,omitempty"`
+
+	// TrussPushFailureCount counts consecutive failed truss pushes for the current config.
+	// Drives exponential backoff between attempts. Reset on success or config change.
+	// +optional
+	TrussPushFailureCount int32 `json:"trussPushFailureCount,omitempty"`
+
+	// TrussPushNextRetryTime is the earliest time the next truss push is allowed after a failure.
+	// +optional
+	TrussPushNextRetryTime *metav1.Time `json:"trussPushNextRetryTime,omitempty"`
+
+	// TrussPushLastError is the error from the most recent failed truss push.
+	// +optional
+	TrussPushLastError string `json:"trussPushLastError,omitempty"`
 
 	// TrussPushTime is the last time a truss push was initiated.
 	// Used to detect stale TRUSS_PUSHING state and retry after timeout.

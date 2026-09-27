@@ -16,8 +16,8 @@ type PushResult struct {
 
 // PusherInterface abstracts the push operation for testing.
 type PusherInterface interface {
-	Push(ctx context.Context, trussDir, modelName, deploymentName string) (*PushResult, error)
-	PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*PushResult, error)
+	Push(ctx context.Context, trussDir, modelName, team, deploymentName string) (*PushResult, error)
+	PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*PushResult, error)
 }
 
 // Pusher wraps the truss-go SDK for pushing deployments to Baseten.
@@ -34,13 +34,14 @@ func NewPusher(apiKey string) *Pusher {
 
 // Push creates a deployment by pushing a truss directory to Baseten.
 // The truss directory must contain a config.yaml and optionally a data/ directory.
-func (p *Pusher) Push(ctx context.Context, trussDir, modelName, deploymentName string) (*PushResult, error) {
+func (p *Pusher) Push(ctx context.Context, trussDir, modelName, team, deploymentName string) (*PushResult, error) {
 	client := truss.NewClient(truss.WithAPIKey(p.apiKey))
 
-	result, err := client.Push(ctx, trussDir, modelName,
-		truss.Publish(),
-		truss.WithDeploymentName(deploymentName),
-	)
+	opts := []truss.PushOption{truss.Publish(), truss.WithDeploymentName(deploymentName)}
+	if team != "" {
+		opts = append(opts, truss.WithTeam(team))
+	}
+	result, err := client.Push(ctx, trussDir, modelName, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("truss push failed: %w", err)
 	}
@@ -53,7 +54,7 @@ func (p *Pusher) Push(ctx context.Context, trussDir, modelName, deploymentName s
 
 // PushFromConfig is a convenience that generates config.yaml, writes a temp directory,
 // pushes to Baseten, and cleans up. Returns the push result.
-func (p *Pusher) PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*PushResult, error) {
+func (p *Pusher) PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*PushResult, error) {
 	// Create temp directory
 	tmpDir, err := os.MkdirTemp("", "truss-push-*")
 	if err != nil {
@@ -66,21 +67,21 @@ func (p *Pusher) PushFromConfig(ctx context.Context, configYAML, setupScript []b
 		return nil, fmt.Errorf("writing truss directory: %w", err)
 	}
 
-	return p.Push(ctx, tmpDir, modelName, deploymentName)
+	return p.Push(ctx, tmpDir, modelName, team, deploymentName)
 }
 
 // MockPusher is a test double for PusherInterface.
 type MockPusher struct {
-	PushFunc           func(ctx context.Context, trussDir, modelName, deploymentName string) (*PushResult, error)
-	PushFromConfigFunc func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*PushResult, error)
+	PushFunc           func(ctx context.Context, trussDir, modelName, team, deploymentName string) (*PushResult, error)
+	PushFromConfigFunc func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*PushResult, error)
 }
 
 var _ PusherInterface = (*MockPusher)(nil)
 
-func (m *MockPusher) Push(ctx context.Context, trussDir, modelName, deploymentName string) (*PushResult, error) {
-	return m.PushFunc(ctx, trussDir, modelName, deploymentName)
+func (m *MockPusher) Push(ctx context.Context, trussDir, modelName, team, deploymentName string) (*PushResult, error) {
+	return m.PushFunc(ctx, trussDir, modelName, team, deploymentName)
 }
 
-func (m *MockPusher) PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*PushResult, error) {
-	return m.PushFromConfigFunc(ctx, configYAML, setupScript, modelName, deploymentName)
+func (m *MockPusher) PushFromConfig(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*PushResult, error) {
+	return m.PushFromConfigFunc(ctx, configYAML, setupScript, modelName, team, deploymentName)
 }

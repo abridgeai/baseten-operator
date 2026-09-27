@@ -3,4 +3,5 @@ resources:
 - models_v1alpha1_basetenmodel.yaml
 - models_v1alpha1_basetenmodel_with_autoscaling.yaml
 - models_v1alpha1_basetenmodel_with_trussconfig.yaml
+- models_v1alpha1_basetenmodel_cpu.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

@@ -18,6 +18,7 @@ const (
 	testStrategyReplica    = "REPLICA"
 	testCleanupScaleToZero = "SCALE_TO_ZERO"
 	testDevEnvPath         = "/v1/models/model1/environments/dev"
+	testTeamsPath          = "/v1/teams"
 )
 
 func ptr[T any](v T) *T {
@@ -488,7 +489,7 @@ func TestFindModelIDByName(t *testing.T) {
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		id, err := c.FindModelIDByName(context.Background(), "my-model")
+		id, err := c.FindModelIDByName(context.Background(), "my-model", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -504,7 +505,7 @@ func TestFindModelIDByName(t *testing.T) {
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		id, err := c.FindModelIDByName(context.Background(), "my-model")
+		id, err := c.FindModelIDByName(context.Background(), "my-model", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -520,7 +521,7 @@ func TestFindModelIDByName(t *testing.T) {
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		_, err := c.FindModelIDByName(context.Background(), "my-model")
+		_, err := c.FindModelIDByName(context.Background(), "my-model", "")
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -530,6 +531,83 @@ func TestFindModelIDByName(t *testing.T) {
 		}
 		if apiErr.StatusCode != 500 {
 			t.Errorf("StatusCode = %d, want 500", apiErr.StatusCode)
+		}
+	})
+}
+
+func TestFindModelIDByName_Team(t *testing.T) {
+	t.Run("scopes lookup to the named team", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case testTeamsPath:
+				if got := r.URL.Query().Get("name"); got != "Evals" {
+					t.Errorf("teams name filter = %q, want Evals", got)
+				}
+				writeJSON(t, w, managementapi.Teams{Teams: []managementapi.Team{{Id: "t1", Name: "Evals"}}})
+			case "/v1/teams/t1/models":
+				if got := r.URL.Query().Get("name"); got != "my-model" {
+					t.Errorf("models name filter = %q, want my-model", got)
+				}
+				writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{{Id: "m-evals", Name: "my-model"}}})
+			default:
+				t.Errorf("unexpected path: %s (org-wide /v1/models must not be used with a team)", r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+
+		id, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "Evals")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "m-evals" {
+			t.Errorf("FindModelIDByName() = %q, want m-evals", id)
+		}
+	})
+
+	t.Run("not found in team returns empty", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == testTeamsPath {
+				writeJSON(t, w, managementapi.Teams{Teams: []managementapi.Team{{Id: "t1", Name: "Evals"}}})
+				return
+			}
+			writeJSON(t, w, managementapi.Models{})
+		}))
+		defer srv.Close()
+
+		id, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "Evals")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "" {
+			t.Errorf("expected empty, got %q", id)
+		}
+	})
+
+	t.Run("unknown team is an error, not a missing model", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != testTeamsPath {
+				t.Errorf("should stop after team lookup, got %s", r.URL.Path)
+			}
+			writeJSON(t, w, managementapi.Teams{})
+		}))
+		defer srv.Close()
+
+		_, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "Nope")
+		if err == nil || !strings.Contains(err.Error(), `team "Nope" not found`) {
+			t.Fatalf("expected team-not-found error, got %v", err)
+		}
+	})
+
+	t.Run("team lookup API error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(t, w, http.StatusUnauthorized, "unauthorized")
+		}))
+		defer srv.Close()
+
+		_, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "Evals")
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+			t.Fatalf("expected 401 APIError, got %T: %v", err, err)
 		}
 	})
 }
@@ -1191,7 +1269,7 @@ func TestHasPromotionSettingsDrift(t *testing.T) {
 // surface as an *APIError, so IsNotFoundError and friends treat it as a generic error.
 func TestNetworkError(t *testing.T) {
 	c := newTestClient("http://127.0.0.1:1") // unreachable port
-	_, err := c.FindModelIDByName(context.Background(), "my-model")
+	_, err := c.FindModelIDByName(context.Background(), "my-model", "")
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
 	}

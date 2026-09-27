@@ -202,6 +202,24 @@ var _ = Describe("Manager", Ordered, func() {
 		return output
 	}
 
+	// The mock can't serve truss-go's push, so every push fails; the operator must
+	// record it and back off rather than immediately re-pushing.
+	expectPushFailedWithBackoff := func(name string) {
+		Eventually(func(g Gomega) {
+			g.Expect(getStatus(name, ".status.trussPushStatus")).To(Equal("TRUSS_PUSH_FAILED"))
+			g.Expect(getStatus(name, ".status.trussPushFailureCount")).To(Equal("1"))
+			g.Expect(getStatus(name, ".status.deploymentStatus")).To(Equal("FAILED"))
+			g.Expect(getStatus(name, ".status.message")).To(ContainSubstring("next retry at"))
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+		Expect(getStatus(name, ".status.trussPushLastError")).NotTo(BeEmpty())
+
+		cmd := exec.Command("kubectl", "get", "events", "-n", "default",
+			"--field-selector", "involvedObject.name="+name+",reason=TrussPushFailed", "-o", "name")
+		out, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(out)).NotTo(BeEmpty(), "expected a TrussPushFailed event")
+	}
+
 	getConditionStatus := func(name, condType string) string {
 		jsonpath := fmt.Sprintf(".status.conditions[?(@.type=='%s')].status", condType)
 		return getStatus(name, jsonpath)
@@ -831,15 +849,112 @@ spec:
 				g.Expect(msg).To(ContainSubstring("depl-"), "should include deployment name with depl- prefix")
 			}, 60*time.Second, 2*time.Second).Should(Succeed())
 
-			By("verifying status is DEPLOYING (creating deployment)")
-			status := getStatus("e2e-trussconfig", ".status.deploymentStatus")
-			Expect(status).To(Equal("DEPLOYING"))
+			By("verifying the failed push is recorded and backed off")
+			expectPushFailedWithBackoff("e2e-trussconfig")
+			Consistently(func() string {
+				return getStatus("e2e-trussconfig", ".status.trussPushFailureCount")
+			}, 15*time.Second, 3*time.Second).Should(Equal("1"), "no new push attempts during backoff")
 
 			By("cleanup")
 			cmd = exec.Command("kubectl", "delete", "bm", "--all", "-n", "default", "--ignore-not-found")
 			_, _ = utils.Run(cmd)
 			cmd = exec.Command("kubectl", "delete", "configmap", "e2e-truss-setup", "-n", "default", "--ignore-not-found")
 			_, _ = utils.Run(cmd)
+		})
+
+		It("should compute hash and attempt push for a CPU-only trussConfig", func() {
+			resetMock()
+
+			By("applying a BasetenModel CR with cpu/memory and no accelerator")
+			cr := `apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-trussconfig-cpu
+  namespace: default
+spec:
+  modelName: "test-model"
+  trussConfig:
+    resources:
+      cpu: "2"
+      memory: 4Gi
+      useGpu: false
+    baseImage:
+      image: "public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.29.0"
+    dockerServer:
+      startCommand: "vllm serve HuggingFaceTB/SmolLM2-135M-Instruct --served-model-name hello-vllm --host 0.0.0.0 --port 8000 --enforce-eager"
+      readinessEndpoint: "/health"
+      livenessEndpoint: "/health"
+      predictEndpoint: "/v1/chat/completions"
+      serverPort: 8000
+    environmentVariables:
+      VLLM_CPU_KVCACHE_SPACE: "1"
+  environment:
+    name: "dev"
+    autoscaling:
+      minReplicas: 0
+      maxReplicas: 1
+      concurrencyTarget: 2`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cr)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "CPU-only trussConfig should pass CRD validation")
+
+			By("verifying the stored spec kept cpu/memory and has no accelerator")
+			Expect(getStatus("e2e-trussconfig-cpu", ".spec.trussConfig.resources.cpu")).To(Equal("2"))
+			Expect(getStatus("e2e-trussconfig-cpu", ".spec.trussConfig.resources.memory")).To(Equal("4Gi"))
+			Expect(getStatus("e2e-trussconfig-cpu", ".spec.trussConfig.resources.accelerator")).To(BeEmpty())
+
+			By("waiting for the operator to start the truss push")
+			// The async push fails against the mock (no truss-go GraphQL), but hash,
+			// deployment naming, and config generation run for real.
+			Eventually(func(g Gomega) {
+				msg := getStatus("e2e-trussconfig-cpu", ".status.message")
+				g.Expect(msg).To(ContainSubstring("truss push"))
+				g.Expect(msg).To(ContainSubstring("depl-vllm-cpu-release-repo-v0.29.0-"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			expectPushFailedWithBackoff("e2e-trussconfig-cpu")
+			Expect(getStatus("e2e-trussconfig-cpu", ".status.trussConfigHash")).To(HaveLen(8))
+
+			By("cleanup")
+			cmd = exec.Command("kubectl", "delete", "bm", "e2e-trussconfig-cpu", "-n", "default", "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("should reject invalid trussConfig resources at admission", func() {
+			apply := func(resources string) (string, error) {
+				cr := fmt.Sprintf(`apiVersion: models.baseten.com/v1alpha1
+kind: BasetenModel
+metadata:
+  name: e2e-invalid-resources
+  namespace: default
+spec:
+  modelName: "test-model"
+  trussConfig:
+    resources:
+%s
+    baseImage:
+      image: "test:latest"
+  environment:
+    name: "dev"`, resources)
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(cr)
+				return utils.Run(cmd)
+			}
+
+			By("rejecting resources with neither accelerator nor cpu")
+			out, err := apply(`      memory: 4Gi`)
+			Expect(err).To(HaveOccurred())
+			Expect(out + err.Error()).To(ContainSubstring("one of accelerator or cpu must be set"))
+
+			By("rejecting useGpu without an accelerator")
+			out, err = apply("      cpu: \"2\"\n      useGpu: true")
+			Expect(err).To(HaveOccurred())
+			Expect(out + err.Error()).To(ContainSubstring("useGpu requires accelerator"))
+
+			By("verifying nothing was persisted")
+			cmd := exec.Command("kubectl", "get", "bm", "e2e-invalid-resources", "-n", "default")
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred())
 		})
 
 		It("should detect config change when image is upgraded", func() {

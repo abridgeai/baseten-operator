@@ -20,12 +20,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -119,6 +121,96 @@ var _ = Describe("BasetenModel Controller", func() {
 			Expect(*found.Spec.Environment.Autoscaling.MinReplicas).To(Equal(int32(0)))
 			Expect(*found.Spec.Environment.Autoscaling.MaxReplicas).To(Equal(int32(5)))
 			Expect(*found.Spec.Environment.Autoscaling.ConcurrencyTarget).To(Equal(int32(10)))
+		})
+	})
+
+	Context("TrussResources admission validation", func() {
+		ctx := context.Background()
+
+		// Unstructured so an explicit `accelerator: ""` survives serialization
+		// (the typed struct's omitempty would drop it before it reaches the API server).
+		newTrussCR := func(name string, resources map[string]any) *unstructured.Unstructured {
+			return &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "models.baseten.com/v1alpha1",
+				"kind":       "BasetenModel",
+				"metadata":   map[string]any{"name": name, "namespace": "default"},
+				"spec": map[string]any{
+					"modelName": "test-model",
+					"trussConfig": map[string]any{
+						"resources": resources,
+						"baseImage": map[string]any{"image": "test:latest"},
+					},
+					"environment": map[string]any{"name": "dev"},
+				},
+			}}
+		}
+
+		DescribeTable("accepts valid resources",
+			func(name string, resources map[string]any) {
+				cr := newTrussCR(name, resources)
+				Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
+			},
+			Entry("GPU with accelerator", "res-gpu", map[string]any{"accelerator": "H100:1", "useGpu": true}),
+			Entry("accelerator without useGpu", "res-gpu-no-flag", map[string]any{"accelerator": "L4"}),
+			Entry("CPU with cpu and memory", "res-cpu", map[string]any{"cpu": "2", "memory": "4Gi", "useGpu": false}),
+			Entry("CPU with cpu only", "res-cpu-only", map[string]any{"cpu": "1"}),
+		)
+
+		DescribeTable("rejects invalid resources",
+			func(name string, resources map[string]any, wantMsg string) {
+				err := k8sClient.Create(ctx, newTrussCR(name, resources))
+				Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+				Expect(err.Error()).To(ContainSubstring(wantMsg))
+			},
+			Entry("empty resources", "res-empty", map[string]any{}, "one of accelerator or cpu must be set"),
+			Entry("memory only", "res-mem-only", map[string]any{"memory": "4Gi"}, "one of accelerator or cpu must be set"),
+			Entry("useGpu without accelerator", "res-gpu-flag-only", map[string]any{"cpu": "2", "useGpu": true}, "useGpu requires accelerator"),
+			Entry("empty accelerator", "res-empty-accel", map[string]any{"accelerator": ""}, "spec.trussConfig.resources.accelerator"),
+			Entry("empty cpu", "res-empty-cpu", map[string]any{"cpu": ""}, "spec.trussConfig.resources.cpu"),
+		)
+	})
+
+	Context("spec.team admission validation", func() {
+		ctx := context.Background()
+
+		newModel := func(name, team string) *modelsv1alpha1.BasetenModel {
+			return &modelsv1alpha1.BasetenModel{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: modelsv1alpha1.BasetenModelSpec{
+					ModelName:            "test-model",
+					Team:                 team,
+					SourceDeploymentName: "dep-v1",
+					Environment:          modelsv1alpha1.EnvironmentConfig{Name: "dev"},
+				},
+			}
+		}
+
+		It("allows setting team on a CR that had none", func() {
+			m := newModel("team-set-later", "")
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Team = "Evals"
+			Expect(k8sClient.Update(ctx, m)).To(Succeed())
+		})
+
+		It("rejects changing or removing team once set", func() {
+			m := newModel("team-immutable", "Evals")
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			changed := m.DeepCopy()
+			changed.Spec.Team = "Other"
+			err := k8sClient.Update(ctx, changed)
+			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+			Expect(err.Error()).To(ContainSubstring("team is immutable once set"))
+
+			removed := m.DeepCopy()
+			removed.Spec.Team = ""
+			err = k8sClient.Update(ctx, removed)
+			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+			Expect(err.Error()).To(ContainSubstring("team is immutable once set"))
 		})
 	})
 
@@ -220,7 +312,7 @@ var _ = Describe("BasetenModel Controller", func() {
 		}
 
 		mockModelFound := func() {
-			mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+			mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 				return testModelID, nil
 			}
 		}
@@ -248,7 +340,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					Fail("should not call FindModelIDByName when paused")
 					return "", nil
 				}
@@ -398,7 +490,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					Fail("UpdateDeploymentAutoscaling must not be called in Observe mode")
 					return nil
 				}
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					Fail("truss push must not be called in Observe mode")
 					return nil, nil
 				}
@@ -506,7 +598,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.Mode = modelsv1alpha1.ModeObserve
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				expectNoMutations()
@@ -563,7 +655,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				expectNoMutations()
@@ -581,7 +673,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.Mode = modelsv1alpha1.ModePause
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					Fail("Pause mode must not call FindModelIDByName")
 					return "", nil
 				}
@@ -600,7 +692,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.Paused = true //nolint:staticcheck // testing the deprecated field's back-compat behavior
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					Fail("paused=true must short-circuit before Observe path")
 					return "", nil
 				}
@@ -619,7 +711,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model := newTestModel(name)
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", fmt.Errorf("API error")
 				}
 
@@ -646,7 +738,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model := newTestModel(name)
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 
@@ -669,7 +761,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
 				getModelIDCalled := false
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					getModelIDCalled = true
 					return testModelID, nil
 				}
@@ -716,7 +808,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				getModelIDCalled := false
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					getModelIDCalled = true
 					return testModelID, nil
 				}
@@ -3004,7 +3096,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					Expect(deploymentName).To(HavePrefix("depl-"))
@@ -3022,6 +3114,63 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				// Async push runs in background — give it a moment
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
+			})
+
+			It("should push a CPU-only config with cpu/memory and no accelerator", func() {
+				name := "truss-push-cpu-only"
+				model := newTrussConfigModel(name)
+				model.Spec.TrussConfig.Resources = modelsv1alpha1.TrussResources{
+					CPU:    "2",
+					Memory: "4Gi",
+					UseGpu: ptr(false),
+				}
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", nil
+				}
+
+				pushed := make(chan string, 1)
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					Expect(deploymentName).To(HavePrefix("depl-test-latest-"))
+					pushed <- string(configYAML)
+					return &truss.PushResult{ModelID: testModelID, DeploymentID: "cpu-dep-id"}, nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				var configYAML string
+				Eventually(pushed, 2*time.Second).Should(Receive(&configYAML))
+				Expect(configYAML).NotTo(ContainSubstring("accelerator"))
+				Expect(configYAML).To(ContainSubstring(`cpu: "2"`))
+				Expect(configYAML).To(ContainSubstring("memory: 4Gi"))
+				Expect(configYAML).To(ContainSubstring("use_gpu: false"))
+			})
+
+			It("should scope model lookup and truss push to spec.team", func() {
+				name := "truss-push-team"
+				model := newTrussConfigModel(name)
+				model.Spec.Team = "Single Tenant (Evals)"
+				defer cleanupModel(name)
+
+				var lookupTeam string
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					lookupTeam = team
+					return "", nil // not found yet: truss push creates it
+				}
+				pushedTeam := make(chan string, 1)
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					pushedTeam <- team
+					return &truss.PushResult{ModelID: testModelID, DeploymentID: "team-dep"}, nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(lookupTeam).To(Equal("Single Tenant (Evals)"))
+				Eventually(pushedTeam, 2*time.Second).Should(Receive(Equal("Single Tenant (Evals)")))
 			})
 
 			It("should invalidate cached modelID when FindDeploymentIDByName returns 404", func() {
@@ -3052,6 +3201,136 @@ var _ = Describe("BasetenModel Controller", func() {
 				status := getModelStatus(name)
 				Expect(status.ModelID).To(BeEmpty(), "cached model ID should be cleared")
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
+			})
+
+			Describe("push failure backoff", func() {
+				failingPush := func(calls *int32) {
+					mockModelFound()
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return "", "", nil
+					}
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+						atomic.AddInt32(calls, 1)
+						return nil, fmt.Errorf("truss push failed: API error (UNAUTHORIZED_ACCESS)")
+					}
+				}
+				waitForFailure := func(name string, attempt int32) modelsv1alpha1.BasetenModelStatus {
+					var status modelsv1alpha1.BasetenModelStatus
+					Eventually(func(g Gomega) {
+						status = getModelStatus(name)
+						g.Expect(status.TrussPushStatus).To(Equal(statusTrussPushFailed))
+						g.Expect(status.TrussPushFailureCount).To(Equal(attempt))
+					}, 2*time.Second, 50*time.Millisecond).Should(Succeed())
+					return status
+				}
+
+				It("should record the failure and not push again until the backoff elapses", func() {
+					name := "truss-push-backoff"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					status := waitForFailure(name, 1)
+					Expect(status.TrussPushLastError).To(ContainSubstring("UNAUTHORIZED_ACCESS"))
+					Expect(status.TrussPushNextRetryTime).NotTo(BeNil())
+					Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">=", retryBaseInterval-time.Second))
+					Expect(drainEvents()).To(ContainElement(And(ContainSubstring(EventTrussPushFailed), ContainSubstring("attempt 1"))))
+
+					By("reconciling repeatedly during the backoff window")
+					for range 5 {
+						result, err := reconcileByName(name)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(result.RequeueAfter).To(BeNumerically(">", time.Minute), "should wait for the backoff, not hot-loop")
+					}
+					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(1)), "no new push during backoff")
+
+					status = getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+					Expect(status.Message).To(ContainSubstring("UNAUTHORIZED_ACCESS"))
+					Expect(status.Message).To(ContainSubstring("next retry at"))
+				})
+
+				It("should retry after the backoff elapses and grow the attempt count", func() {
+					name := "truss-push-backoff-retry"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					By("fast-forwarding past the retry time")
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					past := metav1.NewTime(time.Now().Add(-time.Second))
+					m.Status.TrussPushNextRetryTime = &past
+					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					status := waitForFailure(name, 2)
+					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(2)))
+					Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">=", 2*retryBaseInterval-time.Second), "backoff should double")
+				})
+
+				It("should push a changed config immediately and reset the failure count", func() {
+					name := "truss-push-backoff-config-change"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					By("changing the image while still in backoff")
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					m.Spec.TrussConfig.BaseImage.Image = "test:v2"
+					Expect(k8sClient.Update(ctx, m)).To(Succeed())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() int32 { return atomic.LoadInt32(&calls) }, 2*time.Second).Should(Equal(int32(2)))
+					waitForFailure(name, 1) // new config starts its own count
+				})
+
+				It("should clear failure state after a successful push", func() {
+					name := "truss-push-backoff-recover"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					past := metav1.NewTime(time.Now().Add(-time.Second))
+					m.Status.TrussPushNextRetryTime = &past
+					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+						return &truss.PushResult{ModelID: testModelID, DeploymentID: "ok"}, nil
+					}
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Eventually(func(g Gomega) {
+						s := getModelStatus(name)
+						g.Expect(s.TrussPushStatus).To(Equal(statusTrussPushDone))
+						g.Expect(s.TrussPushFailureCount).To(BeZero())
+						g.Expect(s.TrussPushNextRetryTime).To(BeNil())
+						g.Expect(s.TrussPushLastError).To(BeEmpty())
+					}, 2*time.Second, 50*time.Millisecond).Should(Succeed())
+				})
 			})
 
 			It("should emit TrussPushCompleted when deployment appears after push", func() {
@@ -3096,7 +3375,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, fmt.Errorf("should not be called")
 				}
@@ -3120,7 +3399,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", "", nil // Not found — push will fail, next reconcile retries
 				}
 
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					return nil, fmt.Errorf("upload failed: connection timeout")
 				}
 
@@ -3168,7 +3447,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				var capturedSetupScript []byte
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					capturedSetupScript = setupScript
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "new-dep"}, nil
 				}
@@ -3226,12 +3505,12 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				// Model does not exist
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
@@ -3256,11 +3535,11 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
@@ -3290,11 +3569,11 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelIDResolvedTime = &prev
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3335,11 +3614,11 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelIDResolvedTime = &prev
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3372,11 +3651,11 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
@@ -3465,7 +3744,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelIDResolvedTime = &prev
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return testModelID, nil
 				}
 				configHash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
@@ -3507,7 +3786,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
 				// Now reconcile — should use cached modelID and proceed to environment + promotion
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					Fail("should not call FindModelIDByName when modelID is cached")
 					return "", nil
 				}
@@ -3532,7 +3811,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model := newTestModel(name)
 				defer cleanupModel(name)
 
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					return "", nil
 				}
 
@@ -3591,7 +3870,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				findCalled := false
-				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName string) (string, error) {
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 					findCalled = true
 					return testModelID, nil
 				}

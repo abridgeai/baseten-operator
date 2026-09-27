@@ -1,7 +1,6 @@
 # Baseten Operator
 
 [![CI](https://github.com/abridgeai/baseten-operator/actions/workflows/test.yml/badge.svg)](https://github.com/abridgeai/baseten-operator/actions/workflows/test.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/abridgeai/baseten-operator)](https://goreportcard.com/report/github.com/abridgeai/baseten-operator)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > **Note:** This project is a work in progress. The API is `v1alpha1` and may change between versions. If you run into issues, please [open a GitHub issue](https://github.com/abridgeai/baseten-operator/issues).
@@ -50,6 +49,7 @@ metadata:
   name: my-model-production
 spec:
   modelName: "my-llm-model"                         # required — model name in Baseten
+  # team: "My Team"                                 # optional — Baseten team name; required for team-scoped API keys, immutable once set
   mode: Reconcile                                    # optional — Reconcile (default), Observe, or Pause
   deletionPolicy: Retain                             # optional — Retain (default), DeleteWithGuardrails, or Delete
 
@@ -60,8 +60,10 @@ spec:
   trussConfig:
     pythonVersion: "py312"                           # optional (e.g., py311, py312)
     resources:                                       # required
-      accelerator: "H100:1"                          # required (e.g., H100:2, A100:4, L4)
-      # useGpu: true                                 # optional
+      accelerator: "H100:1"                          # GPU: type and count (e.g., H100:2, A100:4, L4)
+      # useGpu: true                                 # optional; useGpu: true requires accelerator
+      # cpu: "2"                                     # CPU-only: set cpu (and memory) instead of accelerator
+      # memory: "4Gi"
     baseImage:                                       # required
       image: "us-docker.pkg.dev/my-project/my-repo/vllm:0.16.0"
       dockerAuth:                                    # optional — only if private registry
@@ -184,6 +186,15 @@ spec:
     name: production
 ```
 
+For a CPU-only deployment, omit `accelerator` and set `cpu`/`memory`; Baseten picks the smallest CPU instance that fits. See `config/samples/models_v1alpha1_basetenmodel_cpu.yaml` for a minimal vLLM-on-CPU example.
+
+```yaml
+    resources:
+      cpu: "2"
+      memory: 4Gi
+      useGpu: false
+```
+
 ### Drift Detection and Correction
 
 If someone changes autoscaling or promotion settings in the Baseten UI, the operator detects the drift on the next reconcile and corrects it back to the desired state defined in the CR. Both autoscaling and promotion settings are reconciled in a single API call.
@@ -202,6 +213,8 @@ When a deployment fails (`FAILED`, `DEPLOY_FAILED`, `BUILD_FAILED`), the operato
 | Concurrency | Safe across multiple CRs on the same model |
 
 After 2 hours the operator stops retrying and emits a `DeploymentRetryExhausted` warning. `BUILD_STOPPED` is never retried (intentional user action).
+
+A failed `truss push` (for example, an API key without permission to create models) is also retried with the same backoff schedule. The CR reports `FAILED` with the error, `status.trussPushLastError`, and `status.trussPushNextRetryTime`, and a `TrussPushFailed` warning is emitted per attempt. Push retries continue at the 30m cap until they succeed; changing `trussConfig` pushes the new config immediately.
 
 ### Orphan Deployment Cleanup
 
