@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., v0.1.0)'
+        description: 'Release version; must match charts/baseten-operator/Chart.yaml on main (e.g., v0.1.0)'
         required: true
         type: string
 
@@ -34,6 +34,18 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Check version matches Chart.yaml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          CHART_VERSION=$(sed -n 's/^version: *//p' charts/baseten-operator/Chart.yaml)
+          APP_VERSION=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' charts/baseten-operator/Chart.yaml)
+          if [[ "$CHART_VERSION" != "${VERSION#v}" || "$APP_VERSION" != "$VERSION" ]]; then
+            echo "Error: Chart.yaml on main has version=$CHART_VERSION appVersion=$APP_VERSION, expected ${VERSION#v} / $VERSION."
+            echo "Bump charts/baseten-operator/Chart.yaml in a PR first (e.g. 'chore: release $VERSION')."
+            exit 1
+          fi
 
       - name: Check tag does not exist
         env:
@@ -71,25 +83,18 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v5
 
-      - name: Update Chart version
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          cd charts/baseten-operator
-          CHART_VERSION="${VERSION#v}"
-          sed -i "s/^version: .*/version: $CHART_VERSION/" Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" Chart.yaml
+      # main is protected by a ruleset (PR + required checks), so the release never
+      # commits there: the version bump lands in Chart.yaml via PR, and the tag
+      # points at the exact main commit that was built.
+      - name: Package Helm chart
+        run: helm package charts/baseten-operator --destination /tmp/chart
 
-      - name: Commit and tag release
+      - name: Tag release
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add charts/baseten-operator/Chart.yaml
-          git commit -m "chore: release $VERSION"
           git tag "$VERSION"
-          git push origin main --tags
+          git push origin "refs/tags/$VERSION"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -104,12 +109,11 @@ jobs:
         run: |
           echo "$GH_TOKEN" | helm registry login ghcr.io --username "$GH_ACTOR" --password-stdin
 
-      - name: Package and push Helm chart
+      - name: Push Helm chart
         env:
           VERSION: ${{ inputs.version }}
         run: |
           CHART_VERSION="${VERSION#v}"
-          helm package charts/baseten-operator --destination /tmp/chart
           helm push "/tmp/chart/baseten-operator-${CHART_VERSION}.tgz" oci://ghcr.io/abridgeai/charts
 
       - name: Attach Helm chart to GitHub Release
