@@ -84,6 +84,14 @@ This is enforced by CI on every PR.
 - E2e tests for new reconciliation scenarios (when applicable)
 - All tests must pass: `make test && make test-e2e`
 
+## Releasing
+
+1. Open a PR that bumps `version` and `appVersion` in `charts/baseten-operator/Chart.yaml`
+   (e.g. `chore: release v0.4.0`), and merge it.
+2. Run the **Release** workflow with the same version (`v0.4.0`). It fails if the version does
+   not match `Chart.yaml` on `main`. It publishes the image and chart to GHCR, tags that `main`
+   commit, and creates the GitHub Release. It never commits to `main`.
+
 ## Project Structure
 
 ```
