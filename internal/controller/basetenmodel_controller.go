@@ -494,7 +494,8 @@ func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID str
 		if dep.AutoscalingSettings != nil && dep.AutoscalingSettings.MinReplica == 0 {
 			continue
 		}
-		if err := r.BasetenClient.UpdateDeploymentAutoscaling(ctx, modelID, dep.ID, 0); err != nil {
+		zero := int32(0)
+		if err := r.BasetenClient.UpdateDeploymentAutoscaling(ctx, modelID, dep.ID, &modelsv1alpha1.AutoscalingConfig{MinReplicas: &zero}); err != nil {
 			logger.Error(err, "Failed to scale in orphan deployment", "deploymentID", dep.ID, "deploymentName", dep.Name)
 			continue
 		}
@@ -1189,11 +1190,76 @@ func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *mode
 	return modelID, nil, nil
 }
 
-func (r *BasetenModelReconciler) resolveSourceDeployment(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) (string, *ctrl.Result, error) {
-	if model.Spec.TrussConfig != nil {
-		return r.reconcileTrussDeployment(ctx, model, modelID)
+func (r *BasetenModelReconciler) reconcileSourceAutoscaling(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID, sourceName string) (bool, error) {
+	const productionEnv = "production"
+	settings := model.Spec.SourceAutoscaling
+	if settings == nil {
+		return false, nil
 	}
-	return model.Spec.SourceDeploymentName, nil, nil
+	deployments, err := r.BasetenClient.ListDeployments(ctx, modelID)
+	if err != nil {
+		return false, err
+	}
+	for _, dep := range deployments {
+		if dep.Name != sourceName { // Promoted copies have a suffix; never modify them here.
+			continue
+		}
+		observed := dep.AutoscalingSettings
+		production := dep.IsProduction || (dep.Environment != nil && *dep.Environment == productionEnv)
+		if production {
+			env, err := r.BasetenClient.GetEnvironment(ctx, modelID, productionEnv)
+			if err != nil {
+				return false, err
+			}
+			if env.CurrentDeployment == nil || env.CurrentDeployment.ID != dep.ID || env.CandidateDeployment != nil || env.ScheduleDecodeErr != nil || baseten.ScheduleActive(env) {
+				return false, fmt.Errorf("production environment is not exclusively serving source %s", dep.ID)
+			}
+			observed = env.AutoscalingSettings
+		} else if dep.Environment != nil || dep.IsDevelopment {
+			return false, fmt.Errorf("source %s is attached to another environment", dep.ID)
+		}
+		if observed == nil {
+			return false, fmt.Errorf("source %s has no autoscaling settings", dep.ID)
+		}
+		if (settings.ScaleDownDelay != nil && observed.ScaleDownDelay == nil) || (settings.AutoscalingWindow != nil && observed.AutoscalingWindow == nil) {
+			return false, fmt.Errorf("source %s autoscaling timers are unknown", dep.ID)
+		}
+		if drift, _ := baseten.HasAutoscalingDrift(settings, observed); !drift {
+			return false, nil
+		}
+		if production {
+			err = r.BasetenClient.UpdateEnvironmentSettings(ctx, modelID, productionEnv, settings, nil)
+		} else {
+			err = r.BasetenClient.UpdateDeploymentAutoscaling(ctx, modelID, dep.ID, settings)
+		}
+		if err == nil {
+			r.Recorder.Eventf(model, corev1.EventTypeNormal, EventAutoscalingUpdated, "Updated source deployment %s autoscaling", dep.ID)
+		}
+		return true, err
+	}
+	return false, fmt.Errorf("source deployment %q not found", sourceName)
+}
+
+func (r *BasetenModelReconciler) resolveSourceDeployment(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) (string, *ctrl.Result, error) {
+	sourceName := model.Spec.SourceDeploymentName
+	if model.Spec.TrussConfig != nil {
+		var result *ctrl.Result
+		var err error
+		sourceName, result, err = r.reconcileTrussDeployment(ctx, model, modelID)
+		if err != nil || result != nil || modelID == "" {
+			return sourceName, result, err
+		}
+	}
+	if changed, err := r.reconcileSourceAutoscaling(ctx, model, modelID, sourceName); err != nil || changed {
+		message := "waiting for source autoscaling settings to converge"
+		if err != nil {
+			message = fmt.Sprintf("source autoscaling: %v", err)
+			r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingUpdateFailed, "%s", message)
+		}
+		r.logUpdateStatus(ctx, model, statusUpdate{deploymentStatus: statusPending, message: message})
+		return "", &ctrl.Result{RequeueAfter: 10 * time.Second}, err
+	}
+	return sourceName, nil, nil
 }
 
 func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) (string, *ctrl.Result, error) {

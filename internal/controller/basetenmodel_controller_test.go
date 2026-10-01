@@ -333,6 +333,128 @@ var _ = Describe("BasetenModel Controller", func() {
 			mockEnvWithSettings(nil, nil)
 		}
 
+		Describe("Source autoscaling", func() {
+			newSourceModel := func(name string) *modelsv1alpha1.BasetenModel {
+				model := newTestModel(name)
+				model.Spec.SourceDeploymentName = ""
+				model.Spec.TrussConfig = &modelsv1alpha1.TrussConfig{
+					Resources: modelsv1alpha1.TrussResources{CPU: "1"},
+					BaseImage: modelsv1alpha1.TrussBaseImage{Image: "test:latest"},
+				}
+				model.Spec.SourceAutoscaling = &modelsv1alpha1.AutoscalingConfig{
+					MinReplicas: ptr(int32(0)), AutoscalingWindow: ptr(int32(10)), ScaleDownDelay: ptr(int32(0)),
+				}
+				return model
+			}
+
+			DescribeTable("rejects unsupported source policies at admission", func(name string, mutate func(*modelsv1alpha1.BasetenModel)) {
+				model := newSourceModel(name)
+				mutate(model)
+				Expect(errors.IsInvalid(k8sClient.Create(ctx, model))).To(BeTrue())
+			},
+				Entry("production target", "source-prod-target", func(m *modelsv1alpha1.BasetenModel) { m.Spec.Environment.Name = "production" }),
+				Entry("externally created source", "source-external", func(m *modelsv1alpha1.BasetenModel) {
+					m.Spec.TrussConfig = nil
+					m.Spec.SourceDeploymentName = testSourceDep
+				}),
+				Entry("negative delay", "source-negative-delay", func(m *modelsv1alpha1.BasetenModel) { m.Spec.SourceAutoscaling.ScaleDownDelay = ptr(int32(-1)) }),
+			)
+
+			DescribeTable("waits for source settings before reporting the target healthy", func(environment *string, updateFails bool) {
+				name := fmt.Sprintf("source-settings-%v-%t", environment != nil, updateFails)
+				model := newSourceModel(name)
+				defer cleanupModel(name)
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				hash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
+				sourceName := truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image)
+				model.Status = modelsv1alpha1.BasetenModelStatus{
+					ModelID: testModelID, TrussConfigHash: hash, SourceDeploymentName: sourceName, TrussPushStatus: statusTrussPushDone,
+				}
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+				observed := &baseten.AutoscalingSettings{MinReplica: 0, AutoscalingWindow: ptr(int32(60)), ScaleDownDelay: ptr(int32(900))}
+				mockClient.ListDeploymentsFunc = func(context.Context, string) ([]baseten.DeploymentDetail, error) {
+					return []baseten.DeploymentDetail{
+						{ID: "copy", Name: sourceName + ".1", Environment: ptr(testEnvName)},
+						{ID: testSourceDepID, Name: sourceName, Environment: environment, AutoscalingSettings: observed},
+					}, nil
+				}
+				targetReads, updates := 0, 0
+				mockClient.GetEnvironmentFunc = func(_ context.Context, modelID, envName string) (*baseten.Environment, error) {
+					Expect(modelID).To(Equal(testModelID))
+					if envName == "production" {
+						return &baseten.Environment{CurrentDeployment: &baseten.Deployment{ID: testSourceDepID}, AutoscalingSettings: observed}, nil
+					}
+					targetReads++
+					return &baseten.Environment{
+						CurrentDeployment:   &baseten.Deployment{Name: sourceName + ".1", Status: baseten.DeploymentStatusActive},
+						AutoscalingSettings: testAutoscalingSettings(),
+					}, nil
+				}
+				update := func(settings *modelsv1alpha1.AutoscalingConfig) error {
+					updates++
+					Expect(settings).To(Equal(model.Spec.SourceAutoscaling))
+					if updateFails {
+						return fmt.Errorf("source update unavailable")
+					}
+					observed.AutoscalingWindow, observed.ScaleDownDelay = ptr(int32(10)), ptr(int32(0))
+					return nil
+				}
+				mockClient.UpdateEnvironmentSettingsFunc = func(_ context.Context, modelID, envName string, settings *modelsv1alpha1.AutoscalingConfig, promotion *modelsv1alpha1.PromotionSettingsConfig) error {
+					Expect(environment).NotTo(BeNil())
+					Expect(modelID).To(Equal(testModelID))
+					Expect(envName).To(Equal("production"))
+					Expect(promotion).To(BeNil())
+					return update(settings)
+				}
+				mockClient.UpdateDeploymentAutoscalingFunc = func(_ context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
+					Expect(environment).To(BeNil())
+					Expect(modelID).To(Equal(testModelID))
+					Expect(depID).To(Equal(testSourceDepID))
+					return update(settings)
+				}
+				_, err := reconcileByName(name)
+				Expect(err != nil).To(Equal(updateFails))
+				Expect(updates).To(Equal(1))
+				Expect(targetReads).To(BeZero())
+				Expect(getCondition(getModelStatus(name).Conditions, "Ready").Status).To(Equal(metav1.ConditionFalse))
+				if updateFails {
+					updateFails = false
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+				}
+				before := updates
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updates).To(Equal(before), "converged settings must not be patched again")
+				Expect(targetReads).To(Equal(1))
+				Expect(getCondition(getModelStatus(name).Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+				Expect(getModelStatus(name).TrussConfigHash).To(Equal(hash), "no new truss push for autoscaling")
+			},
+				Entry("first source in production", ptr("production"), false),
+				Entry("unassigned source", (*string)(nil), false),
+				Entry("retry production update failure", ptr("production"), true),
+				Entry("retry deployment update failure", (*string)(nil), true),
+			)
+
+			DescribeTable("does not touch unrelated deployments or environments", func(dep baseten.DeploymentDetail, env *baseten.Environment) {
+				model := newSourceModel("source-boundary")
+				mockClient.ListDeploymentsFunc = func(context.Context, string) ([]baseten.DeploymentDetail, error) {
+					return []baseten.DeploymentDetail{dep}, nil
+				}
+				mockClient.GetEnvironmentFunc = func(context.Context, string, string) (*baseten.Environment, error) { return env, nil }
+				changed, err := reconciler.reconcileSourceAutoscaling(ctx, model, testModelID, testSourceDep)
+				Expect(err).To(HaveOccurred())
+				Expect(changed).To(BeFalse())
+			},
+				Entry("promoted copy is not an exact match", baseten.DeploymentDetail{ID: "copy", Name: testSourceDep + ".1"}, nil),
+				Entry("other environment", baseten.DeploymentDetail{ID: testSourceDepID, Name: testSourceDep, Environment: ptr("staging")}, nil),
+				Entry("unknown settings", baseten.DeploymentDetail{ID: testSourceDepID, Name: testSourceDep}, nil),
+				Entry("unknown timers are not zero", baseten.DeploymentDetail{ID: testSourceDepID, Name: testSourceDep, AutoscalingSettings: &baseten.AutoscalingSettings{}}, nil),
+				Entry("production moved", baseten.DeploymentDetail{ID: testSourceDepID, Name: testSourceDep, IsProduction: true}, &baseten.Environment{CurrentDeployment: &baseten.Deployment{ID: "other"}}),
+				Entry("production promoting", baseten.DeploymentDetail{ID: testSourceDepID, Name: testSourceDep, Environment: ptr("production")}, &baseten.Environment{CurrentDeployment: &baseten.Deployment{ID: testSourceDepID}, CandidateDeployment: &baseten.Deployment{ID: "candidate"}}),
+			)
+		})
+
 		Describe("Paused Reconciliation", func() {
 			It("should skip all API calls and return empty result when paused", func() {
 				name := "paused-no-api"
@@ -486,7 +608,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					Fail("DeleteDeployment must not be called in Observe mode")
 					return nil
 				}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, deploymentID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					Fail("UpdateDeploymentAutoscaling must not be called in Observe mode")
 					return nil
 				}
@@ -2416,9 +2538,9 @@ var _ = Describe("BasetenModel Controller", func() {
 				)
 
 				scaledIDs := []string{}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					scaledIDs = append(scaledIDs, depID)
-					Expect(minReplica).To(Equal(int32(0)))
+					Expect(settings).To(Equal(&modelsv1alpha1.AutoscalingConfig{MinReplicas: ptr(int32(0))}))
 					return nil
 				}
 
@@ -2665,7 +2787,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				)
 
 				scaledIDs := []string{}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					scaledIDs = append(scaledIDs, depID)
 					return nil
 				}
@@ -2709,7 +2831,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				)
 
 				scaledIDs := []string{}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					scaledIDs = append(scaledIDs, depID)
 					return nil
 				}
@@ -2830,7 +2952,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					deletedIDs = append(deletedIDs, depID)
 					return nil
 				}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					return nil
 				}
 
@@ -2971,7 +3093,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					deleteCalled = true
 					return nil
 				}
-				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, minReplica int32) error {
+				mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, depID string, settings *modelsv1alpha1.AutoscalingConfig) error {
 					scaleCalled = true
 					return nil
 				}

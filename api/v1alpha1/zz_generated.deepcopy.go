@@ -200,6 +200,11 @@ func (in *BasetenModelSpec) DeepCopyInto(out *BasetenModelSpec) {
 		*out = new(TrussConfig)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.SourceAutoscaling != nil {
+		in, out := &in.SourceAutoscaling, &out.SourceAutoscaling
+		*out = new(AutoscalingConfig)
+		(*in).DeepCopyInto(*out)
+	}
 	in.Environment.DeepCopyInto(&out.Environment)
 	if in.OrphanDeploymentCleanup != nil {
 		in, out := &in.OrphanDeploymentCleanup, &out.OrphanDeploymentCleanup

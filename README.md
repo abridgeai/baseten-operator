@@ -39,6 +39,15 @@ Use Kubernetes-native continuous delivery tooling (e.g. [Argo CD](https://argo-c
 
 ## Full Spec Reference
 
+For disposable test models using `trussConfig` and a non-production target, opt in with
+`spec.sourceAutoscaling: {minReplicas: 0, autoscalingWindow: 10, scaleDownDelay: 0}`.
+This reconciles the exact source deployment, including the default `production`
+environment Baseten attaches to the first push. Promoted copies keep the target
+environment's policy. Other attached environments, an unrelated production deployment,
+or an active production promotion/schedule block the override. Omit the field to preserve
+existing behavior. `DeleteWithGuardrails` still waits for all environments to be idle.
+Removing the opt-in stops reconciliation; it does not restore previous settings.
+
 <details>
 <summary>Complete BasetenModel CR with all supported fields</summary>
 

@@ -1108,12 +1108,17 @@ func TestUpdateDeploymentAutoscaling(t *testing.T) {
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		err := c.UpdateDeploymentAutoscaling(context.Background(), "model1", "d1", 0)
+		err := c.UpdateDeploymentAutoscaling(context.Background(), "model1", "d1", &modelsv1alpha1.AutoscalingConfig{
+			MinReplicas: ptr(int32(0)), AutoscalingWindow: ptr(int32(10)), ScaleDownDelay: ptr(int32(0)),
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if val, ok := gotBody["min_replica"]; !ok || val != float64(0) {
 			t.Errorf("expected min_replica=0, got %v", gotBody)
+		}
+		if gotBody["autoscaling_window"] != float64(10) || gotBody["scale_down_delay"] != float64(0) || len(gotBody) != 3 {
+			t.Errorf("expected only the explicitly set source policy fields, got %v", gotBody)
 		}
 	})
 
@@ -1124,7 +1129,7 @@ func TestUpdateDeploymentAutoscaling(t *testing.T) {
 		defer srv.Close()
 
 		c := newTestClient(srv.URL)
-		err := c.UpdateDeploymentAutoscaling(context.Background(), "model1", "d1", 0)
+		err := c.UpdateDeploymentAutoscaling(context.Background(), "model1", "d1", &modelsv1alpha1.AutoscalingConfig{MinReplicas: ptr(int32(0))})
 		if err == nil {
 			t.Fatal("expected error")
 		}

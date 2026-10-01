@@ -74,6 +74,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(self.sourceAutoscaling) || (has(self.trussConfig) && self.environment.name != 'production')",message="sourceAutoscaling requires trussConfig and a non-production target environment"
 type BasetenModelSpec struct {
 	// ModelName references an existing Baseten model
 	// +required
@@ -99,6 +100,12 @@ type BasetenModelSpec struct {
 	// Mutually exclusive with sourceDeploymentName.
 	// +optional
 	TrussConfig *TrussConfig `json:"trussConfig,omitempty"`
+
+	// SourceAutoscaling optionally manages the exact truss source deployment, including
+	// its initial production environment. Omit to leave Baseten defaults unchanged.
+	// This is separate from the target environment's autoscaling and does not trigger a push.
+	// +optional
+	SourceAutoscaling *AutoscalingConfig `json:"sourceAutoscaling,omitempty"`
 
 	// Environment defines the target environment and its configuration
 	// +required

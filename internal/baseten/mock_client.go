@@ -18,7 +18,7 @@ type MockClient struct {
 	ActivateDeploymentFunc          func(ctx context.Context, modelID, deploymentID string) error
 	PromoteFunc                     func(ctx context.Context, modelID, deploymentID, targetEnv string, settings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error)
 	ListDeploymentsFunc             func(ctx context.Context, modelID string) ([]DeploymentDetail, error)
-	UpdateDeploymentAutoscalingFunc func(ctx context.Context, modelID, deploymentID string, minReplica int32) error
+	UpdateDeploymentAutoscalingFunc func(ctx context.Context, modelID, deploymentID string, settings *modelsv1alpha1.AutoscalingConfig) error
 	DeleteDeploymentFunc            func(ctx context.Context, modelID, deploymentID string) error
 	RetryDeploymentFunc             func(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error)
 }
@@ -69,8 +69,8 @@ func (m *MockClient) ListDeployments(ctx context.Context, modelID string) ([]Dep
 	return m.ListDeploymentsFunc(ctx, modelID)
 }
 
-func (m *MockClient) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
-	return m.UpdateDeploymentAutoscalingFunc(ctx, modelID, deploymentID, minReplica)
+func (m *MockClient) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, settings *modelsv1alpha1.AutoscalingConfig) error {
+	return m.UpdateDeploymentAutoscalingFunc(ctx, modelID, deploymentID, settings)
 }
 
 func (m *MockClient) DeleteDeployment(ctx context.Context, modelID, deploymentID string) error {
