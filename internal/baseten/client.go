@@ -79,7 +79,7 @@ type ClientInterface interface {
 	ActivateDeployment(ctx context.Context, modelID, deploymentID string) error
 	Promote(ctx context.Context, modelID, deploymentID, targetEnv string, settings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error)
 	ListDeployments(ctx context.Context, modelID string) ([]DeploymentDetail, error)
-	UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, minReplica int32) error
+	UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, settings *modelsv1alpha1.AutoscalingConfig) error
 	DeleteDeployment(ctx context.Context, modelID, deploymentID string) error
 	RetryDeployment(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error)
 }
@@ -320,11 +320,12 @@ func (c *Client) ListDeployments(ctx context.Context, modelID string) ([]Deploym
 	return result, nil
 }
 
-func (c *Client) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
-	mr := int(minReplica)
-	_, err := c.api.PatchModelsDeploymentsAutoscalingSettings(ctx, modelID, deploymentID, managementapi.UpdateAutoscalingSettings{
-		MinReplica: &mr,
-	})
+func (c *Client) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, settings *modelsv1alpha1.AutoscalingConfig) error {
+	update := toUpdateAutoscalingSettings(settings)
+	if update == nil {
+		return nil
+	}
+	_, err := c.api.PatchModelsDeploymentsAutoscalingSettings(ctx, modelID, deploymentID, *update)
 	return toAPIError(err)
 }
 

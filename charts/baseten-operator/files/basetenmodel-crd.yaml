@@ -480,6 +480,48 @@ spec:
                   is treated as Pause regardless of spec.mode. Will be removed in a future
                   API version.
                 type: boolean
+              sourceAutoscaling:
+                description: |-
+                  SourceAutoscaling optionally manages the exact truss source deployment, including
+                  its initial production environment. Omit to leave Baseten defaults unchanged.
+                  This is separate from the target environment's autoscaling and does not trigger a push.
+                properties:
+                  autoscalingWindow:
+                    description: AutoscalingWindow is the timeframe of traffic considered
+                      for autoscaling decisions (in seconds)
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  concurrencyTarget:
+                    description: ConcurrencyTarget is the number of requests per replica
+                      before scaling up
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxReplicas:
+                    description: MaxReplicas is the maximum number of replicas
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    description: MinReplicas is the minimum number of replicas
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  scaleDownDelay:
+                    description: ScaleDownDelay is the waiting period before scaling
+                      down any active replica (in seconds)
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  targetUtilizationPercentage:
+                    description: TargetUtilizationPercentage is the target utilization
+                      percentage for scaling decisions
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                type: object
               sourceDeploymentName:
                 description: |-
                   SourceDeploymentName is the deployment to promote (created by CI/CD via truss push).
@@ -671,6 +713,10 @@ spec:
               rule: '!(has(self.sourceDeploymentName) && has(self.trussConfig))'
             - message: team is immutable once set
               rule: '!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)'
+            - message: sourceAutoscaling requires trussConfig and a non-production
+                target environment
+              rule: '!has(self.sourceAutoscaling) || (has(self.trussConfig) && self.environment.name
+                != ''production'')'
           status:
             description: status defines the observed state of BasetenModel
             properties:
