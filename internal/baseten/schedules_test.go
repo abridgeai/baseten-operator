@@ -42,12 +42,14 @@ func observedOvernight() AutoscalingSchedule {
 	}
 }
 
+var futureLaunch = time.Date(time.Now().UTC().Year()+1, time.October, 1, 13, 0, 0, 0, time.UTC)
+
 func specOneTime() modelsv1alpha1.AutoscalingSchedule {
 	return modelsv1alpha1.AutoscalingSchedule{
 		Name:        "launch",
 		Cadence:     CadenceOneTime,
-		StartAt:     "2026-10-01T09:00:00-04:00",
-		EndAt:       "2026-10-01T17:00:00-04:00",
+		StartAt:     futureLaunch.In(time.FixedZone("UTC-4", -4*60*60)).Format(time.RFC3339),
+		EndAt:       futureLaunch.Add(8 * time.Hour).In(time.FixedZone("UTC-4", -4*60*60)).Format(time.RFC3339),
 		Autoscaling: modelsv1alpha1.ScheduleAutoscalingConfig{MinReplicas: 4, MaxReplicas: 20},
 	}
 }
@@ -153,7 +155,7 @@ func TestHasScheduleDrift(t *testing.T) {
 			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{specOneTime()}},
 			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{{
 				ID: "sched-2", Name: "launch", Enabled: true, Cadence: CadenceOneTime,
-				StartAt: "2026-10-01T13:00:00Z", EndAt: "2026-10-01T21:00:00Z",
+				StartAt: futureLaunch.Format(time.RFC3339), EndAt: futureLaunch.Add(8 * time.Hour).Format(time.RFC3339),
 				AutoscalingSettings: ScheduleAutoscalingSettings{MinReplica: 4, MaxReplica: 20},
 			}}},
 			nil,
@@ -272,7 +274,7 @@ func TestUpdateAutoscalingSchedules(t *testing.T) {
 				t.Errorf("ONE_TIME schedule must not send %s", k)
 			}
 		}
-		if created["start_at"] != "2026-10-01T09:00:00-04:00" || created["enabled"] != true {
+		if created["start_at"] != specOneTime().StartAt || created["enabled"] != true {
 			t.Errorf("unexpected one-time schedule: %v", created)
 		}
 	})
