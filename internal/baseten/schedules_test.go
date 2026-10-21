@@ -319,7 +319,7 @@ func TestGetEnvironmentDecodesSchedules(t *testing.T) {
 			t.Errorf("unexpected decoded recurring schedule: %+v", got)
 		}
 		got := env.AutoscalingSchedules.Schedules[1]
-		if got.Cadence != CadenceOneTime || got.StartAt != "2099-10-01T13:00:00Z" || got.EndAt != "2099-10-01T21:00:00Z" || *got.AutoscalingSettings.MaxScaleDownRate != 10 {
+		if got.Cadence != CadenceOneTime || got.StartAt != "2026-10-01T13:00:00Z" || got.EndAt != "2026-10-01T21:00:00Z" || *got.AutoscalingSettings.MaxScaleDownRate != 10 {
 			t.Errorf("unexpected decoded one-time schedule: %+v", got)
 		}
 	})
