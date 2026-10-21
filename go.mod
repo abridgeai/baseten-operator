@@ -1,6 +1,6 @@
 module github.com/abridgeai/baseten-operator
 
-go 1.26.2
+go 1.26.10
 
 require (
 	github.com/basetenlabs/baseten-go v0.3.0

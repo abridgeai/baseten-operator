@@ -1,5 +1,5 @@
 # Build the baseten-operator binary
-ARG BUILDER_IMAGE=golang:1.26.2
+ARG BUILDER_IMAGE=golang:1.26.10
 ARG RUNTIME_IMAGE=gcr.io/distroless/static:nonroot
 FROM ${BUILDER_IMAGE} AS builder
 ARG TARGETOS
