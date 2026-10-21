@@ -46,8 +46,8 @@ func specOneTime() modelsv1alpha1.AutoscalingSchedule {
 	return modelsv1alpha1.AutoscalingSchedule{
 		Name:        "launch",
 		Cadence:     CadenceOneTime,
-		StartAt:     "2026-10-01T09:00:00-04:00",
-		EndAt:       "2026-10-01T17:00:00-04:00",
+		StartAt:     "2099-10-01T09:00:00-04:00",
+		EndAt:       "2099-10-01T17:00:00-04:00",
 		Autoscaling: modelsv1alpha1.ScheduleAutoscalingConfig{MinReplicas: 4, MaxReplicas: 20},
 	}
 }
@@ -153,7 +153,7 @@ func TestHasScheduleDrift(t *testing.T) {
 			&modelsv1alpha1.AutoscalingScheduleConfig{Schedules: []modelsv1alpha1.AutoscalingSchedule{specOneTime()}},
 			&AutoscalingSchedules{Schedules: []AutoscalingSchedule{{
 				ID: "sched-2", Name: "launch", Enabled: true, Cadence: CadenceOneTime,
-				StartAt: "2026-10-01T13:00:00Z", EndAt: "2026-10-01T21:00:00Z",
+				StartAt: "2099-10-01T13:00:00Z", EndAt: "2099-10-01T21:00:00Z",
 				AutoscalingSettings: ScheduleAutoscalingSettings{MinReplica: 4, MaxReplica: 20},
 			}}},
 			nil,
@@ -272,7 +272,7 @@ func TestUpdateAutoscalingSchedules(t *testing.T) {
 				t.Errorf("ONE_TIME schedule must not send %s", k)
 			}
 		}
-		if created["start_at"] != "2026-10-01T09:00:00-04:00" || created["enabled"] != true {
+		if created["start_at"] != "2099-10-01T09:00:00-04:00" || created["enabled"] != true {
 			t.Errorf("unexpected one-time schedule: %v", created)
 		}
 	})

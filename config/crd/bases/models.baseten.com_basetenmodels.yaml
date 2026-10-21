@@ -656,6 +656,49 @@ spec:
                           small scripts only)
                         type: string
                     type: object
+                  weights:
+                    description: Weights are mirrored by BDN and mounted before the
+                      server starts.
+                    items:
+                      description: TrussWeightSource declares one BDN source and its
+                        read-only container mount.
+                      properties:
+                        allowPatterns:
+                          items:
+                            type: string
+                          type: array
+                        auth:
+                          description: Auth is omitted for public sources.
+                          properties:
+                            authMethod:
+                              enum:
+                              - CUSTOM_SECRET
+                              type: string
+                            authSecretName:
+                              minLength: 1
+                              type: string
+                          required:
+                          - authMethod
+                          - authSecretName
+                          type: object
+                        ignorePatterns:
+                          items:
+                            type: string
+                          type: array
+                        mountLocation:
+                          pattern: ^/[^/].*
+                          type: string
+                        source:
+                          minLength: 1
+                          type: string
+                      required:
+                      - mountLocation
+                      - source
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - mountLocation
+                    x-kubernetes-list-type: map
                 required:
                 - baseImage
                 - resources

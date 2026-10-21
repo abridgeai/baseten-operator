@@ -148,6 +148,12 @@ type BasetenModelSpec struct {
 // TrussConfig defines the truss configuration for creating a deployment.
 // Fields map to the truss config.yaml format (https://docs.baseten.co/reference/truss-configuration).
 type TrussConfig struct {
+	// Weights are mirrored by BDN and mounted before the server starts.
+	// +optional
+	// +listType=map
+	// +listMapKey=mountLocation
+	Weights []TrussWeightSource `json:"weights,omitempty"`
+
 	// PythonVersion is the Python version to build with (e.g., "py311", "py312")
 	// +optional
 	PythonVersion string `json:"pythonVersion,omitempty"`
@@ -186,6 +192,29 @@ type TrussConfig struct {
 	// Large scripts should be stored in a ConfigMap and referenced via configMapRef.
 	// +optional
 	SetupScript *SetupScriptSource `json:"setupScript,omitempty"`
+}
+
+// TrussWeightSource declares one BDN source and its read-only container mount.
+type TrussWeightSource struct {
+	// +kubebuilder:validation:MinLength=1
+	Source string `json:"source"`
+	// +kubebuilder:validation:Pattern=`^/[^/].*`
+	MountLocation string `json:"mountLocation"`
+	// Auth is omitted for public sources.
+	// +optional
+	Auth *TrussWeightAuth `json:"auth,omitempty"`
+	// +optional
+	AllowPatterns []string `json:"allowPatterns,omitempty"`
+	// +optional
+	IgnorePatterns []string `json:"ignorePatterns,omitempty"`
+}
+
+// TrussWeightAuth references an existing Baseten workspace secret.
+type TrussWeightAuth struct {
+	// +kubebuilder:validation:Enum=CUSTOM_SECRET
+	AuthMethod string `json:"authMethod"`
+	// +kubebuilder:validation:MinLength=1
+	AuthSecretName string `json:"authSecretName"`
 }
 
 // TrussResources defines compute resources for the deployment.

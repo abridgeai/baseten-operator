@@ -3085,6 +3085,20 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 			}
 
+			It("should preserve BDN sources through Kubernetes admission", func() {
+				name := "truss-bdn-admission"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+				model.Spec.TrussConfig.Weights = []modelsv1alpha1.TrussWeightSource{
+					{Source: "gs://models/base/", MountLocation: "/weights/model", Auth: &modelsv1alpha1.TrussWeightAuth{AuthMethod: "CUSTOM_SECRET", AuthSecretName: "gcs-reader"}, IgnorePatterns: []string{"*.pt"}},
+					{Source: "hf://org/draft@revision", MountLocation: "/weights/draft", AllowPatterns: []string{"*.safetensors"}},
+				}
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				stored := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, stored)).To(Succeed())
+				Expect(stored.Spec.TrussConfig.Weights).To(Equal(model.Spec.TrussConfig.Weights))
+			})
+
 			It("should launch async push and requeue when trussConfig is specified", func() {
 				name := "truss-push-and-promote"
 				model := newTrussConfigModel(name)

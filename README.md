@@ -195,6 +195,34 @@ For a CPU-only deployment, omit `accelerator` and set `cpu`/`memory`; Baseten pi
       useGpu: false
 ```
 
+### BDN weight mounts
+
+Set `spec.trussConfig.weights` to have Baseten mirror model files and mount them
+read-only before container startup. Point your server at the mount instead of
+running a GCS download in its startup script. Each adapter or separate draft can
+have its own source and mount:
+
+```yaml
+    weights:
+      - source: gs://my-models/base/v1/
+        mountLocation: /weights/model
+        auth:
+          authMethod: CUSTOM_SECRET
+          authSecretName: gcs-reader
+      - source: gs://my-models/adapters/example/v1/
+        mountLocation: /weights/loras/example
+        auth:
+          authMethod: CUSTOM_SECRET
+          authSecretName: gcs-reader
+```
+
+`auth` is optional for public sources; `CUSTOM_SECRET` references an existing
+Baseten workspace secret and does not mount it in the inference container.
+`allowPatterns` and `ignorePatterns` pass through to BDN file filtering.
+Use versioned source paths: changing remote contents alone does not change the
+operator's deployment hash. Omitting `weights` preserves existing deployments.
+Install the updated CRD and operator before applying resources with weight mounts.
+
 ### Drift Detection and Correction
 
 If someone changes autoscaling or promotion settings in the Baseten UI, the operator detects the drift on the next reconcile and corrects it back to the desired state defined in the CR. Both autoscaling and promotion settings are reconciled in a single API call.
