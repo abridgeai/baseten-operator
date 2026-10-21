@@ -2,10 +2,15 @@ name: Image Startup Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   standard:
@@ -17,9 +22,19 @@ jobs:
         with:
           persist-credentials: false
       - name: Build image
-        run: docker build -t baseten-operator:smoke .
+        run: |
+          mkdir -p image-test-logs
+          docker build --progress=plain -t baseten-operator:smoke . 2>&1 | tee image-test-logs/build.log
       - name: Check startup without cluster credentials
-        run: timeout 30s docker run --rm --network none baseten-operator:smoke --help
+        run: timeout 30s docker run --rm --network none baseten-operator:smoke --help 2>&1 | tee image-test-logs/startup.log
+      - name: Upload image test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: standard-image-test-logs
+          path: image-test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   fips:
     name: FIPS image startup
@@ -49,9 +64,18 @@ jobs:
         run: |
           GOVER=$(awk '$1 == "go" {print $2}' go.mod)
           test -n "$GOVER"
-          docker build -t baseten-operator:fips-smoke \
+          mkdir -p image-test-logs
+          docker build --progress=plain -t baseten-operator:fips-smoke \
             --build-arg "BUILDER_IMAGE=us-docker.pkg.dev/abridge-artifact-registry/cgr/abridge.com/go-fips:${GOVER}-dev" \
             --build-arg RUNTIME_IMAGE=us-docker.pkg.dev/abridge-artifact-registry/cgr/abridge.com/glibc-openssl-fips:latest \
-            --build-arg CGO_ENABLED=1 .
+            --build-arg CGO_ENABLED=1 . 2>&1 | tee image-test-logs/build.log
       - name: Check FIPS initialization without cluster credentials
-        run: timeout 30s docker run --rm --network none baseten-operator:fips-smoke --help
+        run: timeout 30s docker run --rm --network none baseten-operator:fips-smoke --help 2>&1 | tee image-test-logs/startup.log
+      - name: Upload FIPS image test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fips-image-test-logs
+          path: image-test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
