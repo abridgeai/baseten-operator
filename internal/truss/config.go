@@ -22,6 +22,30 @@ func GenerateConfigYAML(tc *modelsv1alpha1.TrussConfig, modelName string) ([]byt
 		config["python_version"] = tc.PythonVersion
 	}
 
+	if len(tc.Weights) > 0 {
+		weights := make([]map[string]any, 0, len(tc.Weights))
+		for _, source := range tc.Weights {
+			weight := map[string]any{
+				"source":         source.Source,
+				"mount_location": source.MountLocation,
+			}
+			if source.Auth != nil {
+				weight["auth"] = map[string]any{
+					"auth_method":      source.Auth.AuthMethod,
+					"auth_secret_name": source.Auth.AuthSecretName,
+				}
+			}
+			if len(source.AllowPatterns) > 0 {
+				weight["allow_patterns"] = source.AllowPatterns
+			}
+			if len(source.IgnorePatterns) > 0 {
+				weight["ignore_patterns"] = source.IgnorePatterns
+			}
+			weights = append(weights, weight)
+		}
+		config["weights"] = weights
+	}
+
 	// Resources
 	// truss rejects an empty accelerator; CPU-only configs must omit the key.
 	resources := map[string]any{}

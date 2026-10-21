@@ -3,6 +3,7 @@ package truss
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -374,5 +375,64 @@ func TestWriteTrussDirectory_NoSetupScript(t *testing.T) {
 	// data/ directory should not exist
 	if _, err := os.Stat(filepath.Join(trussDir, "data")); !os.IsNotExist(err) {
 		t.Error("data/ directory should not exist when no setup script is provided")
+	}
+}
+
+func TestGenerateConfigYAMLWeights(t *testing.T) {
+	tc := &modelsv1alpha1.TrussConfig{Weights: []modelsv1alpha1.TrussWeightSource{
+		{Source: "gs://models/base/", MountLocation: "/weights/model", Auth: &modelsv1alpha1.TrussWeightAuth{AuthMethod: "CUSTOM_SECRET", AuthSecretName: "gcs-reader"}, IgnorePatterns: []string{"optimizer_state_dict.pt", "**/optimizer_state_dict.pt"}},
+		{Source: "gs://models/adapter-a/", MountLocation: "/weights/loras/a", Auth: &modelsv1alpha1.TrussWeightAuth{AuthMethod: "CUSTOM_SECRET", AuthSecretName: "gcs-reader"}},
+		{Source: "gs://models/adapter-b/", MountLocation: "/weights/loras/b", Auth: &modelsv1alpha1.TrussWeightAuth{AuthMethod: "CUSTOM_SECRET", AuthSecretName: "gcs-reader"}},
+		{Source: "hf://org/draft@revision", MountLocation: "/weights/draft", AllowPatterns: []string{"*.json", "*.safetensors"}},
+	}}
+	data, err := GenerateConfigYAML(tc, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := yaml.Unmarshal([]byte(`weights:
+- source: gs://models/base/
+  mount_location: /weights/model
+  auth: {auth_method: CUSTOM_SECRET, auth_secret_name: gcs-reader}
+  ignore_patterns: [optimizer_state_dict.pt, '**/optimizer_state_dict.pt']
+- source: gs://models/adapter-a/
+  mount_location: /weights/loras/a
+  auth: {auth_method: CUSTOM_SECRET, auth_secret_name: gcs-reader}
+- source: gs://models/adapter-b/
+  mount_location: /weights/loras/b
+  auth: {auth_method: CUSTOM_SECRET, auth_secret_name: gcs-reader}
+- source: hf://org/draft@revision
+  mount_location: /weights/draft
+  allow_patterns: ['*.json', '*.safetensors']
+`), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got["weights"], want["weights"]) {
+		t.Fatalf("weights = %#v, want %#v", got["weights"], want["weights"])
+	}
+	if _, ok := got["secrets"]; ok {
+		t.Fatal("BDN authentication must not add container secrets")
+	}
+	originalHash := HashTrussConfig(tc, "")
+	copy := tc.DeepCopy()
+	copy.Weights[0].IgnorePatterns[0] = "changed"
+	copy.Weights[0].Auth.AuthSecretName = "another-reader"
+	if tc.Weights[0].IgnorePatterns[0] != "optimizer_state_dict.pt" || tc.Weights[0].Auth.AuthSecretName != "gcs-reader" {
+		t.Fatal("deep copy aliases original weights")
+	}
+	if originalHash == HashTrussConfig(copy, "") {
+		t.Fatal("weight changes must trigger a new deployment")
+	}
+	tc.Weights = nil
+	data, err = GenerateConfigYAML(tc, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "weights:") {
+		t.Fatal("legacy configs must omit weights")
 	}
 }
