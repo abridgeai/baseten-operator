@@ -595,10 +595,6 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 // event drive things; handled=false means the CR is in steady state and normal
 // reconciliation can continue.
 func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *modelsv1alpha1.BasetenModel) (bool, ctrl.Result, error) {
-	if model.Spec.PromotionCancellation != nil && !model.Spec.Paused { //nolint:staticcheck // legacy pause remains a kill switch
-		result, err := r.reconcilePromotionCancellation(ctx, model)
-		return true, result, err
-	}
 	if !model.DeletionTimestamp.IsZero() {
 		result, err := r.reconcileDeletion(ctx, model)
 		return true, result, err
@@ -606,6 +602,10 @@ func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *
 	if effectiveMode(model) == modelsv1alpha1.ModePause {
 		r.reconcilePaused(ctx, model)
 		return true, ctrl.Result{}, nil
+	}
+	if model.Spec.PromotionCancellation != nil {
+		result, err := r.reconcilePromotionCancellation(ctx, model)
+		return true, result, err
 	}
 	if !controllerutil.AddFinalizer(model, modelsv1alpha1.FinalizerName) {
 		return false, ctrl.Result{}, nil

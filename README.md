@@ -305,35 +305,40 @@ See [Argo CD Resource Health docs](https://argo-cd.readthedocs.io/en/latest/oper
 
 - **`Reconcile`** (default) — normal active reconciliation. Reads desired state, reconciles drift, promotes deployments, retries failures.
 - **`Observe`** — read-only. The operator reads Baseten state and refreshes status (including detected drift) but never mutates: no creates, promotions, updates, deletes, or truss pushes. Useful in a multi-region setup so secondary regions retain visibility without dual-writing alongside the primary. Failover by flipping a region to `Reconcile` via GitOps.
-- **`Pause`** — no API calls, no requeue, last known status preserved, unless an explicit `promotionCancellation` request is present. Useful during incidents or when configuring the model manually in the Baseten UI.
+- **`Pause`** — no API calls, no requeue, last known status preserved. Useful during incidents or when configuring the model manually in the Baseten UI.
 
 ```yaml
 spec:
   mode: Observe   # this region only watches; the primary region runs as Reconcile
 ```
 
-### Abandoning a stuck promotion
+### Canceling a particular promotion
 
-Baseten rejects environment autoscaling updates while a promotion is in progress. For an unused
-environment, set `mode: Pause`, `environment.autoscaling.minReplicas: 0`, `deletionPolicy: Retain`,
-and `promotionCancellation` with `modelID`, `environmentName`, and `candidateDeploymentID` copied from
-the controller's recorded attempt. Only the owning reconciler may set `observeOnly: false`;
-secondary regions set `observeOnly: true` and wait without making writes.
+Set `spec.promotionCancellation` with `modelID`, `environmentName`, and
+`candidateDeploymentID` copied from the controller's recorded attempt. The existing mode
+controls permissions: Reconcile can cancel, Observe only reports, and Pause (including legacy
+`paused: true`) makes no Baseten API calls. No separate permission switch is needed.
 
-Cancellation verifies the identities, cancels the owned promotion, waits until Baseten clears both
-the candidate and promotion, then lowers only the minimum replica setting and reads it back.
-It never force-cancels, deletes the shared model, or deactivates the source/current deployment.
-A changed candidate, a candidate that became current, or an active autoscaling schedule blocks
-cancellation for reassessment. `PROMOTION_CANCELED` with a current-generation Ready condition means
-cancellation and the floor are confirmed; check `activeReplicaCount` separately for replica drain.
-The request keeps normal reconciliation paused until a subsequent explicit apply removes it.
-Deleting a CR after cancellation with Retain releases its finalizer without deleting the upstream model.
-Legacy `paused: true` remains an unconditional kill switch, including during cancellation.
+The operator compares the pinned attempt with the live candidate, calls `cancel_promotion`,
+and waits until Baseten clears the candidate and in-progress promotion. A different candidate
+or one that became current blocks cancellation. The request prevents further source pushes and
+promotions while it remains present; removing it explicitly resumes ordinary behavior.
 
-Install the new CRD and operator before callers emit cancellation requests. Reverting the operator
-leaves these CRs paused and may stall cleanup; it cannot complete this protocol. Re-upgrade to
-finish cancellation. Baseten's cancel endpoint has no candidate-ID precondition: this uses the existing
-single-writer ownership contract, so do not concurrently promote through another operator or UI.
+Cancellation does not select replica settings or require minimum zero. After it clears, the
+existing environment reconciliation applies the settings already declared in the CR, respecting
+schedule ownership. For example, canceling candidate B with desired minimum 3 preserves the
+serving predecessor's minimum 3. MMS may separately set the environment minimum to zero during
+cleanup; this is an environment setting, not a candidate-specific setting.
+
+`PROMOTION_CANCELED` acknowledges the pinned attempt; the current deployment's replica count
+is reported separately. Deletion follows the existing lifecycle before processing cancellation:
+Retain releases the finalizer without requiring a successful Baseten read or cancellation.
+
+Install the CRD and operator before callers emit cancellation requests. Do not revert to an
+operator that lacks this field while requests remain on write-enabled CRs: it would ignore the
+request and could resume promotion. Pause affected CRs before downgrade, or keep the new operator
+installed and forward-fix. Baseten's cancel endpoint has no candidate-ID precondition, so the
+existing single-writer contract still applies; concurrent external promotions are unsupported.
 
 ### Deletion Policy
 

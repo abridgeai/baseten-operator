@@ -70,17 +70,13 @@ const (
 )
 
 // PromotionCancellation identifies the promotion to cancel.
-// +kubebuilder:validation:XValidation:rule="self.observeOnly || (has(self.candidateDeploymentID) && size(self.candidateDeploymentID) > 0)",message="a cancellation writer must identify its owned candidate"
 type PromotionCancellation struct {
 	// +kubebuilder:validation:MinLength=1
 	ModelID string `json:"modelID"`
 	// +kubebuilder:validation:MinLength=1
 	EnvironmentName string `json:"environmentName"`
-	// +optional
-	CandidateDeploymentID string `json:"candidateDeploymentID,omitempty"`
-	// ObserveOnly lets secondary regions acknowledge cancellation without mutating Baseten.
-	// +kubebuilder:default=false
-	ObserveOnly bool `json:"observeOnly"`
+	// +kubebuilder:validation:MinLength=1
+	CandidateDeploymentID string `json:"candidateDeploymentID"`
 }
 
 // BasetenModelSpec defines the desired state of BasetenModel.
@@ -88,10 +84,9 @@ type PromotionCancellation struct {
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
-// +kubebuilder:validation:XValidation:rule="!has(self.promotionCancellation) || (self.mode == 'Pause' && self.environment.autoscaling.minReplicas == 0)",message="promotionCancellation requires mode Pause and minReplicas zero"
 type BasetenModelSpec struct {
-	// PromotionCancellation cancels an owned promotion before applying the unused environment's zero floor.
-	// Mode stays Pause until an explicit apply removes this request.
+	// PromotionCancellation cancels an owned promotion. Pause and Observe remain authoritative.
+	// While present, the request prevents further source pushes and promotions.
 	// +optional
 	PromotionCancellation *PromotionCancellation `json:"promotionCancellation,omitempty"`
 
