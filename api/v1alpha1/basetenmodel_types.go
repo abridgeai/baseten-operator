@@ -69,16 +69,16 @@ const (
 	ModePause ReconcileMode = "Pause"
 )
 
-// PromotionRecovery pins the external identities of an abandoned attempt.
-// +kubebuilder:validation:XValidation:rule="self.observeOnly || (has(self.candidateDeploymentID) && size(self.candidateDeploymentID) > 0)",message="a recovery writer must identify its owned candidate"
-type PromotionRecovery struct {
+// PromotionCancellation identifies the promotion to cancel.
+// +kubebuilder:validation:XValidation:rule="self.observeOnly || (has(self.candidateDeploymentID) && size(self.candidateDeploymentID) > 0)",message="a cancellation writer must identify its owned candidate"
+type PromotionCancellation struct {
 	// +kubebuilder:validation:MinLength=1
 	ModelID string `json:"modelID"`
 	// +kubebuilder:validation:MinLength=1
 	EnvironmentName string `json:"environmentName"`
 	// +optional
 	CandidateDeploymentID string `json:"candidateDeploymentID,omitempty"`
-	// ObserveOnly lets secondary regions acknowledge recovery without mutating Baseten.
+	// ObserveOnly lets secondary regions acknowledge cancellation without mutating Baseten.
 	// +kubebuilder:default=false
 	ObserveOnly bool `json:"observeOnly"`
 }
@@ -88,12 +88,12 @@ type PromotionRecovery struct {
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
-// +kubebuilder:validation:XValidation:rule="!has(self.promotionRecovery) || (self.mode == 'Pause' && self.environment.autoscaling.minReplicas == 0)",message="promotionRecovery requires mode Pause and minReplicas zero"
+// +kubebuilder:validation:XValidation:rule="!has(self.promotionCancellation) || (self.mode == 'Pause' && self.environment.autoscaling.minReplicas == 0)",message="promotionCancellation requires mode Pause and minReplicas zero"
 type BasetenModelSpec struct {
-	// PromotionRecovery abandons one owned promotion before flooring its unused environment.
+	// PromotionCancellation cancels an owned promotion before applying the unused environment's zero floor.
 	// Mode stays Pause until an explicit apply removes this request.
 	// +optional
-	PromotionRecovery *PromotionRecovery `json:"promotionRecovery,omitempty"`
+	PromotionCancellation *PromotionCancellation `json:"promotionCancellation,omitempty"`
 
 	// ModelName references an existing Baseten model
 	// +required

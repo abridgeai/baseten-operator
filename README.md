@@ -305,7 +305,7 @@ See [Argo CD Resource Health docs](https://argo-cd.readthedocs.io/en/latest/oper
 
 - **`Reconcile`** (default) — normal active reconciliation. Reads desired state, reconciles drift, promotes deployments, retries failures.
 - **`Observe`** — read-only. The operator reads Baseten state and refreshes status (including detected drift) but never mutates: no creates, promotions, updates, deletes, or truss pushes. Useful in a multi-region setup so secondary regions retain visibility without dual-writing alongside the primary. Failover by flipping a region to `Reconcile` via GitOps.
-- **`Pause`** — no API calls, no requeue, last known status preserved, unless an explicit `promotionRecovery` request is present. Useful during incidents or when configuring the model manually in the Baseten UI.
+- **`Pause`** — no API calls, no requeue, last known status preserved, unless an explicit `promotionCancellation` request is present. Useful during incidents or when configuring the model manually in the Baseten UI.
 
 ```yaml
 spec:
@@ -316,23 +316,23 @@ spec:
 
 Baseten rejects environment autoscaling updates while a promotion is in progress. For an unused
 environment, set `mode: Pause`, `environment.autoscaling.minReplicas: 0`, `deletionPolicy: Retain`,
-and `promotionRecovery` with `modelID`, `environmentName`, and `candidateDeploymentID` copied from
+and `promotionCancellation` with `modelID`, `environmentName`, and `candidateDeploymentID` copied from
 the controller's recorded attempt. Only the owning reconciler may set `observeOnly: false`;
 secondary regions set `observeOnly: true` and wait without making writes.
 
-Recovery verifies the identities, cancels the owned promotion, waits until Baseten clears both
+Cancellation verifies the identities, cancels the owned promotion, waits until Baseten clears both
 the candidate and promotion, then lowers only the minimum replica setting and reads it back.
 It never force-cancels, deletes the shared model, or deactivates the source/current deployment.
 A changed candidate, a candidate that became current, or an active autoscaling schedule blocks
-recovery for reassessment. `PROMOTION_RECOVERED` with a current-generation Ready condition means
+cancellation for reassessment. `PROMOTION_CANCELED` with a current-generation Ready condition means
 cancellation and the floor are confirmed; check `activeReplicaCount` separately for replica drain.
 The request keeps normal reconciliation paused until a subsequent explicit apply removes it.
-Deleting a recovered CR with Retain releases its finalizer without deleting the upstream model.
-Legacy `paused: true` remains an unconditional kill switch, including during recovery.
+Deleting a CR after cancellation with Retain releases its finalizer without deleting the upstream model.
+Legacy `paused: true` remains an unconditional kill switch, including during cancellation.
 
-Install the new CRD and operator before callers emit recovery requests. Reverting the operator
+Install the new CRD and operator before callers emit cancellation requests. Reverting the operator
 leaves these CRs paused and may stall cleanup; it cannot complete this protocol. Re-upgrade to
-finish recovery. Baseten's cancel endpoint has no candidate-ID precondition: this uses the existing
+finish cancellation. Baseten's cancel endpoint has no candidate-ID precondition: this uses the existing
 single-writer ownership contract, so do not concurrently promote through another operator or UI.
 
 ### Deletion Policy

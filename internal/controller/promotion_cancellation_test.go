@@ -14,24 +14,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func recoveryFixture(t *testing.T) (*BasetenModelReconciler, *modelsv1alpha1.BasetenModel, *baseten.MockClient) {
+func cancellationFixture(t *testing.T) (*BasetenModelReconciler, *modelsv1alpha1.BasetenModel, *baseten.MockClient) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := modelsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	m := &modelsv1alpha1.BasetenModel{ObjectMeta: metav1.ObjectMeta{Name: "recovery", Namespace: "default", Generation: 2},
+	m := &modelsv1alpha1.BasetenModel{ObjectMeta: metav1.ObjectMeta{Name: "cancellation", Namespace: "default", Generation: 2},
 		Spec: modelsv1alpha1.BasetenModelSpec{Mode: modelsv1alpha1.ModePause, ModelName: "model", SourceDeploymentName: "source", DeletionPolicy: modelsv1alpha1.DeletionPolicyRetain,
-			PromotionRecovery: &modelsv1alpha1.PromotionRecovery{ModelID: "model1", EnvironmentName: "dev", CandidateDeploymentID: "candidate"},
-			Environment:       modelsv1alpha1.EnvironmentConfig{Name: "dev", Autoscaling: &modelsv1alpha1.AutoscalingConfig{MinReplicas: ptr(int32(0))}}},
+			PromotionCancellation: &modelsv1alpha1.PromotionCancellation{ModelID: "model1", EnvironmentName: "dev", CandidateDeploymentID: "candidate"},
+			Environment:           modelsv1alpha1.EnvironmentConfig{Name: "dev", Autoscaling: &modelsv1alpha1.AutoscalingConfig{MinReplicas: ptr(int32(0))}}},
 		Status: modelsv1alpha1.BasetenModelStatus{ModelID: "model1", CandidateDeploymentID: "candidate"}}
 	c := &baseten.MockClient{}
 	r := &BasetenModelReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(m).WithObjects(m).Build(), BasetenClient: c}
 	return r, m, c
 }
 
-func TestPromotionRecoveryOrdersCancellationBeforeFloorAndStaysPaused(t *testing.T) {
-	r, m, c := recoveryFixture(t)
+func TestPromotionCancellationOrdersCancellationBeforeFloorAndStaysPaused(t *testing.T) {
+	r, m, c := cancellationFixture(t)
 	env := &baseten.Environment{Name: "dev", CandidateDeployment: &baseten.Deployment{ID: "candidate"}, PromotionStatus: "RELEASING", AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1}}
 	c.GetEnvironmentFunc = func(context.Context, string, string) (*baseten.Environment, error) { return env, nil }
 	calls := []string{}
@@ -76,7 +76,7 @@ func TestPromotionRecoveryOrdersCancellationBeforeFloorAndStaysPaused(t *testing
 	if err := r.Get(context.Background(), types.NamespacedName{Name: m.Name, Namespace: m.Namespace}, m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Status.DeploymentStatus != statusPromotionRecovered || m.Status.CandidateDeploymentID != "candidate" {
+	if m.Status.DeploymentStatus != statusPromotionCanceled || m.Status.CandidateDeploymentID != "candidate" {
 		t.Fatalf("status=%+v", m.Status)
 	}
 	ready := getCondition(m.Status.Conditions, conditionReady)
@@ -85,10 +85,10 @@ func TestPromotionRecoveryOrdersCancellationBeforeFloorAndStaysPaused(t *testing
 	}
 }
 
-func TestPromotionRecoveryRefusesUnsafeMutations(t *testing.T) {
+func TestPromotionCancellationRefusesUnsafeMutations(t *testing.T) {
 	for _, tc := range []string{"unknown model", "different environment", "different candidate", "candidate became current", "unowned candidate", "push in flight", "observer", "schedule", "schedule decode", "not paused", "nonzero floor", "cancel rejected"} {
 		t.Run(tc, func(t *testing.T) {
-			r, m, c := recoveryFixture(t)
+			r, m, c := cancellationFixture(t)
 			env := &baseten.Environment{Name: "dev", CandidateDeployment: &baseten.Deployment{ID: "candidate"}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1}}
 			cancelCalls := 0
 			switch tc {
@@ -105,7 +105,7 @@ func TestPromotionRecoveryRefusesUnsafeMutations(t *testing.T) {
 			case "push in flight":
 				m.Status.TrussPushStatus = statusTrussPushing
 			case "observer":
-				m.Spec.PromotionRecovery.ObserveOnly = true
+				m.Spec.PromotionCancellation.ObserveOnly = true
 			case "schedule":
 				env.CandidateDeployment = nil
 				env.AutoscalingSchedules = &baseten.AutoscalingSchedules{AppliedState: &baseten.AutoscalingScheduleState{ScheduleID: ptr("schedule")}}
@@ -123,7 +123,7 @@ func TestPromotionRecoveryRefusesUnsafeMutations(t *testing.T) {
 				t.Fatal("unsafe floor")
 				return nil
 			}
-			_, err := r.reconcilePromotionRecovery(context.Background(), m)
+			_, err := r.reconcilePromotionCancellation(context.Background(), m)
 			if tc == "cancel rejected" {
 				if err == nil || cancelCalls != 1 {
 					t.Fatalf("err=%v calls=%d", err, cancelCalls)
@@ -135,11 +135,11 @@ func TestPromotionRecoveryRefusesUnsafeMutations(t *testing.T) {
 	}
 }
 
-func TestPromotionRecoveryAcknowledgesNewGenerationAndReportsLiveReplicas(t *testing.T) {
-	r, m, c := recoveryFixture(t)
+func TestPromotionCancellationAcknowledgesNewGenerationAndReportsLiveReplicas(t *testing.T) {
+	r, m, c := cancellationFixture(t)
 	env := &baseten.Environment{Name: "dev", CurrentDeployment: &baseten.Deployment{ID: "predecessor", ActiveReplicaCount: 2}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0}}
 	c.GetEnvironmentFunc = func(context.Context, string, string) (*baseten.Environment, error) { return env, nil }
-	if _, err := r.reconcilePromotionRecovery(context.Background(), m); err != nil {
+	if _, err := r.reconcilePromotionCancellation(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
 	if m.Status.ActiveReplicaCount != 2 {
@@ -149,7 +149,7 @@ func TestPromotionRecoveryAcknowledgesNewGenerationAndReportsLiveReplicas(t *tes
 	if err := r.Update(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.reconcilePromotionRecovery(context.Background(), m); err != nil {
+	if _, err := r.reconcilePromotionCancellation(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Get(context.Background(), types.NamespacedName{Name: m.Name, Namespace: m.Namespace}, m); err != nil {
@@ -160,10 +160,10 @@ func TestPromotionRecoveryAcknowledgesNewGenerationAndReportsLiveReplicas(t *tes
 	}
 }
 
-func TestPromotionRecoveryReleasesOnlyRetainedResource(t *testing.T) {
+func TestPromotionCancellationReleasesOnlyRetainedResource(t *testing.T) {
 	for _, retain := range []bool{true, false} {
 		t.Run(map[bool]string{true: "retain", false: "guardrails"}[retain], func(t *testing.T) {
-			r, m, c := recoveryFixture(t)
+			r, m, c := cancellationFixture(t)
 			m.Finalizers = []string{modelsv1alpha1.FinalizerName}
 			if !retain {
 				m.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
@@ -181,7 +181,7 @@ func TestPromotionRecoveryReleasesOnlyRetainedResource(t *testing.T) {
 			c.GetEnvironmentFunc = func(context.Context, string, string) (*baseten.Environment, error) {
 				return &baseten.Environment{Name: "dev", AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0}}, nil
 			}
-			if _, err := r.reconcilePromotionRecovery(context.Background(), m); err != nil {
+			if _, err := r.reconcilePromotionCancellation(context.Background(), m); err != nil {
 				t.Fatal(err)
 			}
 			err := r.Get(context.Background(), key, m)

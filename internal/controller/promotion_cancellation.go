@@ -10,16 +10,16 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-const statusPromotionRecovered = "PROMOTION_RECOVERED"
+const statusPromotionCanceled = "PROMOTION_CANCELED"
 
-func (r *BasetenModelReconciler) reconcilePromotionRecovery(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
-	request := model.Spec.PromotionRecovery
+func (r *BasetenModelReconciler) reconcilePromotionCancellation(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
+	request := model.Spec.PromotionCancellation
 	pending := func(message string) (ctrl.Result, error) {
 		err := r.updateStatus(ctx, model, statusUpdate{deploymentStatus: statusPending, message: message})
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 	blocked := func(message string) (ctrl.Result, error) {
-		err := r.updateStatus(ctx, model, statusUpdate{deploymentStatus: baseten.DeploymentStatusFailed, message: "promotion recovery blocked: " + message})
+		err := r.updateStatus(ctx, model, statusUpdate{deploymentStatus: baseten.DeploymentStatusFailed, message: "promotion cancellation blocked: " + message})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 	if model.Spec.Mode != modelsv1alpha1.ModePause || model.Spec.Environment.Autoscaling == nil || model.Spec.Environment.Autoscaling.MinReplicas == nil || *model.Spec.Environment.Autoscaling.MinReplicas != 0 {
@@ -75,16 +75,16 @@ func (r *BasetenModelReconciler) reconcilePromotionRecovery(ctx context.Context,
 	}
 	if !model.DeletionTimestamp.IsZero() {
 		if model.Spec.DeletionPolicy != modelsv1alpha1.DeletionPolicyRetain {
-			return blocked("recovered resources must retain the shared Baseten model on deletion")
+			return blocked("canceled promotions must retain the shared Baseten model on deletion")
 		}
 		return r.releaseFinalizer(ctx, model)
 	}
-	err = r.updateStatus(ctx, model, statusUpdate{deploymentStatus: statusPromotionRecovered, replicaCount: recoveryReplicaCount(env),
+	err = r.updateStatus(ctx, model, statusUpdate{deploymentStatus: statusPromotionCanceled, replicaCount: cancellationReplicaCount(env),
 		message: fmt.Sprintf("promotion abandoned; %s floor is zero; reconciliation remains paused", env.Name)})
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 }
 
-func recoveryReplicaCount(env *baseten.Environment) int32 {
+func cancellationReplicaCount(env *baseten.Environment) int32 {
 	if env.CurrentDeployment != nil {
 		return env.CurrentDeployment.ActiveReplicaCount
 	}

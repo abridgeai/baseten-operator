@@ -480,9 +480,9 @@ spec:
                   is treated as Pause regardless of spec.mode. Will be removed in a future
                   API version.
                 type: boolean
-              promotionRecovery:
+              promotionCancellation:
                 description: |-
-                  PromotionRecovery abandons one owned promotion before flooring its unused environment.
+                  PromotionCancellation cancels an owned promotion before applying the unused environment's zero floor.
                   Mode stays Pause until an explicit apply removes this request.
                 properties:
                   candidateDeploymentID:
@@ -495,7 +495,7 @@ spec:
                     type: string
                   observeOnly:
                     default: false
-                    description: ObserveOnly lets secondary regions acknowledge recovery
+                    description: ObserveOnly lets secondary regions acknowledge cancellation
                       without mutating Baseten.
                     type: boolean
                 required:
@@ -504,7 +504,7 @@ spec:
                 - observeOnly
                 type: object
                 x-kubernetes-validations:
-                - message: a recovery writer must identify its owned candidate
+                - message: a cancellation writer must identify its owned candidate
                   rule: self.observeOnly || (has(self.candidateDeploymentID) && size(self.candidateDeploymentID)
                     > 0)
               sourceDeploymentName:
@@ -741,9 +741,9 @@ spec:
               rule: '!(has(self.sourceDeploymentName) && has(self.trussConfig))'
             - message: team is immutable once set
               rule: '!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)'
-            - message: promotionRecovery requires mode Pause and minReplicas zero
-              rule: '!has(self.promotionRecovery) || (self.mode == ''Pause'' && self.environment.autoscaling.minReplicas
-                == 0)'
+            - message: promotionCancellation requires mode Pause and minReplicas zero
+              rule: '!has(self.promotionCancellation) || (self.mode == ''Pause'' &&
+                self.environment.autoscaling.minReplicas == 0)'
           status:
             description: status defines the observed state of BasetenModel
             properties:

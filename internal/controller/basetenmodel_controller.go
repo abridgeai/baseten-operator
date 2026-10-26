@@ -587,7 +587,7 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 }
 
 // reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel:
-// explicit promotion recovery, deletion handling, paused short-circuit, and finalizer add. Deletion is
+// explicit promotion cancellation, deletion handling, paused short-circuit, and finalizer add. Deletion is
 // always allowed to proceed regardless of mode (so a paused or observe CR can
 // be cleanly removed); reconcileDeletion is mode-aware and only calls
 // DeleteModel in Reconcile mode with deletionPolicy: Delete.
@@ -595,8 +595,8 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 // event drive things; handled=false means the CR is in steady state and normal
 // reconciliation can continue.
 func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *modelsv1alpha1.BasetenModel) (bool, ctrl.Result, error) {
-	if model.Spec.PromotionRecovery != nil && !model.Spec.Paused { //nolint:staticcheck // legacy pause remains a kill switch
-		result, err := r.reconcilePromotionRecovery(ctx, model)
+	if model.Spec.PromotionCancellation != nil && !model.Spec.Paused { //nolint:staticcheck // legacy pause remains a kill switch
+		result, err := r.reconcilePromotionCancellation(ctx, model)
 		return true, result, err
 	}
 	if !model.DeletionTimestamp.IsZero() {
@@ -1879,7 +1879,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	}
 
 	// Auto-clear deployment retry tracking on healthy status
-	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionRecovered {
+	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionCanceled {
 		model.Status.FirstDeploymentFailureTime = nil
 		model.Status.DeploymentRetryCount = 0
 		model.Status.NextRetryTime = nil
@@ -1888,7 +1888,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	}
 
 	readyStatus := metav1.ConditionFalse
-	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionRecovered {
+	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionCanceled {
 		readyStatus = metav1.ConditionTrue
 	}
 	setCondition(&model.Status.Conditions, metav1.Condition{
