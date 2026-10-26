@@ -1278,3 +1278,43 @@ func TestNetworkError(t *testing.T) {
 		t.Error("network error should not be APIError")
 	}
 }
+
+func TestCancelPromotion(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != testDevEnvPath+"/cancel_promotion" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				if status == http.StatusOK {
+					_, _ = fmt.Fprint(w, `{"status":"RAMPING_DOWN"}`)
+				} else {
+					_, _ = fmt.Fprint(w, `{"code":"VALIDATION_ERROR","message":"promotion changed"}`)
+				}
+			}))
+			defer server.Close()
+			err := newTestClient(server.URL).CancelPromotion(context.Background(), "model1", "dev")
+			if status == http.StatusOK && err != nil {
+				t.Fatal(err)
+			}
+			if status != http.StatusOK {
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != status {
+					t.Fatalf("error=%v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestEnvironmentPreservesPromotionState(t *testing.T) {
+	e := toEnvironment(&managementapi.Environment{InProgressPromotion: &managementapi.InProgressPromotion{Status: managementapi.InProgressPromotionStatus_RAMPING_DOWN}})
+	if e.PromotionStatus != "RAMPING_DOWN" {
+		t.Fatalf("promotion status=%s", e.PromotionStatus)
+	}
+	if toEnvironment(&managementapi.Environment{}).PromotionStatus != "" {
+		t.Fatal("absent promotion must be clear")
+	}
+}

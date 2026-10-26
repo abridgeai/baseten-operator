@@ -69,12 +69,27 @@ const (
 	ModePause ReconcileMode = "Pause"
 )
 
+// PromotionCancellation identifies the promotion to cancel.
+type PromotionCancellation struct {
+	// +kubebuilder:validation:MinLength=1
+	ModelID string `json:"modelID"`
+	// +kubebuilder:validation:MinLength=1
+	EnvironmentName string `json:"environmentName"`
+	// +kubebuilder:validation:MinLength=1
+	CandidateDeploymentID string `json:"candidateDeploymentID"`
+}
+
 // BasetenModelSpec defines the desired state of BasetenModel.
 // Exactly one of sourceDeploymentName or trussConfig must be specified.
 // +kubebuilder:validation:XValidation:rule="has(self.sourceDeploymentName) || has(self.trussConfig)",message="one of sourceDeploymentName or trussConfig must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.sourceDeploymentName) && has(self.trussConfig))",message="sourceDeploymentName and trussConfig are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.team) || (has(self.team) && self.team == oldSelf.team)",message="team is immutable once set"
 type BasetenModelSpec struct {
+	// PromotionCancellation cancels an owned promotion. Pause and Observe remain authoritative.
+	// While present, the request prevents further source pushes and promotions.
+	// +optional
+	PromotionCancellation *PromotionCancellation `json:"promotionCancellation,omitempty"`
+
 	// ModelName references an existing Baseten model
 	// +required
 	// +kubebuilder:validation:MinLength=1

@@ -480,6 +480,25 @@ spec:
                   is treated as Pause regardless of spec.mode. Will be removed in a future
                   API version.
                 type: boolean
+              promotionCancellation:
+                description: |-
+                  PromotionCancellation cancels an owned promotion. Pause and Observe remain authoritative.
+                  While present, the request prevents further source pushes and promotions.
+                properties:
+                  candidateDeploymentID:
+                    minLength: 1
+                    type: string
+                  environmentName:
+                    minLength: 1
+                    type: string
+                  modelID:
+                    minLength: 1
+                    type: string
+                required:
+                - candidateDeploymentID
+                - environmentName
+                - modelID
+                type: object
               sourceDeploymentName:
                 description: |-
                   SourceDeploymentName is the deployment to promote (created by CI/CD via truss push).

@@ -7,6 +7,7 @@ import (
 )
 
 type MockClient struct {
+	CancelPromotionFunc             func(context.Context, string, string) error
 	FindModelIDByNameFunc           func(ctx context.Context, modelName, team string) (string, error)
 	DeleteModelFunc                 func(ctx context.Context, modelID string) error
 	GetEnvironmentFunc              func(ctx context.Context, modelID, envName string) (*Environment, error)
@@ -79,4 +80,8 @@ func (m *MockClient) DeleteDeployment(ctx context.Context, modelID, deploymentID
 
 func (m *MockClient) RetryDeployment(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error) {
 	return m.RetryDeploymentFunc(ctx, modelID, deploymentID)
+}
+
+func (m *MockClient) CancelPromotion(ctx context.Context, modelID, envName string) error {
+	return m.CancelPromotionFunc(ctx, modelID, envName)
 }

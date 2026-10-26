@@ -312,6 +312,34 @@ spec:
   mode: Observe   # this region only watches; the primary region runs as Reconcile
 ```
 
+### Canceling a particular promotion
+
+Set `spec.promotionCancellation` with `modelID`, `environmentName`, and
+`candidateDeploymentID` copied from the controller's recorded attempt. The existing mode
+controls permissions: Reconcile can cancel, Observe only reports, and Pause (including legacy
+`paused: true`) makes no Baseten API calls. No separate permission switch is needed.
+
+The operator compares the pinned attempt with the live candidate, calls `cancel_promotion`,
+and waits until Baseten clears the candidate and in-progress promotion. A different candidate
+or one that became current blocks cancellation. The request prevents further source pushes and
+promotions while it remains present; removing it explicitly resumes ordinary behavior.
+
+Cancellation does not select replica settings or require minimum zero. After it clears, the
+existing environment reconciliation applies the settings already declared in the CR, respecting
+schedule ownership. For example, canceling candidate B with desired minimum 3 preserves the
+serving predecessor's minimum 3. MMS may separately set the environment minimum to zero during
+cleanup; this is an environment setting, not a candidate-specific setting.
+
+`PROMOTION_CANCELED` acknowledges the pinned attempt; the current deployment's replica count
+is reported separately. Deletion follows the existing lifecycle before processing cancellation:
+Retain releases the finalizer without requiring a successful Baseten read or cancellation.
+
+Install the CRD and operator before callers emit cancellation requests. Do not revert to an
+operator that lacks this field while requests remain on write-enabled CRs: it would ignore the
+request and could resume promotion. Pause affected CRs before downgrade, or keep the new operator
+installed and forward-fix. Baseten's cancel endpoint has no candidate-ID precondition, so the
+existing single-writer contract still applies; concurrent external promotions are unsupported.
+
 ### Deletion Policy
 
 `spec.deletionPolicy` controls what happens to the upstream Baseten model when the CR is deleted. Only honored in `Reconcile` mode; `Pause` and `Observe` always retain.
