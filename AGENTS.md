@@ -45,6 +45,7 @@ Both converge on environment reconciliation + promotion.
 - **Autoscaling schedules** (`spec.environment.autoscalingSchedule`) are owned as a full collection
   matched by name; absent means the operator never touches them. Baseline autoscaling drift is skipped
   while `autoscaling_schedules.applied_state.schedule_id` is set.
+- **Promotion recovery** uses an explicit `spec.promotionRecovery` request with `mode: Pause`; see `README.md` → Abandoning a stuck promotion. Ordinary Pause stays inert.
 - **`spec.paused: true`** stops all reconciliation/API calls and preserves last status.
 
 ## Conventions
