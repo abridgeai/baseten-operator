@@ -217,9 +217,15 @@ func TestHasAutoscalingDrift(t *testing.T) {
 		},
 		{
 			"optional pointer fields with drift",
-			&modelsv1alpha1.AutoscalingConfig{AutoscalingWindow: ptr(int32(60)), ScaleDownDelay: ptr(int32(120)), TargetUtilizationPercentage: ptr(int32(80))},
-			&AutoscalingSettings{AutoscalingWindow: ptr(int32(30)), ScaleDownDelay: ptr(int32(60)), TargetUtilizationPercentage: ptr(int32(50))},
-			true, 3,
+			&modelsv1alpha1.AutoscalingConfig{AutoscalingWindow: ptr(int32(60)), ScaleDownDelay: ptr(int32(120)), TargetUtilizationPercentage: ptr(int32(80)), MaxScaleDownRate: ptr(int32(10))},
+			&AutoscalingSettings{AutoscalingWindow: ptr(int32(30)), ScaleDownDelay: ptr(int32(60)), TargetUtilizationPercentage: ptr(int32(50)), MaxScaleDownRate: ptr(int32(50))},
+			true, 4,
+		},
+		{
+			"maxScaleDownRate unset in spec - Baseten's default is left alone",
+			&modelsv1alpha1.AutoscalingConfig{MinReplicas: ptr(int32(1))},
+			&AutoscalingSettings{MinReplica: 1, MaxScaleDownRate: ptr(int32(50))},
+			false, 0,
 		},
 		{
 			"optional pointer fields - env nil treated as zero",
@@ -306,6 +312,7 @@ func TestToUpdateAutoscalingSettings(t *testing.T) {
 			AutoscalingWindow:           ptr(int32(60)),
 			ScaleDownDelay:              ptr(int32(120)),
 			TargetUtilizationPercentage: ptr(int32(80)),
+			MaxScaleDownRate:            ptr(int32(10)),
 		})
 		if result == nil {
 			t.Fatal("expected non-nil result")
@@ -316,6 +323,7 @@ func TestToUpdateAutoscalingSettings(t *testing.T) {
 		assertIntPtr(t, "autoscaling_window", result.AutoscalingWindow, 60)
 		assertIntPtr(t, "scale_down_delay", result.ScaleDownDelay, 120)
 		assertIntPtr(t, "target_utilization_percentage", result.TargetUtilizationPercentage, 80)
+		assertIntPtr(t, "max_scale_down_rate", result.MaxScaleDownRate, 10)
 	})
 
 	t.Run("partial fields", func(t *testing.T) {

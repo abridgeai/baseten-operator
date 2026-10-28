@@ -20,6 +20,7 @@ spec:
       scaleDownDelay: 120
       autoscalingWindow: 600
       targetUtilizationPercentage: 70
+      maxScaleDownRate: 10 # percent of running replicas removed per scale-down step (Baseten default 50)
 
     # Scheduled overrides; the operator owns the full schedule list when set
     autoscalingSchedule:

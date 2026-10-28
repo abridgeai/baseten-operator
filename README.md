@@ -102,6 +102,7 @@ spec:
       autoscalingWindow: 600                         # seconds
       scaleDownDelay: 120                            # seconds
       targetUtilizationPercentage: 70
+      maxScaleDownRate: 10 # percent of running replicas removed per scale-down step (Baseten default 50)
     autoscalingSchedule:                             # optional; absent means schedules are never touched
       timezone: America/New_York                     # IANA; omit to keep current
       schedules:                                     # max 10; matched by name; unlisted schedules are deleted

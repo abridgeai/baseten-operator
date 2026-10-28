@@ -149,6 +149,7 @@ type AutoscalingSettings struct {
 	AutoscalingWindow           *int32 `json:"autoscaling_window"`
 	ScaleDownDelay              *int32 `json:"scale_down_delay"`
 	TargetUtilizationPercentage *int32 `json:"target_utilization_percentage"`
+	MaxScaleDownRate            *int32 `json:"max_scale_down_rate"`
 }
 
 // PromotionSettings represents the promotion configuration from API response (PromotionSettingsV1).
@@ -404,6 +405,7 @@ func toAutoscalingSettings(a managementapi.AutoscalingSettings) *AutoscalingSett
 		AutoscalingWindow:           intPtrToInt32Ptr(a.AutoscalingWindow),
 		ScaleDownDelay:              intPtrToInt32Ptr(a.ScaleDownDelay),
 		TargetUtilizationPercentage: intPtrToInt32Ptr(a.TargetUtilizationPercentage),
+		MaxScaleDownRate:            intPtrToInt32Ptr(a.MaxScaleDownRate),
 	}
 }
 
@@ -474,6 +476,10 @@ func toUpdateAutoscalingSettings(c *modelsv1alpha1.AutoscalingConfig) *managemen
 	}
 	if c.TargetUtilizationPercentage != nil {
 		out.TargetUtilizationPercentage = int32PtrToIntPtr(c.TargetUtilizationPercentage)
+		set = true
+	}
+	if c.MaxScaleDownRate != nil {
+		out.MaxScaleDownRate = int32PtrToIntPtr(c.MaxScaleDownRate)
 		set = true
 	}
 	if !set {
@@ -631,6 +637,9 @@ func HasAutoscalingDrift(spec *modelsv1alpha1.AutoscalingConfig, env *Autoscalin
 	}
 	if spec.TargetUtilizationPercentage != nil && *spec.TargetUtilizationPercentage != derefInt32(env.TargetUtilizationPercentage) {
 		drifts = append(drifts, fmt.Sprintf("targetUtilization %d→%d", derefInt32(env.TargetUtilizationPercentage), *spec.TargetUtilizationPercentage))
+	}
+	if spec.MaxScaleDownRate != nil && *spec.MaxScaleDownRate != derefInt32(env.MaxScaleDownRate) {
+		drifts = append(drifts, fmt.Sprintf("maxScaleDownRate %d→%d", derefInt32(env.MaxScaleDownRate), *spec.MaxScaleDownRate))
 	}
 
 	return len(drifts) > 0, drifts

@@ -117,6 +117,13 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                      maxScaleDownRate:
+                        description: MaxScaleDownRate caps the percentage of running
+                          replicas removed per scale-down step
+                        format: int32
+                        maximum: 50
+                        minimum: 1
+                        type: integer
                       minReplicas:
                         description: MinReplicas is the minimum number of replicas
                         format: int32
