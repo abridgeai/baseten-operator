@@ -437,7 +437,8 @@ spec:
     autoscaling:
       minReplicas: 2
       maxReplicas: 10
-      concurrencyTarget: 20`
+      concurrencyTarget: 20
+      maxScaleDownRate: 10`
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -486,7 +487,8 @@ spec:
     autoscaling:
       minReplicas: 4
       maxReplicas: 20
-      concurrencyTarget: 30`
+      concurrencyTarget: 30
+      maxScaleDownRate: 10`
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(crUpdated)
 			_, err = utils.Run(cmd)
@@ -500,6 +502,21 @@ spec:
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("AutoscalingUpdated"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+
+			By("changing only maxScaleDownRate: the API server keeps the field and the operator reconciles it alone")
+			crRate := strings.Replace(crUpdated, "maxScaleDownRate: 10", "maxScaleDownRate: 20", 1)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(crRate)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "events", "-n", "default",
+					"--field-selector", "involvedObject.name=e2e-autoscaling,reason=AutoscalingUpdated",
+					"-o", "jsonpath={.items[*].message}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("maxScaleDownRate 10→20"))
 			}, 60*time.Second, 2*time.Second).Should(Succeed())
 		})
 

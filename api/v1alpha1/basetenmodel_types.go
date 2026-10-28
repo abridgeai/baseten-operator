@@ -566,6 +566,12 @@ type AutoscalingConfig struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=100
 	TargetUtilizationPercentage *int32 `json:"targetUtilizationPercentage,omitempty"`
+
+	// MaxScaleDownRate caps the percentage of running replicas removed per scale-down step
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=50
+	MaxScaleDownRate *int32 `json:"maxScaleDownRate,omitempty"`
 }
 
 // PromotionSettingsConfig defines promotion behavior settings
