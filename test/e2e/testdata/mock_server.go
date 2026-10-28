@@ -27,9 +27,10 @@ type deployment struct {
 }
 
 type autoscalingSettings struct {
-	MinReplica        int32 `json:"min_replica"`
-	MaxReplica        int32 `json:"max_replica"`
-	ConcurrencyTarget int32 `json:"concurrency_target"`
+	MinReplica        int32  `json:"min_replica"`
+	MaxReplica        int32  `json:"max_replica"`
+	ConcurrencyTarget int32  `json:"concurrency_target"`
+	MaxScaleDownRate  *int32 `json:"max_scale_down_rate,omitempty"`
 }
 
 type promotionSettings struct {
