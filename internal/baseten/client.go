@@ -186,12 +186,12 @@ type Environment struct {
 }
 
 // FindModelIDByName returns the ID of the model named modelName ("" if not found).
-// A non-empty team scopes the lookup to that team.
+// A non-empty team scopes the lookup to that team; without one, a name found in several teams is an error.
 func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) (string, error) {
 	var models *managementapi.Models
 	var err error
 	if team == "" {
-		models, err = c.api.GetModels(ctx, managementapi.GetV1ModelsParams{})
+		models, err = c.api.GetModels(ctx, managementapi.GetV1ModelsParams{Name: &modelName})
 	} else {
 		var teamID string
 		if teamID, err = c.findTeamID(ctx, team); err != nil {
@@ -202,12 +202,18 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) 
 	if err != nil {
 		return "", toAPIError(err)
 	}
+	var id string
+	var teams []string
 	for _, m := range models.Models {
 		if m.Name == modelName {
-			return m.Id, nil
+			id = m.Id
+			teams = append(teams, m.TeamName)
 		}
 	}
-	return "", nil
+	if len(teams) > 1 {
+		return "", fmt.Errorf("baseten model %q exists in teams %v; set spec.team to pick one", modelName, teams)
+	}
+	return id, nil
 }
 
 func (c *Client) findTeamID(ctx context.Context, team string) (string, error) {

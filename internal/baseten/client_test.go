@@ -541,6 +541,43 @@ func TestFindModelIDByName(t *testing.T) {
 			t.Errorf("StatusCode = %d, want 500", apiErr.StatusCode)
 		}
 	})
+
+	t.Run("org-wide lookup filters by name", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("name"); got != "my-model" {
+				t.Errorf("models name filter = %q, want my-model", got)
+			}
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{{Id: "m1", Name: "my-model"}}})
+		}))
+		defer srv.Close()
+
+		if _, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("same name in two teams is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{
+				{Id: "m-a", Name: "my-model", TeamName: "TeamA"},
+				{Id: "m-b", Name: "my-model", TeamName: "TeamB"},
+			}})
+		}))
+		defer srv.Close()
+
+		id, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "")
+		if err == nil || !strings.Contains(err.Error(), "spec.team") {
+			t.Fatalf("expected an ambiguity error naming spec.team, got id=%q err=%v", id, err)
+		}
+		for _, team := range []string{"TeamA", "TeamB"} {
+			if !strings.Contains(err.Error(), team) {
+				t.Errorf("ambiguity error %q does not name %s", err, team)
+			}
+		}
+		if id != "" {
+			t.Errorf("id = %q, want empty on ambiguity", id)
+		}
+	})
 }
 
 func TestFindModelIDByName_Team(t *testing.T) {
