@@ -511,7 +511,7 @@ var _ = Describe("BasetenModel Controller", func() {
 
 				result, err := reconcileModel(model)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
 
 				status := getModelStatus(name)
 				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
@@ -568,6 +568,32 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusBuilding))
 				Expect(status.Message).To(ContainSubstring("promoting:"))
 				Expect(status.CandidateDeploymentName).To(Equal(testSourceDep + ".222"))
+			})
+
+			It("should poll every 5 minutes only when the current deployment is the source and serving", func() {
+				cases := []struct {
+					name    string
+					current *baseten.Deployment
+					want    time.Duration
+				}{
+					{"observe-wait-scaled", &baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusScaledToZero}, 5 * time.Minute},
+					{"observe-wait-failed", &baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusFailed}, 30 * time.Second},
+					{"observe-wait-other", &baseten.Deployment{Name: "img-old-wgt-old-p-old.111", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3}, 30 * time.Second},
+					{"observe-wait-none", nil, 30 * time.Second},
+					{"observe-wait-unhealthy", &baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusUnhealthy}, 30 * time.Second},
+				}
+				for _, c := range cases {
+					model := newTestModel(c.name)
+					model.Spec.Mode = modelsv1alpha1.ModeObserve
+					mockModelFound()
+					mockEnvWithSettings(c.current, &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusDeploying})
+					expectNoMutations()
+
+					result, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RequeueAfter).To(Equal(c.want), c.name)
+					cleanupModel(c.name)
+				}
 			})
 
 			It("should report not-yet-promoted state without promoting", func() {

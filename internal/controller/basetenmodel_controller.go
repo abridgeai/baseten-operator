@@ -856,6 +856,10 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 		return ctrl.Result{}, err
 	}
 
+	if cur := env.CurrentDeployment; cur != nil && baseten.DeploymentNameMatchesPrefix(cur.Name, sourceDeploymentName) &&
+		(cur.Status == baseten.DeploymentStatusActive || cur.Status == baseten.DeploymentStatusScaledToZero) {
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
