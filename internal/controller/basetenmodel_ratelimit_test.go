@@ -753,6 +753,37 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
+	It("caps how far one long Retry-After pushes the failure clock", func() {
+		name := "rl-fold-cap"
+		defer cleanup(name)
+		Expect(k8sClient.Create(ctx, newModel(name))).To(Succeed())
+		started := time.Now().Add(-30 * time.Minute)
+		ft := metav1.NewTime(started)
+		model := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
+		model.Status.ModelID = rlModelID
+		model.Status.FirstDeploymentFailureTime = &ft
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		mockFound()
+		mockEnv(nil)
+		mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+			return rlSourceID, baseten.DeploymentStatusActive, nil
+		}
+		mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+			return nil, &baseten.APIError{
+				StatusCode: 429, Message: "slow down", HasRetryAfter: true, RetryAfter: time.Hour,
+			}
+		}
+		_, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		status := statusOf(name)
+		drift := status.FirstDeploymentFailureTime.Sub(started)
+		Expect(drift).To(BeNumerically("~", rateLimitFoldCap, 2*time.Second))
+		Expect(status.RateLimitWindowEnd).NotTo(BeNil())
+		Expect(status.RateLimitWindowEnd.Time).To(BeTemporally(">", time.Now().Add(30*time.Minute)))
+	})
+
 	It("waits at least one second when Retry-After is zero", func() {
 		name := "rl-floor"
 		defer cleanup(name)

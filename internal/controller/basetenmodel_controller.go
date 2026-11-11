@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
@@ -90,6 +91,10 @@ const (
 	// A zero result with a nil error is not requeued once status stops changing.
 	rateLimitMinDelay = time.Second
 
+	// rateLimitFoldCap bounds how far one 429 wait may push the 2h failure
+	// deadline. The requeue itself still honors a longer Retry-After.
+	rateLimitFoldCap = 5 * time.Minute
+
 	rateLimitMessage = "rate limited"
 )
 
@@ -103,10 +108,16 @@ type BasetenModelReconciler struct {
 	MaxConcurrentReconciles int           // concurrent reconcile workers (default 1)
 	PushSemaphore           chan struct{} // bounds concurrent async truss push goroutines
 
-	// rateLimitUntil records when a 429 wait was already folded into the failure
-	// clock, so a status-triggered requeue in the same window does not add it again.
+	// rateLimitUntil mirrors status.rateLimitWindowEnd for this process so a
+	// follow-up reconcile can skip the fold before it re-reads. The status
+	// field is the source of truth across restarts.
 	rateLimitMu    sync.Mutex
 	rateLimitUntil map[string]time.Time
+
+	// watchNamespace, when set, limits the watch to that namespace.
+	// controllerName overrides the controller name. Both are empty in production.
+	watchNamespace string
+	controllerName string
 }
 
 type statusUpdate struct {
@@ -121,6 +132,7 @@ type statusUpdate struct {
 	clearCandidate             bool
 	replicaCount               int32
 	firstDeploymentFailureTime *metav1.Time
+	rateLimitWindowEnd         *metav1.Time
 }
 
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels,verbs=get;list;watch;create;update;patch;delete
@@ -798,6 +810,7 @@ func (r *BasetenModelReconciler) resetFailureClockAfterPause(ctx context.Context
 		return
 	}
 	model.Status.FirstDeploymentFailureTime = nil
+	model.Status.RateLimitWindowEnd = nil
 	r.clearRateLimitWait(model)
 	if err := r.Status().Update(ctx, model); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to reset deployment failure clock after leaving pause")
@@ -1288,12 +1301,14 @@ func (r *BasetenModelReconciler) requeueIfRateLimited(ctx context.Context, model
 	if modelID == "" {
 		modelID = model.Status.ModelID
 	}
+	failure, windowEnd := r.foldRateLimitWait(model, delay)
 	r.logUpdateStatus(ctx, model, statusUpdate{
 		deploymentStatus:           statusRateLimited,
 		message:                    rateLimitMessage,
 		modelID:                    modelID,
 		replicaCount:               model.Status.ActiveReplicaCount,
-		firstDeploymentFailureTime: r.deferredFailureTime(model, delay),
+		firstDeploymentFailureTime: failure,
+		rateLimitWindowEnd:         windowEnd,
 	})
 	return ctrl.Result{RequeueAfter: delay}, true
 }
@@ -1331,27 +1346,57 @@ func (r *BasetenModelReconciler) noteRateLimit(ctx context.Context, model *model
 	return delay, true
 }
 
-// deferredFailureTime returns the failure clock pushed forward by one rate-limit
-// wait, or nil when this wait was already accounted for. The caller persists it
-// only as part of a real status write.
-func (r *BasetenModelReconciler) deferredFailureTime(model *modelsv1alpha1.BasetenModel, delay time.Duration) *metav1.Time {
-	current := model.Status.FirstDeploymentFailureTime
-	if current == nil || delay <= 0 {
-		return nil
+// foldRateLimitWait returns the failure clock and window end to persist for this
+// 429, or nils when the saved window already covers the wait. The fold is the
+// uncovered tail of the wait, capped, so a restart does not add the whole wait again.
+func (r *BasetenModelReconciler) foldRateLimitWait(model *modelsv1alpha1.BasetenModel, delay time.Duration) (*metav1.Time, *metav1.Time) {
+	if delay <= 0 {
+		return nil, nil
+	}
+	now := time.Now()
+	proposedEnd := now.Add(delay)
+	var covered time.Time
+	if model.Status.RateLimitWindowEnd != nil {
+		covered = model.Status.RateLimitWindowEnd.Time
 	}
 	key := model.Namespace + "/" + model.Name
-	now := time.Now()
 	r.rateLimitMu.Lock()
-	defer r.rateLimitMu.Unlock()
+	cached, hasCache := time.Time{}, false
+	if r.rateLimitUntil != nil {
+		cached, hasCache = r.rateLimitUntil[key]
+	}
+	r.rateLimitMu.Unlock()
+	// Cache is an optimization: trust it only when status already records the same window.
+	if hasCache && now.Before(cached) && !covered.Add(time.Second).Before(cached) {
+		return nil, nil
+	}
+
+	var uncovered time.Duration
+	switch {
+	case covered.IsZero() || !covered.After(now):
+		uncovered = delay
+	case proposedEnd.After(covered.Add(time.Second)):
+		uncovered = proposedEnd.Sub(covered)
+	default:
+		return nil, nil
+	}
+	if uncovered > rateLimitFoldCap {
+		uncovered = rateLimitFoldCap
+	}
+
+	var failure *metav1.Time
+	if uncovered > 0 && model.Status.FirstDeploymentFailureTime != nil {
+		t := metav1.NewTime(model.Status.FirstDeploymentFailureTime.Add(uncovered))
+		failure = &t
+	}
+	end := metav1.NewTime(proposedEnd)
+	r.rateLimitMu.Lock()
 	if r.rateLimitUntil == nil {
 		r.rateLimitUntil = map[string]time.Time{}
 	}
-	if until, ok := r.rateLimitUntil[key]; ok && now.Before(until) {
-		return nil
-	}
-	shifted := metav1.NewTime(current.Add(delay))
-	r.rateLimitUntil[key] = now.Add(delay)
-	return &shifted
+	r.rateLimitUntil[key] = proposedEnd
+	r.rateLimitMu.Unlock()
+	return failure, &end
 }
 
 func (r *BasetenModelReconciler) clearRateLimitWait(model *modelsv1alpha1.BasetenModel) {
@@ -1699,8 +1744,12 @@ func (r *BasetenModelReconciler) recordPushRateLimit(modelName, namespace, deplo
 			return err
 		}
 		delay = rateLimitDelay(pushErr)
-		if shifted := r.deferredFailureTime(model, delay); shifted != nil {
-			model.Status.FirstDeploymentFailureTime = shifted
+		failure, windowEnd := r.foldRateLimitWait(model, delay)
+		if failure != nil {
+			model.Status.FirstDeploymentFailureTime = failure
+		}
+		if windowEnd != nil {
+			model.Status.RateLimitWindowEnd = windowEnd
 		}
 		next := metav1.NewTime(time.Now().Add(delay))
 		model.Status.TrussPushStatus = statusTrussPushFailed
@@ -2154,6 +2203,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		candidateDeploymentID:   model.Status.CandidateDeploymentID,
 		candidateDeploymentName: model.Status.CandidateDeploymentName,
 		failureUnix:             failureUnix(model.Status.FirstDeploymentFailureTime),
+		rateLimitWindowUnix:     failureUnix(model.Status.RateLimitWindowEnd),
 	}
 
 	model.Status.DeploymentStatus = s.deploymentStatus
@@ -2192,9 +2242,13 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		model.Status.FirstDeploymentFailureTime = nil
 		model.Status.DeploymentRetryCount = 0
 		model.Status.NextRetryTime = nil
+		model.Status.RateLimitWindowEnd = nil
 		r.clearRateLimitWait(model)
 	} else if s.firstDeploymentFailureTime != nil {
 		model.Status.FirstDeploymentFailureTime = s.firstDeploymentFailureTime
+	}
+	if s.rateLimitWindowEnd != nil {
+		model.Status.RateLimitWindowEnd = s.rateLimitWindowEnd
 	}
 
 	readyStatus := metav1.ConditionFalse
@@ -2234,6 +2288,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		candidateDeploymentID:   model.Status.CandidateDeploymentID,
 		candidateDeploymentName: model.Status.CandidateDeploymentName,
 		failureUnix:             failureUnix(model.Status.FirstDeploymentFailureTime),
+		rateLimitWindowUnix:     failureUnix(model.Status.RateLimitWindowEnd),
 	}
 	if curr == prev && !conditionsChanged(beforeConditions, model.Generation, s.deploymentStatus, s.message, readyStatus, progressingStatus) {
 		return nil
@@ -2254,6 +2309,7 @@ type statusSnapshot struct {
 	candidateDeploymentID   string
 	candidateDeploymentName string
 	failureUnix             int64
+	rateLimitWindowUnix     int64
 }
 
 func failureUnix(t *metav1.Time) int64 {
@@ -2304,9 +2360,18 @@ func (r *BasetenModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	name := r.controllerName
+	if name == "" {
+		name = "basetenmodel"
+	}
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&modelsv1alpha1.BasetenModel{}).
-		Named("basetenmodel").
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent}).
-		Complete(r)
+		Named(name).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent})
+	if ns := r.watchNamespace; ns != "" {
+		builder = builder.WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == ns
+		}))
+	}
+	return builder.Complete(r)
 }

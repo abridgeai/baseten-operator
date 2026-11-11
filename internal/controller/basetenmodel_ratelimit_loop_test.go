@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -13,10 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
 	"github.com/abridgeai/baseten-operator/internal/baseten"
@@ -71,7 +69,9 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 	}
 
-	startManager := func(cancel context.CancelFunc, ctx context.Context, ns string, mc *baseten.MockClient) {
+	var managers atomic.Int32
+
+	startManager := func(cancel context.CancelFunc, ctx context.Context, ns string, mc *baseten.MockClient, window time.Duration) {
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: k8sClient.Scheme(),
 			Metrics: metricsserver.Options{
@@ -98,21 +98,11 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 			BasetenClient:           mc,
 			TrussPusher:             &truss.MockPusher{},
 			Recorder:                rec,
-			MaxConcurrentReconciles: 1,
+			MaxConcurrentReconciles: 5,
+			watchNamespace:          ns,
+			controllerName:          fmt.Sprintf("basetenmodel-%s-%d", ns, managers.Add(1)),
 		}
-		pred := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetNamespace() == ns
-		})
-		Expect(ctrl.NewControllerManagedBy(mgr).
-			For(&modelsv1alpha1.BasetenModel{}).
-			Named("basetenmodel-loop-" + ns).
-			WithEventFilter(predicate.Funcs{
-				CreateFunc:  func(e event.CreateEvent) bool { return pred.Create(e) },
-				UpdateFunc:  func(e event.UpdateEvent) bool { return pred.Update(e) },
-				DeleteFunc:  func(e event.DeleteEvent) bool { return pred.Delete(e) },
-				GenericFunc: func(e event.GenericEvent) bool { return pred.Generic(e) },
-			}).
-			Complete(reconciler)).To(Succeed())
+		Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
 
 		done := make(chan struct{})
 		go func() {
@@ -123,7 +113,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 			}
 		}()
 		Expect(mgr.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
-		time.Sleep(loopWindow)
+		time.Sleep(window)
 		cancel()
 		Eventually(done).WithTimeout(10 * time.Second).Should(BeClosed())
 	}
@@ -155,7 +145,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "GetEnvironment calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -190,7 +180,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "Promote calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -222,7 +212,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "DeleteModel calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -246,7 +236,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "FindModelID calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -289,7 +279,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "UpdateEnvironmentSettings calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -340,7 +330,7 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "UpdateAutoscalingSchedules calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
@@ -373,12 +363,89 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		startManager(cancel, ctx, ns, mc)
+		startManager(cancel, ctx, ns, mc, loopWindow)
 
 		Expect(calls.Load()).To(BeNumerically("<=", loopCallCeiling), "FindDeployment calls=%d", calls.Load())
 		got := &modelsv1alpha1.BasetenModel{}
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
 		Expect(got.Status.FirstDeploymentFailureTime.Time).To(BeTemporally("~", started, 2*time.Second))
+	})
+
+	It("folds one rate-limit window when a second manager starts inside that window", func() {
+		ns := prepareNS("rl-loop-restart")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		started := time.Now().Add(-30 * time.Minute)
+		model.Status.ModelID = loopModelID
+		ft := metav1.NewTime(started)
+		model.Status.FirstDeploymentFailureTime = &ft
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		promoteErr := &baseten.APIError{
+			StatusCode: 429, Message: "slow down", HasRetryAfter: true, RetryAfter: 30 * time.Second,
+		}
+		newMock := func(calls *atomic.Int32) *baseten.MockClient {
+			return &baseten.MockClient{
+				GetEnvironmentFunc: func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{Name: loopEnv, AutoscalingSettings: testAutoscalingSettings()}, nil
+				},
+				FindDeploymentIDByNameFunc: func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return loopSourceID, baseten.DeploymentStatusActive, nil
+				},
+				PromoteFunc: func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					calls.Add(1)
+					return nil, promoteErr
+				},
+			}
+		}
+
+		var firstCalls atomic.Int32
+		ctx1, cancel1 := context.WithCancel(context.Background())
+		startManager(cancel1, ctx1, ns, newMock(&firstCalls), loopWindow)
+		Expect(firstCalls.Load()).To(BeNumerically(">=", 1))
+
+		afterFirst := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, afterFirst)).To(Succeed())
+		firstDrift := afterFirst.Status.FirstDeploymentFailureTime.Sub(started)
+
+		var secondCalls atomic.Int32
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		startManager(cancel2, ctx2, ns, newMock(&secondCalls), loopWindow)
+		Expect(secondCalls.Load()).To(BeNumerically(">=", 1))
+
+		afterSecond := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, afterSecond)).To(Succeed())
+		totalDrift := afterSecond.Status.FirstDeploymentFailureTime.Sub(started)
+		extra := totalDrift - firstDrift
+		Expect(extra).To(BeNumerically("<", 20*time.Second), "extra drift=%s total=%s first=%s", extra, totalDrift, firstDrift)
+		Expect(totalDrift).To(BeNumerically("<", 55*time.Second), "total drift=%s", totalDrift)
+		Expect(totalDrift).To(BeNumerically(">", 25*time.Second), "total drift=%s", totalDrift)
+	})
+
+	It("requeues after a Retry-After of zero", func() {
+		ns := prepareNS("rl-loop-zero")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.ModelID = loopModelID
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		var calls atomic.Int32
+		mc := &baseten.MockClient{
+			GetEnvironmentFunc: func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+				calls.Add(1)
+				return nil, &baseten.APIError{
+					StatusCode: 429, Message: "slow down", HasRetryAfter: true, RetryAfter: 0,
+				}
+			},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// No status write on this housekeeping 429, so the only requeue is the timer.
+		// Floor is 1s and header jitter is at most 5s; 12s must fire it at least once more.
+		startManager(cancel, ctx, ns, mc, 12*time.Second)
+		Expect(calls.Load()).To(BeNumerically(">=", 2), "GetEnvironment calls=%d", calls.Load())
+		Expect(calls.Load()).To(BeNumerically("<=", 20), "GetEnvironment calls=%d", calls.Load())
 	})
 })

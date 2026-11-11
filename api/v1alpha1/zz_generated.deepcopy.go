@@ -250,6 +250,10 @@ func (in *BasetenModelStatus) DeepCopyInto(out *BasetenModelStatus) {
 		in, out := &in.NextRetryTime, &out.NextRetryTime
 		*out = (*in).DeepCopy()
 	}
+	if in.RateLimitWindowEnd != nil {
+		in, out := &in.RateLimitWindowEnd, &out.RateLimitWindowEnd
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))
