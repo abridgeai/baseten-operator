@@ -91,8 +91,10 @@ const (
 	// A zero result with a nil error is not requeued once status stops changing.
 	rateLimitMinDelay = time.Second
 
-	// rateLimitFoldCap bounds how far one 429 wait may push the 2h failure
-	// deadline. The requeue itself still honors a longer Retry-After.
+	// rateLimitFoldCap bounds how far one 429 wait may push the stored 2h
+	// failure clock. The requeue still honors a longer Retry-After. The
+	// deadline check does not run until that saved window has passed, so the
+	// rest of the wait cannot exhaust retries while Baseten is still refusing calls.
 	rateLimitFoldCap = 5 * time.Minute
 
 	rateLimitMessage = "rate limited"
@@ -689,6 +691,11 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 		return r.releaseFinalizer(ctx, model)
 	}
 
+	// A delete 429 already folded its wait. Do not call Baseten again until then.
+	if result, waiting := openRateLimitWindow(ctx, model); waiting {
+		return result, nil
+	}
+
 	// Guardrails: refuse to delete a model with any environment still serving.
 	if policy == modelsv1alpha1.DeletionPolicyDeleteWithGuardrails {
 		blockers, err := r.checkDeleteGuardrails(ctx, modelID)
@@ -859,6 +866,10 @@ func effectiveMode(model *modelsv1alpha1.BasetenModel) modelsv1alpha1.ReconcileM
 func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Observing BasetenModel (read-only)", "name", model.Name)
+
+	if result, waiting := openRateLimitWindow(ctx, model); waiting {
+		return result, nil
+	}
 
 	// Resolve modelID (cached if available; otherwise lookup by name). Never creates.
 	modelID := model.Status.ModelID
@@ -1088,8 +1099,12 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 ) (*ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
 
-	// The clock starts only after a retry attempt that was not a 429, and 429 waits
-	// are added back onto it in requeueIfRateLimited so they do not count toward 2h.
+	// The clock starts only after a retry attempt that was not a 429. While a
+	// saved 429 window is still open this wait is not a retry, and it must not
+	// exhaust the deadline before Baseten will accept another call.
+	if result, waiting := openRateLimitWindow(ctx, model); waiting {
+		return &result, true
+	}
 	if model.Status.FirstDeploymentFailureTime != nil && time.Since(model.Status.FirstDeploymentFailureTime.Time) > deploymentRetryDeadline {
 		logger.Info("Deployment retry deadline exceeded", "deploymentName", deploymentName, "firstFailure", model.Status.FirstDeploymentFailureTime.Time)
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventDeploymentRetryExhausted,
@@ -1346,6 +1361,23 @@ func (r *BasetenModelReconciler) noteRateLimit(ctx context.Context, model *model
 	return delay, true
 }
 
+// openRateLimitWindow is the remaining time of a 429 wait already stored on the
+// CR. The fold into the failure clock stays capped, so one long Retry-After
+// cannot grant hours of extra retry budget. Skipping the deadline until this
+// window ends is what keeps that wait from burning the 2h budget: the check
+// runs only after Baseten will take calls again, against the stored clock.
+func openRateLimitWindow(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, bool) {
+	if model.Status.RateLimitWindowEnd == nil {
+		return ctrl.Result{}, false
+	}
+	remaining := time.Until(model.Status.RateLimitWindowEnd.Time)
+	if remaining <= 0 {
+		return ctrl.Result{}, false
+	}
+	log.FromContext(ctx).Info("rate limit window still open", "requeueAfter", remaining)
+	return ctrl.Result{RequeueAfter: remaining}, true
+}
+
 // foldRateLimitWait returns the failure clock and window end to persist for this
 // 429, or nils when the saved window already covers the wait. The fold is the
 // uncovered tail of the wait, capped, so a restart does not add the whole wait again.
@@ -1407,6 +1439,12 @@ func (r *BasetenModelReconciler) clearRateLimitWait(model *modelsv1alpha1.Basete
 
 func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *modelsv1alpha1.BasetenModel) (string, *ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Before any Baseten call. A watch event during the window lands here too,
+	// so it cannot reach the 2h deadline check.
+	if result, waiting := openRateLimitWindow(ctx, model); waiting {
+		return "", &result, nil
+	}
 
 	// Use cached model ID from status if available (persisted in API server across reconciles)
 	if model.Status.ModelID != "" {

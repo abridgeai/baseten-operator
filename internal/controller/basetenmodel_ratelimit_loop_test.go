@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
@@ -71,7 +73,9 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 
 	var managers atomic.Int32
 
-	startManager := func(cancel context.CancelFunc, ctx context.Context, ns string, mc *baseten.MockClient, window time.Duration) {
+	// launchManager starts a real controller for ns and returns a wait that
+	// blocks until ctx is canceled and the manager has stopped. onEvent may be nil.
+	launchManager := func(ctx context.Context, ns string, mc *baseten.MockClient, onEvent func(string)) func() {
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: k8sClient.Scheme(),
 			Metrics: metricsserver.Options{
@@ -86,7 +90,10 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		go func() {
 			for {
 				select {
-				case <-rec.Events:
+				case e := <-rec.Events:
+					if onEvent != nil {
+						onEvent(e)
+					}
 				case <-ctx.Done():
 					return
 				}
@@ -113,9 +120,35 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 			}
 		}()
 		Expect(mgr.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
+		return func() {
+			Eventually(done).WithTimeout(10 * time.Second).Should(BeClosed())
+		}
+	}
+
+	startManager := func(cancel context.CancelFunc, ctx context.Context, ns string, mc *baseten.MockClient, window time.Duration) {
+		wait := launchManager(ctx, ns, mc, nil)
 		time.Sleep(window)
 		cancel()
-		Eventually(done).WithTimeout(10 * time.Second).Should(BeClosed())
+		wait()
+	}
+
+	failedCandidate := func(calls *atomic.Int32) *baseten.MockClient {
+		return &baseten.MockClient{
+			GetEnvironmentFunc: func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+				calls.Add(1)
+				return &baseten.Environment{
+					Name: loopEnv,
+					CandidateDeployment: &baseten.Deployment{
+						ID: "cand-loop", Name: loopSource + ".1", Status: baseten.DeploymentStatusBuildFailed,
+					},
+					AutoscalingSettings: testAutoscalingSettings(),
+				}, nil
+			},
+			RetryDeploymentFunc: func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+				calls.Add(1)
+				return &baseten.RetryResponse{Retried: true}, nil
+			},
+		}
 	}
 
 	prepareNS := func(name string) string {
@@ -413,7 +446,9 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		ctx2, cancel2 := context.WithCancel(context.Background())
 		defer cancel2()
 		startManager(cancel2, ctx2, ns, newMock(&secondCalls), loopWindow)
-		Expect(secondCalls.Load()).To(BeNumerically(">=", 1))
+		// The saved window is still open, so this manager waits it out instead of
+		// calling Promote again. A tail fold of a couple of seconds is still one window.
+		Expect(secondCalls.Load()).To(BeNumerically("<=", 1))
 
 		afterSecond := &modelsv1alpha1.BasetenModel{}
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, afterSecond)).To(Succeed())
@@ -447,5 +482,131 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		startManager(cancel, ctx, ns, mc, 12*time.Second)
 		Expect(calls.Load()).To(BeNumerically(">=", 2), "GetEnvironment calls=%d", calls.Load())
 		Expect(calls.Load()).To(BeNumerically("<=", 20), "GetEnvironment calls=%d", calls.Load())
+	})
+
+	seedExhausted := func(ns string, windowEnd time.Time) {
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		ft := metav1.NewTime(time.Now().Add(-2*time.Hour - time.Minute))
+		we := metav1.NewTime(windowEnd)
+		model.Status.ModelID = loopModelID
+		model.Status.FirstDeploymentFailureTime = &ft
+		model.Status.RateLimitWindowEnd = &we
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+	}
+
+	It("requeues to the window end when the 2h deadline is already exceeded", func() {
+		ns := prepareNS("rl-loop-window")
+		// Long enough that a 2s sample is still inside it, short enough that the
+		// same manager reaches the deadline check once it has passed.
+		windowEnd := time.Now().Add(6 * time.Second)
+		seedExhausted(ns, windowEnd)
+
+		var calls atomic.Int32
+		var firstCall atomic.Int64
+		var mu sync.Mutex
+		var events []string
+		mc := failedCandidate(&calls)
+		mc.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+			firstCall.CompareAndSwap(0, time.Now().UnixNano())
+			calls.Add(1)
+			return &baseten.Environment{
+				Name: loopEnv,
+				CandidateDeployment: &baseten.Deployment{
+					ID: "cand-loop", Name: loopSource + ".1", Status: baseten.DeploymentStatusBuildFailed,
+				},
+				AutoscalingSettings: testAutoscalingSettings(),
+			}, nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, mc, func(e string) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+		})
+
+		time.Sleep(2 * time.Second)
+		Expect(calls.Load()).To(Equal(int32(0)))
+		mu.Lock()
+		seen := append([]string(nil), events...)
+		mu.Unlock()
+		Expect(seen).NotTo(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
+
+		Eventually(func(g Gomega) {
+			g.Expect(time.Now()).To(BeTemporally(">", windowEnd))
+			g.Expect(calls.Load()).To(BeNumerically(">=", 1))
+			mu.Lock()
+			defer mu.Unlock()
+			g.Expect(events).To(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
+		}).WithTimeout(12 * time.Second).WithPolling(200 * time.Millisecond).Should(Succeed())
+		// The deadline fired from the requeue at the window, not from a hot loop.
+		Expect(calls.Load()).To(BeNumerically("<=", 4), "calls=%d", calls.Load())
+		Expect(time.Unix(0, firstCall.Load())).To(BeTemporally(">=", windowEnd.Add(-time.Second)))
+
+		cancel()
+		wait()
+	})
+
+	It("exhausts retries when the rate-limit window has already passed", func() {
+		ns := prepareNS("rl-loop-window-past")
+		seedExhausted(ns, time.Now().Add(-time.Minute))
+
+		var calls atomic.Int32
+		var mu sync.Mutex
+		var events []string
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, failedCandidate(&calls), func(e string) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+		})
+		Eventually(func(g Gomega) {
+			g.Expect(calls.Load()).To(BeNumerically(">=", 1))
+			mu.Lock()
+			defer mu.Unlock()
+			g.Expect(events).To(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		cancel()
+		wait()
+	})
+
+	It("does not exhaust retries when a watch fires during an open rate-limit window", func() {
+		ns := prepareNS("rl-loop-window-watch")
+		seedExhausted(ns, time.Now().Add(50*time.Minute))
+
+		var calls atomic.Int32
+		var mu sync.Mutex
+		var events []string
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, failedCandidate(&calls), func(e string) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+		})
+
+		time.Sleep(2 * time.Second)
+		Expect(calls.Load()).To(Equal(int32(0)))
+
+		fresh := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, fresh)).To(Succeed())
+		base := fresh.DeepCopy()
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations["baseten.ai/poke"] = "1"
+		Expect(k8sClient.Patch(context.Background(), fresh, client.MergeFrom(base))).To(Succeed())
+
+		time.Sleep(2 * time.Second)
+		Expect(calls.Load()).To(Equal(int32(0)))
+		mu.Lock()
+		seen := append([]string(nil), events...)
+		mu.Unlock()
+		Expect(seen).NotTo(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
+
+		cancel()
+		wait()
 	})
 })

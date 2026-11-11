@@ -784,6 +784,74 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(status.RateLimitWindowEnd.Time).To(BeTemporally(">", time.Now().Add(30*time.Minute)))
 	})
 
+	It("waits out an open rate-limit window without exhausting retries or calling Baseten", func() {
+		name := "rl-window-open"
+		defer cleanup(name)
+		Expect(k8sClient.Create(ctx, newModel(name))).To(Succeed())
+		model := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
+		past := metav1.NewTime(time.Now().Add(-2*time.Hour - time.Minute))
+		windowEnd := time.Now().Add(50 * time.Minute)
+		window := metav1.NewTime(windowEnd)
+		model.Status.ModelID = rlModelID
+		model.Status.FirstDeploymentFailureTime = &past
+		model.Status.RateLimitWindowEnd = &window
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		called := false
+		mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+			called = true
+			return "", fmt.Errorf("lookup")
+		}
+		mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+			called = true
+			return nil, fmt.Errorf("getenv")
+		}
+		mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+			called = true
+			return nil, fmt.Errorf("retry")
+		}
+
+		result, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(called).To(BeFalse())
+		Expect(result.RequeueAfter).To(BeNumerically("~", time.Until(windowEnd), 2*time.Second))
+		Expect(statusOf(name).Message).NotTo(ContainSubstring("retries exhausted"))
+		Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
+	})
+
+	It("exhausts retries once a rate-limit window has passed and the deadline is exceeded", func() {
+		name := "rl-window-passed"
+		defer cleanup(name)
+		Expect(k8sClient.Create(ctx, newModel(name))).To(Succeed())
+		model := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
+		past := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+		window := metav1.NewTime(time.Now().Add(-time.Minute))
+		model.Status.ModelID = rlModelID
+		model.Status.FirstDeploymentFailureTime = &past
+		model.Status.RateLimitWindowEnd = &window
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+			return &baseten.Environment{
+				Name: rlEnvName,
+				CandidateDeployment: &baseten.Deployment{
+					ID: "cand-123", Name: rlSource + ".123", Status: baseten.DeploymentStatusBuildFailed,
+				},
+				AutoscalingSettings: testAutoscalingSettings(),
+			}, nil
+		}
+		mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+			Fail("retry API should not be called after the deadline")
+			return nil, nil
+		}
+
+		_, err := reconcileByName(name)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("retries exhausted"))
+	})
+
 	It("waits at least one second when Retry-After is zero", func() {
 		name := "rl-floor"
 		defer cleanup(name)
