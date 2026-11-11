@@ -162,7 +162,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(result.RequeueAfter).To(BeNumerically("<=", after+5*time.Second))
 	}
 
-	It("retries a 429 from model lookup within a minute without changing status", func() {
+	It("writes one initial status when model lookup is rate limited on a new CR", func() {
 		name := "rl-lookup"
 		defer cleanup(name)
 		mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
@@ -173,11 +173,23 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
 		status := statusOf(name)
-		Expect(status.DeploymentStatus).To(BeEmpty())
-		Expect(status.Message).To(BeEmpty())
+		Expect(status.DeploymentStatus).To(Equal(statusRateLimited))
+		Expect(status.Message).To(Equal(rateLimitMessage))
+		ready := getCondition(status.Conditions, "Ready")
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+		Expect(ready.Reason).To(Equal(statusRateLimited))
 		events := drainEvents()
 		Expect(events).To(ContainElement(ContainSubstring("RateLimited")))
 		Expect(events).NotTo(ContainElement(ContainSubstring("ModelNotFound")))
+
+		// A second 429 does not write a different status.
+		result, err = reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		again := statusOf(name)
+		Expect(again.DeploymentStatus).To(Equal(statusRateLimited))
+		Expect(again.Message).To(Equal(rateLimitMessage))
 	})
 
 	It("keeps Ready when GetEnvironment is rate limited on a serving model", func() {
@@ -459,7 +471,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(statusOf(name).TrussPushStatus).To(BeEmpty())
 	})
 
-	It("retries a 429 from observe-mode model lookup without marking the model rate limited", func() {
+	It("writes one initial status when observe-mode model lookup is rate limited on a new CR", func() {
 		name := "rl-observe-lookup"
 		model := newModel(name)
 		model.Spec.Mode = modelsv1alpha1.ModeObserve
@@ -471,8 +483,38 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
-		Expect(statusOf(name).DeploymentStatus).NotTo(Equal(statusRateLimited))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(statusRateLimited))
+		Expect(getCondition(status.Conditions, "Ready")).NotTo(BeNil())
 		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
+	})
+
+	It("advances Ready observedGeneration when the spec changes and the deployment stays active", func() {
+		name := "rl-observed-generation"
+		defer cleanup(name)
+		mockFound()
+		mockEnv(&baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1})
+		_, err := reconcile(newModel(name))
+		Expect(err).NotTo(HaveOccurred())
+		first := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, first)).To(Succeed())
+		ready := getCondition(first.Status.Conditions, "Ready")
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.ObservedGeneration).To(Equal(first.Generation))
+
+		oldGeneration := first.Generation
+		first.Spec.Team = "Evals"
+		Expect(k8sClient.Update(ctx, first)).To(Succeed())
+		_, err = reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		second := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, second)).To(Succeed())
+		Expect(second.Generation).NotTo(Equal(oldGeneration))
+		ready = getCondition(second.Status.Conditions, "Ready")
+		Expect(ready.ObservedGeneration).To(Equal(second.Generation))
+		Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+		progressing := getCondition(second.Status.Conditions, "Progressing")
+		Expect(progressing.ObservedGeneration).To(Equal(second.Generation))
 	})
 
 	It("retries a 429 from observe-mode GetEnvironment without marking the model rate limited", func() {
