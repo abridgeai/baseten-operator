@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
+	trussgo "github.com/basetenlabs/truss-go"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -137,7 +139,7 @@ var _ = Describe("Baseten API rate limits", func() {
 
 		status := statusOf(name)
 		Expect(status.Message).To(Equal("rate limited"))
-		Expect(status.DeploymentStatus).To(Equal("RateLimited"))
+		Expect(status.DeploymentStatus).To(Equal(statusRateLimited))
 		Expect(status.DeploymentRetryCount).To(Equal(int32(0)))
 		Expect(status.NextRetryTime).To(BeNil())
 
@@ -147,7 +149,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		progressing := getCondition(status.Conditions, "Progressing")
 		Expect(progressing).NotTo(BeNil())
 		Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
-		Expect(progressing.Reason).To(Equal("RateLimited"))
+		Expect(progressing.Reason).To(Equal(statusRateLimited))
 
 		events := drainEvents()
 		Expect(events).To(ContainElement(ContainSubstring("RateLimited")))
@@ -160,26 +162,49 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(result.RequeueAfter).To(BeNumerically("<=", after+5*time.Second))
 	}
 
-	It("retries a 429 from model lookup within a minute", func() {
+	It("retries a 429 from model lookup within a minute without changing status", func() {
 		name := "rl-lookup"
 		defer cleanup(name)
 		mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
 			return "", rateLimited(0)
 		}
 		result, err := reconcile(newModel(name))
-		events := expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(BeEmpty())
+		Expect(status.Message).To(BeEmpty())
+		events := drainEvents()
+		Expect(events).To(ContainElement(ContainSubstring("RateLimited")))
 		Expect(events).NotTo(ContainElement(ContainSubstring("ModelNotFound")))
 	})
 
-	It("retries a 429 from GetEnvironment within a minute", func() {
+	It("keeps Ready when GetEnvironment is rate limited on a serving model", func() {
 		name := "rl-get-env"
 		defer cleanup(name)
 		mockFound()
+		mockEnv(&baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 2})
+		_, err := reconcile(newModel(name))
+		Expect(err).NotTo(HaveOccurred())
+		seed := statusOf(name)
+		Expect(getCondition(seed.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		drainEvents()
+
 		mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
 			return nil, rateLimited(0)
 		}
-		result, err := reconcile(newModel(name))
-		expectSoon(name, result, err)
+		result, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(seed.DeploymentStatus))
+		Expect(status.Message).To(Equal(seed.Message))
+		ready := getCondition(status.Conditions, "Ready")
+		Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+		Expect(ready.Reason).To(Equal(baseten.DeploymentStatusActive))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from CreateEnvironment within a minute", func() {
@@ -196,24 +221,38 @@ var _ = Describe("Baseten API rate limits", func() {
 		expectSoon(name, result, err)
 	})
 
-	It("retries a 429 from UpdateEnvironmentSettings within a minute", func() {
+	It("keeps Ready when a settings-drift update is rate limited", func() {
 		name := "rl-update-settings"
 		defer cleanup(name)
 		mockFound()
+		mockEnv(&baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1})
+		_, err := reconcile(newModel(name))
+		Expect(err).NotTo(HaveOccurred())
+		seed := statusOf(name)
+		drainEvents()
+
 		mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
 			return &baseten.Environment{
 				Name:                rlEnvName,
+				CurrentDeployment:   &baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
 				AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 5, ConcurrencyTarget: 10},
 			}, nil
 		}
 		mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
 			return rateLimited(0)
 		}
-		result, err := reconcile(newModel(name))
-		expectSoon(name, result, err)
+		result, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(seed.DeploymentStatus))
+		Expect(status.Message).To(Equal(seed.Message))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
-	It("retries a 429 from UpdateAutoscalingSchedules within a minute", func() {
+	It("retries a 429 from UpdateAutoscalingSchedules without marking the model rate limited", func() {
 		name := "rl-update-schedules"
 		model := newModel(name)
 		model.Spec.Environment.AutoscalingSchedule = &modelsv1alpha1.AutoscalingScheduleConfig{
@@ -234,7 +273,11 @@ var _ = Describe("Baseten API rate limits", func() {
 			return rateLimited(0)
 		}
 		result, err := reconcile(model)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		Expect(statusOf(name).DeploymentStatus).NotTo(Equal(statusRateLimited))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from Promote within a minute and honors Retry-After", func() {
@@ -316,6 +359,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		result, err := reconcile(newModel(name))
 		events := expectSoon(name, result, err)
 		Expect(events).NotTo(ContainElement(ContainSubstring("DeploymentRetryFailed")))
+		Expect(statusOf(name).FirstDeploymentFailureTime).To(BeNil())
 	})
 
 	It("does not push NextRetryTime out when the retry API returns 429", func() {
@@ -350,6 +394,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(status.NextRetryTime).NotTo(BeNil())
 		Expect(status.NextRetryTime.Time).To(BeTemporally("~", pastRetry.Time, time.Second))
 		Expect(status.Message).To(Equal("rate limited"))
+		Expect(status.FirstDeploymentFailureTime.Time).To(BeTemporally("~", firstFailure.Add(result.RequeueAfter), 2*time.Second))
 	})
 
 	It("retries a 429 from source deployment lookup without entering the retry budget", func() {
@@ -366,8 +411,12 @@ var _ = Describe("Baseten API rate limits", func() {
 			return nil, nil
 		}
 		result, err := reconcile(newModel(name))
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		Expect(statusOf(name).DeploymentStatus).NotTo(Equal(statusRateLimited))
 		Expect(retryCalled).To(BeFalse())
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from the pre-retry status check without calling retry or bumping the count", func() {
@@ -410,7 +459,7 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(statusOf(name).TrussPushStatus).To(BeEmpty())
 	})
 
-	It("retries a 429 from observe-mode model lookup within a minute", func() {
+	It("retries a 429 from observe-mode model lookup without marking the model rate limited", func() {
 		name := "rl-observe-lookup"
 		model := newModel(name)
 		model.Spec.Mode = modelsv1alpha1.ModeObserve
@@ -419,22 +468,33 @@ var _ = Describe("Baseten API rate limits", func() {
 			return "", rateLimited(0)
 		}
 		result, err := reconcile(model)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		Expect(statusOf(name).DeploymentStatus).NotTo(Equal(statusRateLimited))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
-	It("retries a 429 from observe-mode GetEnvironment within a minute", func() {
+	It("retries a 429 from observe-mode GetEnvironment without marking the model rate limited", func() {
 		name := "rl-observe-env"
 		model := newModel(name)
 		model.Spec.Mode = modelsv1alpha1.ModeObserve
 		defer cleanup(name)
 		Expect(k8sClient.Create(ctx, model)).To(Succeed())
 		model.Status.ModelID = rlModelID
+		model.Status.DeploymentStatus = baseten.DeploymentStatusActive
+		model.Status.Message = "active: kept"
 		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 		mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
 			return nil, rateLimited(0)
 		}
 		result, err := reconcileByName(name)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(status.Message).To(Equal("active: kept"))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from DeleteModel within a minute and keeps the finalizer", func() {
@@ -500,7 +560,43 @@ var _ = Describe("Baseten API rate limits", func() {
 			return nil, rateLimited(0)
 		}
 		result, err := reconcile(model)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(status.LastCleanupTime).To(BeNil())
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
+	})
+
+	It("keeps Ready when ListEnvironments is rate limited during orphan cleanup", func() {
+		name := "rl-orphan-list-envs"
+		model := newModel(name)
+		model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+			ScaleToZero:     ptr(true),
+			IntervalMinutes: ptr(int32(10)),
+		}
+		defer cleanup(name)
+		mockFound()
+		mockEnv(&baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1})
+		mockClient.ListDeploymentsFunc = func(ctx context.Context, modelID string) ([]baseten.DeploymentDetail, error) {
+			return []baseten.DeploymentDetail{{ID: "orphan-1", Name: "old-deploy", Status: baseten.DeploymentStatusInactive}}, nil
+		}
+		mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+			return nil, rateLimited(0)
+		}
+		result, err := reconcile(model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(status.Message).To(ContainSubstring("active:"))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(getCondition(status.Conditions, "Ready").Reason).NotTo(Equal(statusRateLimited))
+		Expect(status.LastCleanupTime).To(BeNil())
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from scaling in an orphan deployment", func() {
@@ -528,7 +624,55 @@ var _ = Describe("Baseten API rate limits", func() {
 			return rateLimited(0)
 		}
 		result, err := reconcile(model)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(status.LastCleanupTime).To(BeNil())
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
+	})
+
+	It("keeps orphan progress and LastCleanupTime when a later scale-in is rate limited", func() {
+		name := "rl-orphan-partial"
+		model := newModel(name)
+		model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+			ScaleToZero:     ptr(true),
+			IntervalMinutes: ptr(int32(10)),
+		}
+		defer cleanup(name)
+		mockFound()
+		mockEnv(&baseten.Deployment{Name: rlSource + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1})
+		mockClient.ListDeploymentsFunc = func(ctx context.Context, modelID string) ([]baseten.DeploymentDetail, error) {
+			return []baseten.DeploymentDetail{
+				{ID: "orphan-a", Name: "old-a", Status: baseten.DeploymentStatusActive, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2}},
+				{ID: "orphan-b", Name: "old-b", Status: baseten.DeploymentStatusActive, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2}},
+			}, nil
+		}
+		mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+			return nil, nil
+		}
+		calls := 0
+		mockClient.UpdateDeploymentAutoscalingFunc = func(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
+			calls++
+			if deploymentID == "orphan-a" {
+				return nil
+			}
+			return rateLimited(0)
+		}
+		result, err := reconcile(model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		Expect(calls).To(Equal(2))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(status.LastCleanupTime).NotTo(BeNil())
+		events := drainEvents()
+		Expect(events).To(ContainElement(ContainSubstring("OrphanDeploymentsScaledIn")))
+		Expect(events).To(ContainElement(ContainSubstring("old-a")))
+		Expect(events).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("retries a 429 from deleting a stale orphan deployment", func() {
@@ -558,7 +702,112 @@ var _ = Describe("Baseten API rate limits", func() {
 			return rateLimited(0)
 		}
 		result, err := reconcile(model)
-		expectSoon(name, result, err)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		status := statusOf(name)
+		Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+		Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+		Expect(status.LastCleanupTime).To(BeNil())
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
+	})
+
+	It("waits at least one second when Retry-After is zero", func() {
+		name := "rl-floor"
+		defer cleanup(name)
+		mockFound()
+		mockEnv(nil)
+		mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+			return rlSourceID, baseten.DeploymentStatusActive, nil
+		}
+		mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+			return nil, &baseten.APIError{StatusCode: http.StatusTooManyRequests, Message: "slow down", HasRetryAfter: true, RetryAfter: 0}
+		}
+		result, err := reconcile(newModel(name))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">=", time.Second))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Second))
+		Expect(statusOf(name).DeploymentStatus).To(Equal(statusRateLimited))
+	})
+
+	It("resets the deployment failure clock when mode leaves Pause", func() {
+		name := "rl-pause-resume"
+		model := newModel(name)
+		model.Spec.Mode = modelsv1alpha1.ModePause
+		defer cleanup(name)
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		stale := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+		model.Status.FirstDeploymentFailureTime = &stale
+		model.Status.DeploymentRetryCount = 4
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		_, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		paused := statusOf(name)
+		Expect(paused.DeploymentStatus).To(Equal(statusPaused))
+		Expect(paused.FirstDeploymentFailureTime.Time).To(BeTemporally("~", stale.Time, time.Second))
+
+		got := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+		got.Spec.Mode = modelsv1alpha1.ModeReconcile
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+		mockFound()
+		mockEnv(nil)
+		mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+			return rlSourceID, baseten.DeploymentStatusFailed, nil
+		}
+		mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+			return &baseten.RetryResponse{Retried: true}, nil
+		}
+		result, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		status := statusOf(name)
+		Expect(status.FirstDeploymentFailureTime).NotTo(BeNil())
+		Expect(status.FirstDeploymentFailureTime.Time).To(BeTemporally("~", time.Now(), time.Minute))
+		Expect(status.Message).NotTo(ContainSubstring("retries exhausted"))
+	})
+
+	It("treats a truss push 429 as a rate limit instead of the push failure backoff", func() {
+		name := "rl-truss-push"
+		model := newModel(name)
+		model.Spec.SourceDeploymentName = ""
+		model.Spec.TrussConfig = &modelsv1alpha1.TrussConfig{
+			PythonVersion: "py312",
+			Resources:     modelsv1alpha1.TrussResources{Accelerator: "H100:1"},
+			BaseImage:     modelsv1alpha1.TrussBaseImage{Image: "test:latest"},
+		}
+		defer cleanup(name)
+		mockFound()
+		var pushes int
+		mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+			return "", "", nil
+		}
+		reconciler.TrussPusher = &truss.MockPusher{
+			PushFromConfigFunc: func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				pushes++
+				return nil, fmt.Errorf("truss push failed: %w", &trussgo.APIError{StatusCode: http.StatusTooManyRequests, Message: "slow down"})
+			},
+		}
+		_, err := reconcile(model)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			status := statusOf(name)
+			g.Expect(status.DeploymentStatus).To(Equal(statusRateLimited))
+			g.Expect(status.TrussPushFailureCount).To(Equal(int32(0)))
+			g.Expect(status.TrussPushNextRetryTime).NotTo(BeNil())
+			g.Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">", 0))
+			g.Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically("<=", time.Minute))
+		}, 2*time.Second, 50*time.Millisecond).Should(Succeed())
+		Expect(pushes).To(Equal(1))
+
+		result, err := reconcileByName(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Minute))
+		Expect(pushes).To(Equal(1))
+		Expect(statusOf(name).TrussPushFailureCount).To(Equal(int32(0)))
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RateLimited")))
 	})
 
 	It("still returns a non-429 promote error to the caller", func() {

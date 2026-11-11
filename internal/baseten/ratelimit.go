@@ -108,14 +108,13 @@ func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
 		}
 		return time.Duration(secs) * time.Second, true
 	}
-	for _, layout := range []string{time.RFC1123, time.RFC1123Z} {
-		if t, err := time.Parse(layout, header); err == nil {
-			d := t.Sub(now)
-			if d < 0 {
-				return 0, true
-			}
-			return d, true
-		}
+	t, err := http.ParseTime(header)
+	if err != nil {
+		return 0, false
 	}
-	return 0, false
+	d := t.Sub(now)
+	if d < 0 {
+		return 0, true
+	}
+	return d, true
 }

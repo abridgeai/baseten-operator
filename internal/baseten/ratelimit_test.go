@@ -63,8 +63,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{header: "12", want: 12 * time.Second, ok: true},
 		{header: "0", want: 0, ok: true},
 		{header: "  30  ", want: 30 * time.Second, ok: true},
-		{header: now.Add(45 * time.Second).Format(time.RFC1123), want: 45 * time.Second, ok: true},
-		{header: now.Add(-time.Minute).Format(time.RFC1123), want: 0, ok: true},
+		{header: now.Add(45 * time.Second).UTC().Format(http.TimeFormat), want: 45 * time.Second, ok: true},
+		{header: now.Add(-time.Minute).UTC().Format(http.TimeFormat), want: 0, ok: true},
 		{header: "", ok: false},
 		{header: "soon", ok: false},
 		{header: "-5", ok: false},
@@ -94,7 +94,7 @@ func TestClientCapturesRetryAfterOn429(t *testing.T) {
 	t.Run("http date", func(t *testing.T) {
 		when := time.Now().Add(30 * time.Second).UTC().Truncate(time.Second)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Retry-After", when.Format(time.RFC1123))
+			w.Header().Set("Retry-After", when.Format(http.TimeFormat))
 			writeError(t, w, http.StatusTooManyRequests, "slow down")
 		}))
 		defer srv.Close()
