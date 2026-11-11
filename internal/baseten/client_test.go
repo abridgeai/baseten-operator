@@ -32,7 +32,7 @@ func newTestClient(serverURL string) *Client {
 	return &Client{
 		api: &managementapi.Client{
 			BaseURL:    serverURL,
-			HTTPClient: http.DefaultClient,
+			HTTPClient: withRateLimitTransport(&http.Client{}),
 			Headers:    http.Header{"Authorization": {"Api-Key test-key"}},
 		},
 	}

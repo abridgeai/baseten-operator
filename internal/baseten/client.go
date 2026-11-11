@@ -38,9 +38,12 @@ const (
 )
 
 // APIError represents an error response from the Baseten API with status code information.
+// RetryAfter is set only when a 429 response included a Retry-After header.
 type APIError struct {
-	StatusCode int
-	Message    string
+	StatusCode    int
+	Message       string
+	RetryAfter    time.Duration
+	HasRetryAfter bool
 }
 
 func (e *APIError) Error() string {
@@ -55,13 +58,22 @@ func IsNotFoundError(err error) bool {
 
 // toAPIError maps a generated-client HTTP failure (*managementapi.ResponseError) to *APIError
 // so IsNotFoundError keeps working; other errors (network, decode) pass through unchanged.
-func toAPIError(err error) error {
+// The generated client drops response headers, so a 429's Retry-After is read from the
+// capture the rate-limit transport stored on ctx.
+func toAPIError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
 	var respErr *managementapi.ResponseError
 	if errors.As(err, &respErr) {
-		return &APIError{StatusCode: respErr.StatusCode, Message: respErr.Body}
+		apiErr := &APIError{StatusCode: respErr.StatusCode, Message: respErr.Body}
+		if apiErr.StatusCode == http.StatusTooManyRequests {
+			if d, ok := retryAfterFrom(ctx); ok {
+				apiErr.RetryAfter = d
+				apiErr.HasRetryAfter = true
+			}
+		}
+		return apiErr
 	}
 	return err
 }
@@ -111,10 +123,10 @@ func NewClient() (*Client, error) {
 	return &Client{
 		api: &managementapi.Client{
 			BaseURL: baseURL,
-			HTTPClient: &http.Client{
+			HTTPClient: withRateLimitTransport(&http.Client{
 				Timeout:   defaultTimeout,
 				Transport: transport,
-			},
+			}),
 			Headers: http.Header{"Authorization": {"Api-Key " + apiKey}},
 		},
 	}, nil
@@ -188,6 +200,7 @@ type Environment struct {
 // FindModelIDByName returns the ID of the model named modelName ("" if not found).
 // A non-empty team scopes the lookup to that team.
 func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) (string, error) {
+	ctx = captureRateLimit(ctx)
 	var models *managementapi.Models
 	var err error
 	if team == "" {
@@ -200,7 +213,7 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) 
 		models, err = c.api.GetTeamsModels(ctx, teamID, managementapi.GetV1TeamsTeamIdModelsParams{Name: &modelName})
 	}
 	if err != nil {
-		return "", toAPIError(err)
+		return "", toAPIError(ctx, err)
 	}
 	for _, m := range models.Models {
 		if m.Name == modelName {
@@ -211,9 +224,10 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) 
 }
 
 func (c *Client) findTeamID(ctx context.Context, team string) (string, error) {
+	ctx = captureRateLimit(ctx)
 	teams, err := c.api.GetTeams(ctx, managementapi.GetV1TeamsParams{Name: &team})
 	if err != nil {
-		return "", toAPIError(err)
+		return "", toAPIError(ctx, err)
 	}
 	for _, t := range teams.Teams {
 		if t.Name == team {
@@ -225,15 +239,17 @@ func (c *Client) findTeamID(ctx context.Context, team string) (string, error) {
 
 // DeleteModel deletes a Baseten model and cascades to all deployments and environments under it.
 func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
+	ctx = captureRateLimit(ctx)
 	_, err := c.api.DeleteModels(ctx, modelID)
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 // FindDeploymentIDByName lists deployments and returns the ID and status matching deploymentName.
 func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
+	ctx = captureRateLimit(ctx)
 	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
 	if err != nil {
-		return "", "", toAPIError(err)
+		return "", "", toAPIError(ctx, err)
 	}
 	for _, d := range deps.Deployments {
 		if d.Name == deploymentName {
@@ -244,22 +260,25 @@ func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deployment
 }
 
 func (c *Client) ActivateDeployment(ctx context.Context, modelID, deploymentID string) error {
+	ctx = captureRateLimit(ctx)
 	_, err := c.api.PostModelsDeploymentsActivate(ctx, modelID, deploymentID)
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 func (c *Client) GetEnvironment(ctx context.Context, modelID, envName string) (*Environment, error) {
+	ctx = captureRateLimit(ctx)
 	env, err := c.api.GetModelsEnvironmentsEnvName(ctx, modelID, envName)
 	if err != nil {
-		return nil, toAPIError(err)
+		return nil, toAPIError(ctx, err)
 	}
 	return toEnvironment(env), nil
 }
 
 func (c *Client) ListEnvironments(ctx context.Context, modelID string) ([]Environment, error) {
+	ctx = captureRateLimit(ctx)
 	envs, err := c.api.GetModelsEnvironments(ctx, modelID)
 	if err != nil {
-		return nil, toAPIError(err)
+		return nil, toAPIError(ctx, err)
 	}
 	result := make([]Environment, 0, len(envs.Environments))
 	for i := range envs.Environments {
@@ -269,23 +288,26 @@ func (c *Client) ListEnvironments(ctx context.Context, modelID string) ([]Enviro
 }
 
 func (c *Client) CreateEnvironment(ctx context.Context, modelID string, envConfig *modelsv1alpha1.EnvironmentConfig) error {
+	ctx = captureRateLimit(ctx)
 	_, err := c.api.PostModelsEnvironments(ctx, modelID, managementapi.CreateEnvironmentRequest{
 		Name:                envConfig.Name,
 		AutoscalingSettings: toUpdateAutoscalingSettings(envConfig.Autoscaling),
 		PromotionSettings:   toUpdatePromotionSettings(envConfig.PromotionSettings),
 	})
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 func (c *Client) UpdateEnvironmentSettings(ctx context.Context, modelID, envName string, autoscalingConfig *modelsv1alpha1.AutoscalingConfig, promotionConfig *modelsv1alpha1.PromotionSettingsConfig) error {
+	ctx = captureRateLimit(ctx)
 	_, err := c.api.PatchModelsEnvironments(ctx, modelID, envName, managementapi.UpdateEnvironmentRequest{
 		AutoscalingSettings: toUpdateAutoscalingSettings(autoscalingConfig),
 		PromotionSettings:   toUpdatePromotionSettings(promotionConfig),
 	})
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 func (c *Client) Promote(ctx context.Context, modelID, deploymentID, targetEnv string, promotionSettings *modelsv1alpha1.PromotionSettingsConfig) (*Deployment, error) {
+	ctx = captureRateLimit(ctx)
 	scaleDownPrevious := true
 	preserveInstanceType := true
 
@@ -304,15 +326,16 @@ func (c *Client) Promote(ctx context.Context, modelID, deploymentID, targetEnv s
 		PreserveEnvInstanceType:     &preserveInstanceType,
 	})
 	if err != nil {
-		return nil, toAPIError(err)
+		return nil, toAPIError(ctx, err)
 	}
 	return toDeployment(dep), nil
 }
 
 func (c *Client) ListDeployments(ctx context.Context, modelID string) ([]DeploymentDetail, error) {
+	ctx = captureRateLimit(ctx)
 	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
 	if err != nil {
-		return nil, toAPIError(err)
+		return nil, toAPIError(ctx, err)
 	}
 	result := make([]DeploymentDetail, 0, len(deps.Deployments))
 	for _, d := range deps.Deployments {
@@ -322,22 +345,25 @@ func (c *Client) ListDeployments(ctx context.Context, modelID string) ([]Deploym
 }
 
 func (c *Client) UpdateDeploymentAutoscaling(ctx context.Context, modelID, deploymentID string, minReplica int32) error {
+	ctx = captureRateLimit(ctx)
 	mr := int(minReplica)
 	_, err := c.api.PatchModelsDeploymentsAutoscalingSettings(ctx, modelID, deploymentID, managementapi.UpdateAutoscalingSettings{
 		MinReplica: &mr,
 	})
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 func (c *Client) DeleteDeployment(ctx context.Context, modelID, deploymentID string) error {
+	ctx = captureRateLimit(ctx)
 	_, err := c.api.DeleteModelsDeployments(ctx, modelID, deploymentID)
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 func (c *Client) RetryDeployment(ctx context.Context, modelID, deploymentID string) (*RetryResponse, error) {
+	ctx = captureRateLimit(ctx)
 	resp, err := c.api.PostModelsDeploymentsRetry(ctx, modelID, deploymentID)
 	if err != nil {
-		return nil, toAPIError(err)
+		return nil, toAPIError(ctx, err)
 	}
 	out := &RetryResponse{
 		Retried:    resp.Retried,
