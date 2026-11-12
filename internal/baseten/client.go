@@ -237,7 +237,7 @@ func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
 
 // FindDeploymentIDByName lists deployments and returns the ID and status matching deploymentName.
 func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
-	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
+	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{Name: &deploymentName})
 	if err != nil {
 		return "", "", toAPIError(err)
 	}
