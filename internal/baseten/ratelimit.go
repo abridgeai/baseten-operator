@@ -95,26 +95,49 @@ func withRateLimitTransport(base *http.Client) *http.Client {
 	return &clone
 }
 
+// MaxRetryAfter is the longest Retry-After the operator will wait.
+// Larger headers, and dates far enough to overflow a duration, clamp here.
+const MaxRetryAfter = 15 * time.Minute
+
 // parseRetryAfter accepts the two forms from RFC 9110: delta-seconds or an HTTP-date.
 // A date in the past yields 0, true so callers still know the header was present.
+// Values outside [0, MaxRetryAfter] clamp into that range. A date is compared
+// before subtraction so a far-future HTTP-date cannot overflow to a negative duration.
 func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
 	header = strings.TrimSpace(header)
 	if header == "" {
 		return 0, false
 	}
-	if secs, err := strconv.ParseInt(header, 10, 64); err == nil {
-		if secs < 0 {
-			return 0, false
-		}
-		return time.Duration(secs) * time.Second, true
+	secs, err := strconv.ParseInt(header, 10, 64)
+	if err == nil {
+		return clampRetryAfterSeconds(secs), true
+	}
+	var numErr *strconv.NumError
+	if errors.As(err, &numErr) && errors.Is(numErr.Err, strconv.ErrRange) {
+		return MaxRetryAfter, true
 	}
 	t, err := http.ParseTime(header)
 	if err != nil {
 		return 0, false
+	}
+	limit := now.Add(MaxRetryAfter)
+	if !t.Before(limit) {
+		return MaxRetryAfter, true
 	}
 	d := t.Sub(now)
 	if d < 0 {
 		return 0, true
 	}
 	return d, true
+}
+
+func clampRetryAfterSeconds(secs int64) time.Duration {
+	if secs < 0 {
+		return 0
+	}
+	maxSecs := int64(MaxRetryAfter / time.Second)
+	if secs > maxSecs {
+		return MaxRetryAfter
+	}
+	return time.Duration(secs) * time.Second
 }

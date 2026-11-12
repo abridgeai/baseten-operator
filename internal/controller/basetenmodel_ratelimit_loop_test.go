@@ -11,6 +11,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -606,6 +607,266 @@ var _ = Describe("Baseten API rate limit manager loop", func() {
 		mu.Unlock()
 		Expect(seen).NotTo(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
 
+		cancel()
+		wait()
+	})
+
+	stampReady := func(model *modelsv1alpha1.BasetenModel) {
+		model.Status.Conditions = []metav1.Condition{{
+			Type:               conditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             statusRateLimited,
+			Message:            rateLimitMessage,
+			ObservedGeneration: model.Generation,
+			LastTransitionTime: metav1.Now(),
+		}}
+	}
+
+	serving := func(calls *atomic.Int32) *baseten.MockClient {
+		return &baseten.MockClient{
+			GetEnvironmentFunc: func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+				calls.Add(1)
+				return &baseten.Environment{
+					Name: loopEnv,
+					CurrentDeployment: &baseten.Deployment{
+						Name: loopSource + ".1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1,
+					},
+					AutoscalingSettings: testAutoscalingSettings(),
+				}, nil
+			},
+		}
+	}
+
+	It("folds a 15m cap for a one-hour Retry-After and still retries while budget remains", func() {
+		ns := prepareNS("rl-loop-fold15")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		started := time.Now().Add(-70 * time.Minute)
+		ft := metav1.NewTime(started)
+		model.Status.ModelID = loopModelID
+		model.Status.FirstDeploymentFailureTime = &ft
+		stampReady(model)
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		failedEnv := func() (*baseten.Environment, error) {
+			return &baseten.Environment{
+				Name: loopEnv,
+				CandidateDeployment: &baseten.Deployment{
+					ID: "cand-loop", Name: loopSource + ".1", Status: baseten.DeploymentStatusBuildFailed,
+				},
+				AutoscalingSettings: testAutoscalingSettings(),
+			}, nil
+		}
+		var retries atomic.Int32
+		mc := &baseten.MockClient{
+			GetEnvironmentFunc: func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+				return failedEnv()
+			},
+			FindDeploymentIDByNameFunc: func(ctx context.Context, modelID, depName string) (string, string, error) {
+				return "cand-loop", baseten.DeploymentStatusBuildFailed, nil
+			},
+			RetryDeploymentFunc: func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+				retries.Add(1)
+				return nil, &baseten.APIError{
+					StatusCode: 429, Message: "slow down", HasRetryAfter: true, RetryAfter: time.Hour,
+				}
+			},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		wait := launchManager(ctx, ns, mc, nil)
+		Eventually(func(g Gomega) {
+			g.Expect(retries.Load()).To(Equal(int32(1)))
+			got := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Status.Message).NotTo(ContainSubstring("retries exhausted"))
+			g.Expect(got.Status.RateLimitWindowEnd).NotTo(BeNil())
+			g.Expect(got.Status.RateLimitWindowEnd.Time).To(BeTemporally("~", time.Now().Add(baseten.MaxRetryAfter), 5*time.Second))
+			g.Expect(got.Status.FirstDeploymentFailureTime.Sub(started)).To(BeNumerically("~", baseten.MaxRetryAfter, 5*time.Second))
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		time.Sleep(time.Second)
+		Expect(retries.Load()).To(Equal(int32(1)))
+		cancel()
+		wait()
+
+		// The capped wait has elapsed and about 55m of the 2h budget is left.
+		got := &modelsv1alpha1.BasetenModel{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
+		passed := metav1.NewTime(time.Now().Add(-time.Second))
+		got.Status.RateLimitWindowEnd = &passed
+		Expect(k8sClient.Status().Update(context.Background(), got)).To(Succeed())
+
+		var again atomic.Int32
+		mc.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+			again.Add(1)
+			return &baseten.RetryResponse{Retried: true}, nil
+		}
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		wait2 := launchManager(ctx2, ns, mc, nil)
+		Eventually(func(g Gomega) {
+			g.Expect(again.Load()).To(BeNumerically(">=", 1))
+			fresh := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, fresh)).To(Succeed())
+			g.Expect(fresh.Status.Message).NotTo(ContainSubstring("retries exhausted"))
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		cancel2()
+		wait2()
+	})
+
+	It("clamps a pre-existing far-future rate-limit window to 15m", func() {
+		ns := prepareNS("rl-loop-far")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.ModelID = loopModelID
+		far := metav1.NewTime(time.Now().Add(365 * 24 * time.Hour))
+		model.Status.RateLimitWindowEnd = &far
+		stampReady(model)
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		var calls atomic.Int32
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, serving(&calls), nil)
+		Eventually(func(g Gomega) {
+			g.Expect(calls.Load()).To(Equal(int32(0)))
+			got := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Status.RateLimitWindowEnd).NotTo(BeNil())
+			g.Expect(got.Status.RateLimitWindowEnd.Time).To(BeTemporally("~", time.Now().Add(baseten.MaxRetryAfter), 5*time.Second))
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		cancel()
+		wait()
+	})
+
+	It("clears the rate-limit window and calls when the spec generation changes", func() {
+		ns := prepareNS("rl-loop-spec")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.ModelID = loopModelID
+		window := metav1.NewTime(time.Now().Add(10 * time.Minute))
+		model.Status.RateLimitWindowEnd = &window
+		stampReady(model)
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		var calls atomic.Int32
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, serving(&calls), nil)
+		time.Sleep(2 * time.Second)
+		Expect(calls.Load()).To(Equal(int32(0)))
+
+		Eventually(func(g Gomega) {
+			fresh := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, fresh)).To(Succeed())
+			fresh.Spec.Team = "Speech"
+			g.Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		}).WithTimeout(5 * time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			g.Expect(calls.Load()).To(BeNumerically(">=", 1))
+			got := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Status.RateLimitWindowEnd).To(BeNil())
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		cancel()
+		wait()
+	})
+
+	It("clears the rate-limit window on pause and calls on resume", func() {
+		ns := prepareNS("rl-loop-pause")
+		model := newModel(ns)
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.ModelID = loopModelID
+		window := metav1.NewTime(time.Now().Add(10 * time.Minute))
+		model.Status.RateLimitWindowEnd = &window
+		stampReady(model)
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		var calls atomic.Int32
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, serving(&calls), nil)
+		time.Sleep(2 * time.Second)
+		Expect(calls.Load()).To(Equal(int32(0)))
+
+		Eventually(func(g Gomega) {
+			fresh := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, fresh)).To(Succeed())
+			fresh.Spec.Mode = modelsv1alpha1.ModePause
+			g.Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		}).WithTimeout(5 * time.Second).Should(Succeed())
+		Eventually(func(g Gomega) {
+			got := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Status.DeploymentStatus).To(Equal(statusPaused))
+			g.Expect(got.Status.RateLimitWindowEnd).To(BeNil())
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		Expect(calls.Load()).To(Equal(int32(0)))
+		cancel()
+		wait()
+
+		// Resume with a window and no failure clock must not stay PAUSED.
+		resumeNS := prepareNS("rl-loop-resume")
+		resume := newModel(resumeNS)
+		Expect(k8sClient.Create(context.Background(), resume)).To(Succeed())
+		resume.Status.ModelID = loopModelID
+		resume.Status.DeploymentStatus = statusPaused
+		held := metav1.NewTime(time.Now().Add(10 * time.Minute))
+		resume.Status.RateLimitWindowEnd = &held
+		stampReady(resume)
+		Expect(k8sClient.Status().Update(context.Background(), resume)).To(Succeed())
+
+		var resumeCalls atomic.Int32
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		wait2 := launchManager(ctx2, resumeNS, serving(&resumeCalls), nil)
+		Eventually(func(g Gomega) {
+			g.Expect(resumeCalls.Load()).To(BeNumerically(">=", 1))
+			got := &modelsv1alpha1.BasetenModel{}
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: resumeNS}, got)).To(Succeed())
+			g.Expect(got.Status.DeploymentStatus).NotTo(Equal(statusPaused))
+			g.Expect(got.Status.RateLimitWindowEnd).To(BeNil())
+		}).WithTimeout(8 * time.Second).Should(Succeed())
+		cancel2()
+		wait2()
+	})
+
+	It("does not hold delete or the finalizer for a rate-limit window", func() {
+		ns := prepareNS("rl-loop-delete-window")
+		model := newModel(ns)
+		model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.ModelID = loopModelID
+		window := metav1.NewTime(time.Now().Add(10 * time.Minute))
+		model.Status.RateLimitWindowEnd = &window
+		stampReady(model)
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		var calls atomic.Int32
+		mc := &baseten.MockClient{
+			DeleteModelFunc: func(ctx context.Context, modelID string) error {
+				calls.Add(1)
+				return nil
+			},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		wait := launchManager(ctx, ns, mc, nil)
+		Eventually(func(g Gomega) {
+			fresh := &modelsv1alpha1.BasetenModel{}
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, fresh)
+			if apierrors.IsNotFound(err) {
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(k8sClient.Delete(context.Background(), fresh)).To(Succeed())
+		}).WithTimeout(5 * time.Second).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(calls.Load()).To(BeNumerically(">=", 1))
+			got := &modelsv1alpha1.BasetenModel{}
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "loop", Namespace: ns}, got)
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}).WithTimeout(8 * time.Second).Should(Succeed())
 		cancel()
 		wait()
 	})

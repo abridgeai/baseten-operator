@@ -67,7 +67,10 @@ func TestParseRetryAfter(t *testing.T) {
 		{header: now.Add(-time.Minute).UTC().Format(http.TimeFormat), want: 0, ok: true},
 		{header: "", ok: false},
 		{header: "soon", ok: false},
-		{header: "-5", ok: false},
+		{header: "-5", want: 0, ok: true},
+		{header: "99999999999", want: MaxRetryAfter, ok: true},
+		{header: "999999999999999999999", want: MaxRetryAfter, ok: true},
+		{header: time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat), want: MaxRetryAfter, ok: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.header, func(t *testing.T) {

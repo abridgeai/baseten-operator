@@ -779,9 +779,10 @@ var _ = Describe("Baseten API rate limits", func() {
 		Expect(err).NotTo(HaveOccurred())
 		status := statusOf(name)
 		drift := status.FirstDeploymentFailureTime.Sub(started)
-		Expect(drift).To(BeNumerically("~", rateLimitFoldCap, 2*time.Second))
+		// Retry-After of 1h clamps to 15m, and that whole wait is folded.
+		Expect(drift).To(BeNumerically("~", baseten.MaxRetryAfter, 2*time.Second))
 		Expect(status.RateLimitWindowEnd).NotTo(BeNil())
-		Expect(status.RateLimitWindowEnd.Time).To(BeTemporally(">", time.Now().Add(30*time.Minute)))
+		Expect(status.RateLimitWindowEnd.Time).To(BeTemporally("~", time.Now().Add(baseten.MaxRetryAfter), 5*time.Second))
 	})
 
 	It("waits out an open rate-limit window without exhausting retries or calling Baseten", func() {
@@ -815,7 +816,9 @@ var _ = Describe("Baseten API rate limits", func() {
 		result, err := reconcileByName(name)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(called).To(BeFalse())
-		Expect(result.RequeueAfter).To(BeNumerically("~", time.Until(windowEnd), 2*time.Second))
+		// A stored end past 15m is clamped on read.
+		Expect(result.RequeueAfter).To(BeNumerically("~", baseten.MaxRetryAfter, 5*time.Second))
+		Expect(statusOf(name).RateLimitWindowEnd.Time).To(BeTemporally("~", time.Now().Add(baseten.MaxRetryAfter), 5*time.Second))
 		Expect(statusOf(name).Message).NotTo(ContainSubstring("retries exhausted"))
 		Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("DeploymentRetryExhausted")))
 	})
