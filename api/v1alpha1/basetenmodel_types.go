@@ -78,6 +78,7 @@ type BasetenModelSpec struct {
 	// ModelName references an existing Baseten model
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="modelName is immutable"
 	ModelName string `json:"modelName"`
 
 	// Team is the Baseten team name the model belongs to (as in `truss push --team`).
