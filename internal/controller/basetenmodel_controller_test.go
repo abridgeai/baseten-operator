@@ -333,6 +333,18 @@ var _ = Describe("BasetenModel Controller", func() {
 			mockEnvWithSettings(nil, nil)
 		}
 
+		// expectWait checks one poll: exactly 30s for a new state, else in (base, 1.2*base].
+		expectWait := func(name string, base time.Duration) {
+			result, err := reconcileByName(name)
+			Expect(err).NotTo(HaveOccurred())
+			if base == 30*time.Second {
+				Expect(result.RequeueAfter).To(Equal(base))
+				return
+			}
+			Expect(result.RequeueAfter).To(BeNumerically(">", base))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", base+base/5))
+		}
+
 		Describe("Paused Reconciliation", func() {
 			It("should skip all API calls and return empty result when paused", func() {
 				name := "paused-no-api"
@@ -1758,6 +1770,58 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
 				Expect(getModelStatus(name).DeploymentStatus).To(Equal("SOME_NEW_STATUS"))
+			})
+
+			It("should back off with jitter while the source stays unchanged and reset on any change", func() {
+				name := "step5-backoff"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				status := baseten.DeploymentStatusBuilding
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, status, nil
+				}
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				for _, base := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+					expectWait(name, base)
+				}
+				status = baseten.DeploymentStatusDeploying
+				expectWait(name, 30*time.Second)
+				status = "SOME_NEW_STATUS"
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
+				model.Spec.SourceDeploymentName = "img-2-wgt-2-p-2"
+				Expect(k8sClient.Update(ctx, model)).To(Succeed())
+				expectWait(name, 30*time.Second)
+			})
+
+			It("should start again at 30 seconds after the steady state", func() {
+				name := "step5-backoff-steady"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				var current *baseten.Deployment
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{Name: testEnvName, CurrentDeployment: current, AutoscalingSettings: testAutoscalingSettings()}, nil
+				}
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusBuilding, nil
+				}
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				current = &baseten.Deployment{Name: testSourceDep + ".1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1}
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
+				current = nil
+				expectWait(name, 30*time.Second)
 			})
 
 			It("should activate and requeue when source is INACTIVE", func() {
