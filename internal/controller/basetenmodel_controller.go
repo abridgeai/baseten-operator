@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -87,6 +88,13 @@ type BasetenModelReconciler struct {
 	Recorder                record.EventRecorder
 	MaxConcurrentReconciles int           // concurrent reconcile workers (default 1)
 	PushSemaphore           chan struct{} // bounds concurrent async truss push goroutines
+
+	pollState sync.Map // client.ObjectKey -> pollState; one key never reconciles concurrently
+}
+
+type pollState struct {
+	token string
+	wait  time.Duration
 }
 
 type statusUpdate struct {
@@ -225,6 +233,7 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.reconcileOrphanCleanup(ctx, model, modelID)
 		}
 
+		r.resetWait(model)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
@@ -1682,6 +1691,7 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 
 	logger.Info("Found source deployment in Baseten", "sourceDeploymentID", sourceDeploymentID, "sourceDeploymentName", sourceDeploymentName, "status", sourceDeploymentStatus)
 
+	pollToken := sourceDeploymentName + "|" + sourceDeploymentStatus
 	switch sourceDeploymentStatus {
 	case baseten.DeploymentStatusFailed, baseten.DeploymentStatusDeployFailed, baseten.DeploymentStatusBuildFailed:
 		logger.Info("Source deployment failed", "sourceDeploymentName", sourceDeploymentName, "status", sourceDeploymentStatus)
@@ -1728,7 +1738,7 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 			modelID:          modelID,
 		})
 		logger.Info("Source deployment not ready for promotion yet", "status", sourceDeploymentStatus)
-		result := ctrl.Result{RequeueAfter: 30 * time.Second}
+		result := ctrl.Result{RequeueAfter: r.waitInterval(model, pollToken)}
 		return "", &result, nil
 
 	case baseten.DeploymentStatusActive:
@@ -1741,11 +1751,30 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 			message:          fmt.Sprintf("%swaiting to promote: source deployment %s has status %s", ap, sourceDeploymentName, sourceDeploymentStatus),
 			modelID:          modelID,
 		})
-		result := ctrl.Result{RequeueAfter: 30 * time.Second}
+		result := ctrl.Result{RequeueAfter: r.waitInterval(model, pollToken)}
 		return "", &result, nil
 	}
 
 	return sourceDeploymentID, nil, nil
+}
+
+// waitInterval returns 30s for a new token, then doubles per unchanged poll up
+// to 5m, plus up to 20% jitter. State is in memory only.
+func (r *BasetenModelReconciler) waitInterval(model *modelsv1alpha1.BasetenModel, token string) time.Duration {
+	key := client.ObjectKeyFromObject(model)
+	v, _ := r.pollState.Load(key)
+	st, _ := v.(pollState)
+	if st.token != token {
+		r.pollState.Store(key, pollState{token: token, wait: 30 * time.Second})
+		return 30 * time.Second
+	}
+	st.wait = min(2*st.wait, 5*time.Minute)
+	r.pollState.Store(key, st)
+	return st.wait + time.Duration(float64(st.wait)*0.2*rand.Float64())
+}
+
+func (r *BasetenModelReconciler) resetWait(model *modelsv1alpha1.BasetenModel) {
+	r.pollState.Delete(client.ObjectKeyFromObject(model))
 }
 
 // activePrefix returns "active: {name} ({replicas} replicas) | " when there's
