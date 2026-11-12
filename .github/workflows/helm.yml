@@ -35,6 +35,13 @@ jobs:
             --set rbac.aggregatedRoles=false \
             --set metrics.enabled=false > /tmp/render/minimal.yaml
 
+      - name: CRD survives helm uninstall and Config Sync prune
+        run: |
+          helm template baseten-operator charts/baseten-operator \
+            --show-only templates/crd.yaml > /tmp/render/crd.yaml
+          grep -qxF '    helm.sh/resource-policy: keep' /tmp/render/crd.yaml
+          grep -qxF '    client.lifecycle.config.k8s.io/deletion: detach' /tmp/render/crd.yaml
+
       - name: Install kubeconform
         run: |
           curl -sSLo /tmp/kubeconform.tar.gz \

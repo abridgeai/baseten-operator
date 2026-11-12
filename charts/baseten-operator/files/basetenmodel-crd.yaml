@@ -3,7 +3,9 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
+    client.lifecycle.config.k8s.io/deletion: detach
     controller-gen.kubebuilder.io/version: v0.19.0
+    helm.sh/resource-policy: keep
   name: basetenmodels.models.baseten.com
 spec:
   group: models.baseten.com
