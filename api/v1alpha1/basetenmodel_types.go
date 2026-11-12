@@ -755,6 +755,14 @@ type BasetenModelStatus struct {
 	// +optional
 	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
 
+	// RateLimitWindowEnd is the end of the Baseten 429 wait already folded into
+	// FirstDeploymentFailureTime. A later 429 folds only the part of its wait
+	// that extends past this time, including after an operator restart.
+	// The wait is at most 15 minutes. Cleared when the spec generation changes,
+	// on pause, on resume, and on ACTIVE or SCALED_TO_ZERO.
+	// +optional
+	RateLimitWindowEnd *metav1.Time `json:"rateLimitWindowEnd,omitempty"`
+
 	// Conditions represent the current state of the BasetenModel resource.
 	// +listType=map
 	// +listMapKey=type

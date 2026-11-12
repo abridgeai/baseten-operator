@@ -70,6 +70,7 @@ func HasScheduleDrift(spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *
 // UpdateAutoscalingSchedules PATCHes the environment so its schedules match spec: creates missing
 // schedules, replaces changed ones by id, and deletes schedules not in spec.
 func (c *Client) UpdateAutoscalingSchedules(ctx context.Context, modelID, envName string, spec *modelsv1alpha1.AutoscalingScheduleConfig, observed *AutoscalingSchedules) error {
+	ctx = captureRateLimit(ctx)
 	settings, err := toUpdateAutoscalingScheduleSettings(spec, observed)
 	if err != nil || settings == nil {
 		return err
@@ -77,7 +78,7 @@ func (c *Client) UpdateAutoscalingSchedules(ctx context.Context, modelID, envNam
 	_, err = c.api.PatchModelsEnvironments(ctx, modelID, envName, managementapi.UpdateEnvironmentRequest{
 		AutoscalingScheduleSettings: settings,
 	})
-	return toAPIError(err)
+	return toAPIError(ctx, err)
 }
 
 type scheduleDiff struct {

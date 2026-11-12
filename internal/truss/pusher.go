@@ -2,7 +2,9 @@ package truss
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 
 	truss "github.com/basetenlabs/truss-go"
@@ -68,6 +70,13 @@ func (p *Pusher) PushFromConfig(ctx context.Context, configYAML, setupScript []b
 	}
 
 	return p.Push(ctx, tmpDir, modelName, team, deploymentName)
+}
+
+// IsRateLimited reports whether err is an HTTP 429 from the truss-go SDK.
+// Push wraps that error, so matching uses errors.As.
+func IsRateLimited(err error) bool {
+	var apiErr *truss.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
 }
 
 // MockPusher is a test double for PusherInterface.
