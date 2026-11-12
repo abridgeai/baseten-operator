@@ -612,6 +612,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 				for _, c := range cases {
 					model := newTestModel(c.name)
+					DeferCleanup(cleanupModel, c.name)
 					model.Spec.Mode = modelsv1alpha1.ModeObserve
 					mockModelFound()
 					mockEnvWithSettings(c.current, &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusDeploying})
