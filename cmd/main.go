@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	"go.uber.org/zap/zapcore"
 
@@ -160,25 +161,12 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), withLeaderElection(ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "020848ba.baseten.com",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
-	})
+	}, enableLeaderElection))
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -222,4 +210,18 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// withLeaderElection sets the lease timings. LeaseDuration must exceed 2*RenewDeadline+RetryPeriod,
+// because after a lost renew client-go's release() can take up to RenewDeadline more.
+func withLeaderElection(o ctrl.Options, enabled bool) ctrl.Options {
+	lease, renew, retry := 90*time.Second, 40*time.Second, 2*time.Second
+	o.LeaderElection = enabled
+	o.LeaderElectionID = "020848ba.baseten.com"
+	o.LeaseDuration = &lease
+	o.RenewDeadline = &renew
+	o.RetryPeriod = &retry
+	// Safe: main returns as soon as mgr.Start does, so nothing runs after the release.
+	o.LeaderElectionReleaseOnCancel = true
+	return o
 }
