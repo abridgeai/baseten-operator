@@ -212,6 +212,22 @@ var _ = Describe("BasetenModel Controller", func() {
 			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
 			Expect(err.Error()).To(ContainSubstring("team is immutable once set"))
 		})
+
+		It("rejects changing modelName once created", func() {
+			m := newModel("model-name-immutable", "")
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			unchanged := m.DeepCopy()
+			unchanged.Spec.SourceDeploymentName = "dep-v2"
+			Expect(k8sClient.Update(ctx, unchanged)).To(Succeed())
+
+			changed := unchanged.DeepCopy()
+			changed.Spec.ModelName = "other-model"
+			err := k8sClient.Update(ctx, changed)
+			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+			Expect(err.Error()).To(ContainSubstring("modelName is immutable"))
+		})
 	})
 
 	// Reconciliation tests using mock client
