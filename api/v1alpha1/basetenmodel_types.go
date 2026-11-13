@@ -766,6 +766,7 @@ type BasetenModelStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=bm
+// +kubebuilder:metadata:annotations={"helm.sh/resource-policy=keep","client.lifecycle.config.k8s.io/deletion=detach"}
 // +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.spec.modelName`
 // +kubebuilder:printcolumn:name="Environment",type=string,JSONPath=`.spec.environment.name`
 // +kubebuilder:printcolumn:name="Active_Deployment",type=string,JSONPath=`.status.activeDeploymentName`
