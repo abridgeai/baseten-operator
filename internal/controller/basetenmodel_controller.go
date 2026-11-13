@@ -875,9 +875,10 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 
 	if cur := env.CurrentDeployment; cur != nil && baseten.DeploymentNameMatchesPrefix(cur.Name, sourceDeploymentName) &&
 		(cur.Status == baseten.DeploymentStatusActive || cur.Status == baseten.DeploymentStatusScaledToZero) {
+		r.resetWait(model)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: r.waitInterval(model, su.message)}, nil
 }
 
 // expectedSourceDeploymentName returns the deployment name this CR's spec
