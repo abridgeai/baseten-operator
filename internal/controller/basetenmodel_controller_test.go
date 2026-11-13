@@ -4158,6 +4158,38 @@ var _ = Describe("BasetenModel Controller", func() {
 				reconcileUntilGone(name)
 			})
 
+			DescribeTable("with deletionPolicy Delete and empty status.modelID during a first push",
+				func(name string, policy modelsv1alpha1.DeletionPolicy, pushStatus string, pushAge time.Duration, wantHeld bool) {
+					model := newTestModel(name)
+					model.Spec.DeletionPolicy = policy
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.TrussPushStatus = pushStatus
+					if pushAge >= 0 {
+						model.Status.TrussPushTime = &metav1.Time{Time: time.Now().Add(-pushAge)}
+					}
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, model)).To(Succeed())
+
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					got := &modelsv1alpha1.BasetenModel{}
+					getErr := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)
+					if wantHeld {
+						Expect(getErr).NotTo(HaveOccurred())
+						Expect(got.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+						Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+					} else {
+						Expect(errors.IsNotFound(getErr)).To(BeTrue(), "finalizer released, object gone")
+					}
+				},
+				Entry("holds the finalizer while the push is in flight", "deletion-delete-push-inflight", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, 4*time.Minute, true),
+				Entry("releases after the push goes stale", "deletion-delete-push-stale", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, 6*time.Minute, false),
+				Entry("releases when no push is in flight", "deletion-delete-push-ended", modelsv1alpha1.DeletionPolicyDelete, "", time.Minute, false),
+				Entry("releases when the push has no start time", "deletion-delete-push-notime", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, -time.Second, false),
+				Entry("holds the finalizer under DeleteWithGuardrails too", "deletion-guardrails-push-inflight", modelsv1alpha1.DeletionPolicyDeleteWithGuardrails, statusTrussPushing, 4*time.Minute, true),
+			)
+
 			It("with deletionPolicy DeleteWithGuardrails proceeds when all envs idle", func() {
 				name := "deletion-guardrails-idle"
 				model := newTestModel(name)
