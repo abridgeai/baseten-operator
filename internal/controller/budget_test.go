@@ -207,6 +207,19 @@ var _ = Describe("Call budgets", Ordered, func() {
 		Expect(k8sClient.Update(ctx, m)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
 	}
+	forgot := map[string]bool{}
+	forget := func(m *modelsv1alpha1.BasetenModel) {
+		forgot[m.Name] = true
+		cur := &modelsv1alpha1.BasetenModel{}
+		err := k8sClient.Get(ctx, client.ObjectKeyFromObject(m), cur)
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		Expect(err).NotTo(HaveOccurred())
+		cur.Finalizers = nil
+		Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, cur))).To(Succeed())
+	}
 
 	DescribeTable("per Reconcile pass, on the second pass over the same state",
 		func(setup func(*baseten.MockClient), want map[string]int) {
@@ -264,7 +277,9 @@ var _ = Describe("Call budgets", Ordered, func() {
 		defer func() { stop(); <-done }()
 
 		m := newModel()
+		DeferCleanup(func() { Expect(forgot).To(HaveKey(m.Name), "the manager spec cleanup ran") })
 		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		DeferCleanup(forget, m)
 		Eventually(func() string { return get(m.Name).Status.DeploymentStatus }, 5*time.Second).
 			Should(Equal(baseten.DeploymentStatusActive))
 		time.Sleep(time.Second)
@@ -281,5 +296,17 @@ var _ = Describe("Call budgets", Ordered, func() {
 		Eventually(func() bool {
 			return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: m.Name, Namespace: ns}, latest))
 		}, 5*time.Second).Should(BeTrue())
+	})
+
+	It("cleanup removes a live model, one held by its finalizer, and skips a missing one", func() {
+		live, held := newModel(), newModel()
+		Expect(k8sClient.Create(ctx, live)).To(Succeed())
+		Expect(k8sClient.Create(ctx, held)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, held)).To(Succeed())
+		for _, m := range []*modelsv1alpha1.BasetenModel{live, held, live} {
+			forget(m)
+			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(m), &modelsv1alpha1.BasetenModel{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%s: %v", m.Name, err)
+		}
 	})
 })
