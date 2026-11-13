@@ -598,6 +598,36 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(status.CandidateDeploymentName).To(Equal(testSourceDep + ".222"))
 			})
 
+			It("should back off in Observe mode while nothing changes and reset on any change", func() {
+				name := "observe-backoff"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				current := &baseten.Deployment{Name: "img-old-wgt-old-p-old.111", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3}
+				candidate := &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusDeploying}
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{Name: testEnvName, CurrentDeployment: current, CandidateDeployment: candidate, AutoscalingSettings: testAutoscalingSettings()}, nil
+				}
+				expectNoMutations()
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				for _, base := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+					expectWait(name, base)
+				}
+				candidate.ActiveReplicaCount = 1 // only the status message changes
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				old, inFlight := current, candidate
+				current, candidate = &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1}, nil
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+				current, candidate = old, inFlight
+				expectWait(name, 30*time.Second)
+			})
+
 			It("should poll every 5 minutes only when the current deployment is the source and serving", func() {
 				cases := []struct {
 					name    string
