@@ -729,9 +729,11 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 // checkDeleteGuardrails inspects every environment under the model and returns
 // a sorted list of human-readable "name (min=N, active=M)" entries for any
 // environment that is not fully idle. An environment is considered serving if
-// either its env-level autoscaling MinReplica > 0 or any of its current/
-// candidate deployments has ActiveReplicaCount > 0. Returns an empty slice when
-// the model is safe to delete.
+// its env-level autoscaling MinReplica > 0, any of its current/candidate
+// deployments has ActiveReplicaCount > 0, or an enabled autoscaling schedule
+// sets MinReplica above 0 (window not checked; adds ", schedule S min=K").
+// Undecodable schedules also block (fail safe; adds ", schedules unreadable").
+// Returns an empty slice when the model is safe to delete.
 //
 // A 404 on ListEnvironments means the upstream model is already gone (e.g.,
 // deleted out-of-band). Treat as "no envs blocking" so the deletion path can
@@ -758,8 +760,19 @@ func (r *BasetenModelReconciler) checkDeleteGuardrails(ctx context.Context, mode
 		if env.CandidateDeployment != nil && env.CandidateDeployment.ActiveReplicaCount > activeReplica {
 			activeReplica = env.CandidateDeployment.ActiveReplicaCount
 		}
-		if minReplica > 0 || activeReplica > 0 {
-			blockers = append(blockers, fmt.Sprintf("%s (min=%d, active=%d)", env.Name, minReplica, activeReplica))
+		schedules := ""
+		if env.AutoscalingSchedules != nil {
+			for _, s := range env.AutoscalingSchedules.Schedules {
+				if s.Enabled && s.AutoscalingSettings.MinReplica > 0 {
+					schedules += fmt.Sprintf(", schedule %s min=%d", s.Name, s.AutoscalingSettings.MinReplica)
+				}
+			}
+		}
+		if env.ScheduleDecodeErr != nil {
+			schedules += ", schedules unreadable"
+		}
+		if minReplica > 0 || activeReplica > 0 || schedules != "" {
+			blockers = append(blockers, fmt.Sprintf("%s (min=%d, active=%d%s)", env.Name, minReplica, activeReplica, schedules))
 		}
 	}
 	sort.Strings(blockers)

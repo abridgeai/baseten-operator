@@ -4559,6 +4559,75 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=0, active=3)"))
 			})
 
+			DescribeTable("with deletionPolicy DeleteWithGuardrails on an idle env with autoscaling schedules",
+				func(name string, schedules []baseten.AutoscalingSchedule, decodeErr error, wantBlocked string) {
+					model := newTestModel(name)
+					model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+					defer cleanupModel(name)
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive}, nil)
+					var observed *baseten.AutoscalingSchedules
+					if schedules != nil {
+						observed = &baseten.AutoscalingSchedules{Timezone: ptr("America/New_York"), Schedules: schedules, AppliedState: &baseten.AutoscalingScheduleState{ScheduleID: ptr("sched-nights"), AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5}}}
+					}
+					mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+						return []baseten.Environment{{
+							Name:                 "prod",
+							CurrentDeployment:    &baseten.Deployment{Name: "depl-prod", Status: baseten.DeploymentStatusScaledToZero},
+							PromotionSettings:    &baseten.PromotionSettings{},
+							AutoscalingSettings:  &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5},
+							AutoscalingSchedules: observed,
+							ScheduleDecodeErr:    decodeErr,
+						}}, nil
+					}
+					deleteCalls := 0
+					mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+						deleteCalls++
+						return nil
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					toDelete := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+					if wantBlocked == "" {
+						reconcileUntilGone(name)
+						Expect(deleteCalls).To(Equal(1))
+						return
+					}
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+					Expect(deleteCalls).To(Equal(0))
+					status := getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+					Expect(status.Message).To(ContainSubstring(wantBlocked))
+					Expect(status.Message).NotTo(ContainSubstring("schedule off"))
+					Expect(status.Message).NotTo(ContainSubstring("schedule nights"))
+				},
+				Entry("blocks on an enabled schedule with min_replicas above 0", "deletion-guardrails-schedule-on",
+					[]baseten.AutoscalingSchedule{
+						{ID: "sched-bh", Name: "business-hours", Enabled: true, Cadence: "DAILY", Weekdays: []string{"MONDAY", "FRIDAY"}, StartHour: ptr(int32(9)), StartMinute: 30, EndHour: ptr(int32(17)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 2, MaxReplica: 10}},
+						{ID: "sched-off", Name: "off", Enabled: false, Cadence: baseten.CadenceOneTime, StartAt: "2099-11-01T00:00:00Z", EndAt: "2099-11-02T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 3, MaxReplica: 10}},
+						{ID: "sched-nights", Name: "nights", Enabled: true, Cadence: "DAILY", Weekdays: []string{"MONDAY", "FRIDAY"}, StartHour: ptr(int32(0)), EndHour: ptr(int32(6)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 5}},
+						{ID: "sched-we", Name: "weekend", Enabled: true, Cadence: baseten.CadenceOneTime, StartAt: "2099-10-03T00:00:00Z", EndAt: "2099-10-05T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 1, MaxReplica: 1}},
+					}, nil, "prod (min=0, active=0, schedule business-hours min=2, schedule weekend min=1)"),
+				Entry("proceeds when every schedule is disabled or has min_replicas 0", "deletion-guardrails-schedule-off",
+					[]baseten.AutoscalingSchedule{
+						{ID: "sched-off", Name: "off", Enabled: false, Cadence: "DAILY", Weekdays: []string{"SATURDAY"}, StartHour: ptr(int32(8)), EndHour: ptr(int32(20)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 3, MaxReplica: 10}},
+						{ID: "sched-nights", Name: "nights", Enabled: true, Cadence: "HOURLY", Weekdays: []string{"SUNDAY"}, EndMinute: 15, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 5}},
+					}, nil, ""),
+				Entry("proceeds when the schedule list is empty", "deletion-guardrails-schedule-empty",
+					[]baseten.AutoscalingSchedule{}, nil, ""),
+				Entry("blocks when the schedules cannot be decoded (fail safe)", "deletion-guardrails-schedule-unreadable",
+					nil, fmt.Errorf("bad schedule payload"), "prod (min=0, active=0, schedules unreadable)"),
+			)
+
 			It("with deletionPolicy DeleteWithGuardrails blocks on a busy env unrelated to the CR's spec", func() {
 				// CR tracks the "dev" env, but "prod" env (which this CR has
 				// nothing to do with) is still serving. DeleteModel cascades to
@@ -4588,6 +4657,8 @@ var _ = Describe("BasetenModel Controller", func() {
 							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 4},
 							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2, MaxReplica: 20},
 						},
+						{Name: "staging", CurrentDeployment: &baseten.Deployment{Name: "depl-staging", ActiveReplicaCount: 1}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 3}, AutoscalingSchedules: &baseten.AutoscalingSchedules{Timezone: ptr("UTC"), Schedules: []baseten.AutoscalingSchedule{{ID: "sched-st", Name: "weekend", Enabled: true, Cadence: "HOURLY", Weekdays: []string{"SATURDAY", "SUNDAY"}, EndMinute: 15, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 1, MaxReplica: 4}}, {ID: "sched-st-off", Name: "paused", Enabled: false, Cadence: "HOURLY", Weekdays: []string{"MONDAY"}, EndMinute: 30, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 2, MaxReplica: 4}}, {ID: "sched-st-once", Name: "drain", Enabled: true, Cadence: baseten.CadenceOneTime, StartAt: "2099-12-01T00:00:00Z", EndAt: "2099-12-02T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 4}}}}},
+						{Name: "canary", CurrentDeployment: &baseten.Deployment{Name: "depl-canary", ActiveReplicaCount: 1}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 3}, ScheduleDecodeErr: fmt.Errorf("bad schedule payload")},
 					}, nil
 				}
 				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
@@ -4612,6 +4683,8 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
 				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=2, active=4)"),
 					"status should call out the offending env even when it's not the one this CR tracks")
+				Expect(stuck.Status.Message).To(ContainSubstring("staging (min=1, active=1, schedule weekend min=1)"))
+				Expect(stuck.Status.Message).To(ContainSubstring("canary (min=1, active=1, schedules unreadable)"))
 				Expect(stuck.Status.Message).NotTo(ContainSubstring(testEnvName+" ("),
 					"the idle env this CR tracks must not appear in blockers")
 			})
