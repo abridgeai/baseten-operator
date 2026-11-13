@@ -53,6 +53,17 @@ func TestDeploymentNameMatchesPrefix(t *testing.T) {
 		{"empty prefix", "img-1.0", "", false},
 		{"both empty", "", "", true},
 		{"prefix without dot separator should not match", "img-1.0-wgt-1.0-p-1.2extra", "img-1.0-wgt-1.0-p-1.2", false},
+		{"live promotion counter .1", "depl-model-management-cpu-latest-3791d967.1", "depl-model-management-cpu-latest-3791d967", true},
+		{"live promotion counter .2", "depl-abridge-models-vllm-0.26.0-2026.1106.2120-14b56f1f.2", "depl-abridge-models-vllm-0.26.0-2026.1106.2120-14b56f1f", true},
+		{"dotted version tail is not a promotion suffix", "img-1.0-wgt-1.0-p-1.3.1768269232", "img-1.0-wgt-1.0-p-1", false},
+		{"non-numeric dotted tail", "img-1.0-wgt-1.0-p-1.2.rc1", "img-1.0-wgt-1.0-p-1.2", false},
+		{"bare trailing dot", "img-1.0-wgt-1.0-p-1.", "img-1.0-wgt-1.0-p-1", false},
+		{"one dotted number is ambiguous and matches", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", true},
+		{"promotion counter .6", "img-1.0-wgt-1.0-p-1.2.6", "img-1.0-wgt-1.0-p-1.2", true},
+		{"promotion counter .12", "img-1.0-wgt-1.0-p-1.2.12", "img-1.0-wgt-1.0-p-1.2", true},
+		{"long promotion counter", "img-1.0-wgt-1.0-p-1.2.123456789012", "img-1.0-wgt-1.0-p-1.2", true},
+		{"digits without the dot do not match", "img-1.0-wgt-1.0-p-1.212", "img-1.0-wgt-1.0-p-1.2", false},
+		{"all-digit name under another prefix", "1768269232", "img-1.0", false},
 	}
 
 	for _, tt := range tests {

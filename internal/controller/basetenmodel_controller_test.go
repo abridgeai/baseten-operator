@@ -1694,6 +1694,135 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
 			})
 
+			DescribeTable("should promote a spec change, also when the live name matches it",
+				func(name, lastSource, specSource, live string) {
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = specSource
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = lastSource
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					live0 := &baseten.Deployment{ID: "live-id", Name: live, Status: baseten.DeploymentStatusActive}
+					mockEnvWithSettings(live0, nil)
+					candStatus := ""
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						if depName == specSource+".1" {
+							return "promoted-dep-id", candStatus, nil
+						}
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promoted := ""
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promoted = depID
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: specSource + ".1", Status: "DEPLOYING"}, nil
+					}
+					retries := 0
+					mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+						retries++
+						return &baseten.RetryResponse{Retried: true}, nil
+					}
+
+					_, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promoted).To(Equal(testDeploymentID))
+
+					// Later passes: the old copy still serves while our candidate deploys, then fails.
+					for _, st := range []string{baseten.DeploymentStatusDeploying, baseten.DeploymentStatusBuildFailed} {
+						candStatus = st
+						mockEnvWithSettings(live0, &baseten.Deployment{ID: "promoted-dep-id", Name: specSource + ".1", Status: st})
+						_, err = reconcileByName(name)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(getModelStatus(name).DeploymentStatus).NotTo(Equal(baseten.DeploymentStatusActive), st)
+					}
+					Expect(retries).To(Equal(1))
+				},
+				Entry("rollback p-1.3 to p-1", "step5-rollback-shorter", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.3"),
+				Entry("rollback p-1.3 to p-1, live copy suffixed", "step5-rollback-suffixed", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.3.2"),
+				Entry("upgrade p-1 to p-1.2 while the p-1 copy is p-1.2", "step5-upgrade-collides", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.2", "img-1.0-wgt-1.0-p-1.2"),
+				Entry("unrelated live name with no recorded source", "step5-unrelated-live", "", "img-1.0-wgt-1.0-p-1", "img-0.9-wgt-1.0-p-1.1"),
+			)
+
+			DescribeTable("should treat a live .N promotion copy as steady state",
+				func(name, lastSource, live, statusCand string, cand *baseten.Deployment) {
+					const src = "depl-model-management-cpu-latest-3791d967"
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = src
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = lastSource
+					model.Status.CandidateDeploymentID = statusCand
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{ID: "live-id", Name: src + live, Status: baseten.DeploymentStatusActive}, cand)
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promoteCalled := false
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promoteCalled = true
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: src + ".9", Status: "DEPLOYING"}, nil
+					}
+
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promoteCalled).To(BeFalse())
+					Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+					Expect(getModelStatus(name).ActiveDeploymentName).To(Equal(src + live))
+				},
+				Entry(".1 with no recorded source", "step5-live-copy-1", "", ".1", "", nil),
+				Entry(".2 with the same recorded source", "step5-live-copy-2", "depl-model-management-cpu-latest-3791d967", ".2", "", nil),
+				Entry(".2 with a candidate of the source that is not ours", "step5-live-copy-foreign", "", ".2", "",
+					&baseten.Deployment{ID: "foreign-id", Name: "depl-model-management-cpu-latest-3791d967.3", Status: baseten.DeploymentStatusDeploying}),
+				Entry(".2 with our candidate of another source", "step5-live-copy-other", "", ".2", "cand-id",
+					&baseten.Deployment{ID: "cand-id", Name: "depl-model-management-cpu-latest-0000aaaa.1", Status: baseten.DeploymentStatusDeploying}),
+				Entry(".1 completed while our candidate is still listed", "step5-live-copy-lingering",
+					"depl-model-management-cpu-latest-3791d967", ".1", "live-id",
+					&baseten.Deployment{ID: "live-id", Name: "depl-model-management-cpu-latest-3791d967.1", Status: baseten.DeploymentStatusActive}),
+				Entry(".1 with an older recorded source", "step5-live-copy-older-last", "depl-model-management-cpu-latest-0000aaaa", ".1", "", nil),
+				Entry(".2 with a foreign candidate while our live ID is recorded", "step5-live-copy-foreign-recorded",
+					"depl-model-management-cpu-latest-3791d967", ".2", "live-id",
+					&baseten.Deployment{ID: "foreign-id", Name: "depl-model-management-cpu-latest-3791d967.3", Status: baseten.DeploymentStatusDeploying}),
+			)
+
+			DescribeTable("should call Promote again on the next pass after a failed Promote",
+				func(name, live string) {
+					const src = "img-1.0-wgt-1.0-p-1"
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = src
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = live
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{ID: "live-id", Name: live, Status: baseten.DeploymentStatusActive}, nil)
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promotes := 0
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promotes++
+						if promotes == 1 {
+							return nil, &baseten.APIError{StatusCode: 500, Message: "internal error"}
+						}
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: src + ".1", Status: "DEPLOYING"}, nil
+					}
+
+					_, err := reconcileByName(name)
+					Expect(err).To(HaveOccurred())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promotes).To(Equal(2))
+					Expect(getModelStatus(name).DeploymentStatus).NotTo(Equal(baseten.DeploymentStatusActive))
+				},
+				Entry("colliding rollback p-1.3 to p-1", "step5-promote-fail-colliding", "img-1.0-wgt-1.0-p-1.3"),
+				Entry("non-colliding live name", "step5-promote-fail-control", "img-0.9-wgt-1.0-p-1.1"),
+			)
+
 			It("should invalidate cached modelID when Promote fails with 404", func() {
 				// Regression: if modelID goes stale between validateSourceDeployment
 				// and Promote (e.g., model recreated mid-reconcile), Promote's 404

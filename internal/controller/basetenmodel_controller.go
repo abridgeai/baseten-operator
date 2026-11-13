@@ -174,7 +174,7 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	logger.Info("Environment reconciled", "environment", envName)
 
-	if env.CurrentDeployment != nil && baseten.DeploymentNameMatchesPrefix(env.CurrentDeployment.Name, sourceDeploymentName) {
+	if currentServesSource(model, env, sourceDeploymentName) {
 		logger.V(1).Info("Current deployment matches source prefix",
 			"currentDeployment", env.CurrentDeployment.Name,
 			"sourceDeploymentName", sourceDeploymentName,
@@ -285,11 +285,10 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		"targetEnvironment", envName)
 
 	r.logUpdateStatus(ctx, model, statusUpdate{
-		deploymentStatus:     statusPromotingDeployment,
-		message:              fmt.Sprintf("%spromoting %s to %s", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName),
-		modelID:              modelID,
-		sourceDeploymentID:   sourceDeploymentID,
-		sourceDeploymentName: sourceDeploymentName,
+		deploymentStatus:   statusPromotingDeployment,
+		message:            fmt.Sprintf("%spromoting %s to %s", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName),
+		modelID:            modelID,
+		sourceDeploymentID: sourceDeploymentID,
 	})
 
 	targetDep, err := r.BasetenClient.Promote(ctx, modelID, sourceDeploymentID, envName, model.Spec.Environment.PromotionSettings)
@@ -297,11 +296,10 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "Failed to promote source deployment")
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionFailed, "Failed to promote %s to %s: %v", sourceDeploymentName, envName, err)
 		r.logUpdateStatus(ctx, model, statusUpdate{
-			deploymentStatus:     baseten.DeploymentStatusFailed,
-			message:              fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
-			modelID:              modelID,
-			sourceDeploymentID:   sourceDeploymentID,
-			sourceDeploymentName: sourceDeploymentName,
+			deploymentStatus:   baseten.DeploymentStatusFailed,
+			message:            fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
+			modelID:            modelID,
+			sourceDeploymentID: sourceDeploymentID,
 		})
 		if r.invalidateModelID(ctx, model, err) {
 			return ctrl.Result{RequeueAfter: time.Second}, nil
@@ -892,10 +890,27 @@ func (r *BasetenModelReconciler) expectedSourceDeploymentName(ctx context.Contex
 	return truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image), nil
 }
 
+// currentServesSource reports whether current is the promotion of source. "p-1.3" matches
+// both "p-1.3" and "p-1" (Baseten copies are "<name>.<N>"), so after a spec change a live
+// name that also matches the last promoted source belongs to that source, and while our own
+// promotion of source is the candidate, the live name is the old copy.
+func currentServesSource(model *modelsv1alpha1.BasetenModel, env *baseten.Environment, source string) bool {
+	current, cand := env.CurrentDeployment, env.CandidateDeployment
+	if current == nil || !baseten.DeploymentNameMatchesPrefix(current.Name, source) {
+		return false
+	}
+	if cand != nil && cand.ID != current.ID && cand.ID == model.Status.CandidateDeploymentID &&
+		baseten.DeploymentNameMatchesPrefix(cand.Name, source) {
+		return false
+	}
+	last := model.Status.SourceDeploymentName
+	return last == source || !baseten.DeploymentNameMatchesPrefix(current.Name, last)
+}
+
 // composeObserveStatus builds a statusUpdate that reflects observed Baseten
-// state. Mirrors the Reconcile-path status decisions for steady, promoting,
-// and not-yet-promoted scenarios, with mode-specific phrasing where Observe
-// can't act ("awaiting reconciliation", "observe mode does not create").
+// state: steady (plain prefix match, without the currentServesSource tiebreak
+// of Reconcile), promoting, and not-yet-promoted, with mode-specific phrasing
+// where Observe can't act ("awaiting reconciliation", "observe mode does not create").
 func (r *BasetenModelReconciler) composeObserveStatus(model *modelsv1alpha1.BasetenModel, env *baseten.Environment, sourceDeploymentName, modelID string) statusUpdate {
 	envName := model.Spec.Environment.Name
 
