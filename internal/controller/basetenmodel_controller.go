@@ -1834,6 +1834,11 @@ func (r *BasetenModelReconciler) invalidateModelID(ctx context.Context, model *m
 	if !baseten.IsNotFoundError(err) || model.Status.ModelID == "" {
 		return false
 	}
+	// A 404 from a deployment or environment call does not prove the model is gone:
+	// keep the ID (and let the error back off) while the name still resolves to it.
+	if id, lerr := r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName, model.Spec.Team); lerr != nil || id == model.Status.ModelID {
+		return false
+	}
 	logger := log.FromContext(ctx)
 	logger.Info("Invalidating cached model ID", "modelID", model.Status.ModelID)
 	r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelNotFound, "Invalidating cached model ID %s, will re-resolve", model.Status.ModelID)

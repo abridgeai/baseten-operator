@@ -842,6 +842,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelID = testModelID
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) { return "", nil }
 				// Environment succeeds but FindDeploymentIDByName fails (e.g., stale model ID)
 				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, deploymentName string) (string, string, error) {
@@ -943,6 +944,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelID = testModelID
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) { return "", nil }
 				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
 					return nil, &baseten.APIError{StatusCode: 404, Message: "not found"}
 				}
@@ -1720,6 +1722,57 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelNotFound")))
 			})
 
+			It("should keep status.modelID when Promote 404s but the model still resolves to the same ID", func() {
+				name := "step5-promote-404-same-model"
+				model := newTestModel(name)
+				model.Spec.Team = "team-a"
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					if modelName != testModelName || team != "team-a" {
+						return "model-other", nil
+					}
+					return testModelID, nil
+				}
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "deployment not found"}
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred(), "a sub-resource 404 must back off, not requeue in 1 s")
+				Expect(result.IsZero()).To(BeTrue())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
+			})
+
+			It("should keep status.modelID when Promote 404s and the name lookup fails", func() {
+				name := "step5-promote-404-lookup-error"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				lookups := 0
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					if lookups++; lookups > 1 {
+						return "", &baseten.APIError{StatusCode: 500, Message: "internal error"}
+					}
+					return testModelID, nil
+				}
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "deployment not found"}
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred())
+				Expect(getModelStatus(name).ModelID).To(Equal(testModelID))
+			})
+
 			It("should promote when source is SCALED_TO_ZERO", func() {
 				name := "step5-promote-scaled"
 				model := newTestModel(name)
@@ -1944,6 +1997,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				setupThroughStep2()
+				lookups := 0
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					if lookups++; lookups > 1 {
+						return "model-recreated", nil
+					}
+					return testModelID, nil
+				}
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return testDeploymentID, baseten.DeploymentStatusActive, nil
 				}
@@ -3308,6 +3368,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				model.Status.ModelID = testModelID
 				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) { return "", nil }
 				// Simulate Baseten returning 404 on GET /models/<id>/deployments —
 				// which happens when the cached modelID no longer corresponds to
 				// a live model (e.g., model recreated, migrated).
