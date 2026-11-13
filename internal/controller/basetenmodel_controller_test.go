@@ -3961,6 +3961,33 @@ var _ = Describe("BasetenModel Controller", func() {
 			})
 		})
 
+		It("should clear the backoff state when the finalizer is released", func() {
+			name := "deletion-clears-backoff"
+			key := types.NamespacedName{Name: name, Namespace: "default"}
+			model := newTestModel(name)
+			defer cleanupModel(name)
+
+			setupThroughStep2()
+			mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+				return testDeploymentID, baseten.DeploymentStatusBuilding, nil
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			expectWait(name, 30*time.Second)
+			expectWait(name, time.Minute)
+			_, found := reconciler.pollState.Load(key)
+			Expect(found).To(BeTrue(), "backoff entry should exist before deletion")
+
+			toDelete := &modelsv1alpha1.BasetenModel{}
+			Expect(k8sClient.Get(ctx, key, toDelete)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+			_, err := reconcileByName(name)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, key, &modelsv1alpha1.BasetenModel{}))).To(BeTrue(), "finalizer should be released")
+			_, found = reconciler.pollState.Load(key)
+			Expect(found).To(BeFalse(), "backoff entry should be gone after the finalizer is released")
+		})
+
 		Describe("Resource not found", func() {
 			It("should return no error when resource is deleted", func() {
 				result, err := reconcileByName("non-existent-resource")

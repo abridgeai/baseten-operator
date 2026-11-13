@@ -761,6 +761,7 @@ func (r *BasetenModelReconciler) checkDeleteGuardrails(ctx context.Context, mode
 // finalizer-clear — the cleanup goal is achieved either way.
 func (r *BasetenModelReconciler) releaseFinalizer(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
 	controllerutil.RemoveFinalizer(model, modelsv1alpha1.FinalizerName)
+	r.resetWait(model)
 	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, model))
 }
 
