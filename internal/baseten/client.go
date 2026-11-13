@@ -82,6 +82,7 @@ func toAPIError(err error) error {
 
 // ClientInterface defines the contract for interacting with the Baseten API.
 type ClientInterface interface {
+	CancelPromotion(ctx context.Context, modelID, envName string) error
 	FindModelIDByName(ctx context.Context, modelName, team string) (string, error)
 	DeleteModel(ctx context.Context, modelID string) error
 	GetEnvironment(ctx context.Context, modelID, envName string) (*Environment, error)
@@ -188,6 +189,7 @@ type RollingDeploySettings struct {
 
 // Environment represents a Baseten environment with its current deployment
 type Environment struct {
+	PromotionStatus     string               `json:"promotion_status"`
 	Name                string               `json:"name"`
 	CurrentDeployment   *Deployment          `json:"current_deployment,omitempty"`
 	CandidateDeployment *Deployment          `json:"candidate_deployment,omitempty"`
@@ -406,8 +408,13 @@ func toDeploymentDetail(d managementapi.Deployment) DeploymentDetail {
 
 func toEnvironment(e *managementapi.Environment) *Environment {
 	schedules, err := toAutoscalingSchedules(e.AutoscalingSchedules)
+	var promotionStatus string
+	if e.InProgressPromotion != nil {
+		promotionStatus = string(e.InProgressPromotion.Status)
+	}
 	return &Environment{
 		Name:                 e.Name,
+		PromotionStatus:      promotionStatus,
 		CurrentDeployment:    toDeployment(e.CurrentDeployment),
 		CandidateDeployment:  toDeployment(e.CandidateDeployment),
 		AutoscalingSettings:  toAutoscalingSettings(e.AutoscalingSettings),
@@ -749,4 +756,9 @@ func HasPromotionSettingsDrift(spec *modelsv1alpha1.PromotionSettingsConfig, env
 	}
 
 	return len(drifts) > 0, drifts
+}
+
+func (c *Client) CancelPromotion(ctx context.Context, modelID, envName string) error {
+	_, err := c.api.PostModelsEnvironmentsCancelPromotion(ctx, modelID, envName)
+	return toAPIError(err)
 }

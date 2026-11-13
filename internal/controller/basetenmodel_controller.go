@@ -601,7 +601,7 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 }
 
 // reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel:
-// deletion handling, paused short-circuit, and finalizer add. Deletion is
+// explicit promotion cancellation, deletion handling, paused short-circuit, and finalizer add. Deletion is
 // always allowed to proceed regardless of mode (so a paused or observe CR can
 // be cleanly removed); reconcileDeletion is mode-aware and only calls
 // DeleteModel in Reconcile mode with deletionPolicy: Delete.
@@ -616,6 +616,10 @@ func (r *BasetenModelReconciler) reconcileLifecycle(ctx context.Context, model *
 	if effectiveMode(model) == modelsv1alpha1.ModePause {
 		r.reconcilePaused(ctx, model)
 		return true, ctrl.Result{}, nil
+	}
+	if model.Spec.PromotionCancellation != nil {
+		result, err := r.reconcilePromotionCancellation(ctx, model)
+		return true, result, err
 	}
 	if !controllerutil.AddFinalizer(model, modelsv1alpha1.FinalizerName) {
 		return false, ctrl.Result{}, nil
@@ -1901,6 +1905,12 @@ func (r *BasetenModelReconciler) logUpdateStatus(ctx context.Context, model *mod
 }
 
 func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *modelsv1alpha1.BasetenModel, s statusUpdate) error {
+	generationObserved := false
+	for _, condition := range model.Status.Conditions {
+		if condition.Type == conditionReady && condition.ObservedGeneration == model.Generation {
+			generationObserved = true
+		}
+	}
 	// Snapshot fields that determine whether an update is needed.
 	// modelIDResolvedTimeSet is included so a nil → non-nil transition (e.g.,
 	// when an upgraded operator first reconciles a pre-existing CR whose
@@ -1952,7 +1962,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	}
 
 	// Auto-clear deployment retry tracking on healthy status
-	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero {
+	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionCanceled {
 		model.Status.FirstDeploymentFailureTime = nil
 		model.Status.DeploymentRetryCount = 0
 		model.Status.NextRetryTime = nil
@@ -1961,7 +1971,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	}
 
 	readyStatus := metav1.ConditionFalse
-	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero {
+	if s.deploymentStatus == baseten.DeploymentStatusActive || s.deploymentStatus == baseten.DeploymentStatusScaledToZero || s.deploymentStatus == statusPromotionCanceled {
 		readyStatus = metav1.ConditionTrue
 	}
 	setCondition(&model.Status.Conditions, metav1.Condition{
@@ -1997,7 +2007,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		candidateDeploymentID:   model.Status.CandidateDeploymentID,
 		candidateDeploymentName: model.Status.CandidateDeploymentName,
 	}
-	if curr == prev && !conditionsChanged(model.Status.Conditions, s.deploymentStatus, readyStatus, progressingStatus) {
+	if generationObserved && curr == prev && !conditionsChanged(model.Status.Conditions, s.deploymentStatus, readyStatus, progressingStatus) {
 		return nil
 	}
 
