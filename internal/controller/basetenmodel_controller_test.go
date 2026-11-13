@@ -282,6 +282,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			recorder = record.NewFakeRecorder(20)
 			reconciler = &BasetenModelReconciler{
 				Client:        k8sClient,
+				APIReader:     k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				BasetenClient: mockClient,
 				TrussPusher:   mockPusher,

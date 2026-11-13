@@ -185,6 +185,7 @@ func main() {
 
 	if err := (&controller.BasetenModelReconciler{
 		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
 		Scheme:                  mgr.GetScheme(),
 		BasetenClient:           basetenClient,
 		TrussPusher:             trussPusher,
