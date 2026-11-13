@@ -34,7 +34,8 @@ Both converge on environment reconciliation + promotion.
 
 - **Reconcile is environment-polling + prefix matching.** `GET environments/{name}` returns
   `current_deployment` and `candidate_deployment` and is the single source of truth. Baseten adds
-  timestamp suffixes during promotion, so names are matched with `DeploymentNameMatchesPrefix`.
+  a dot plus a promotion counter (legacy: a 10-digit timestamp) to names during promotion, so
+  names are matched with `DeploymentNameMatchesPrefix`.
 - **Tri-state health:** every status update sets both `Ready` and `Progressing` conditions
   (Ready=True → Argo Healthy; Ready=False+Progressing=True → Progressing; both False → Degraded).
 - **Automatic retry:** retryable failures (FAILED, DEPLOY_FAILED, BUILD_FAILED) are retried via the

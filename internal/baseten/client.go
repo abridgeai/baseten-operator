@@ -592,10 +592,14 @@ func int32PtrToIntPtr(p *int32) *int {
 	return &v
 }
 
-// DeploymentNameMatchesPrefix checks if a deployment name matches the given prefix,
-// accounting for Baseten's timestamp suffix (e.g., "img-1.0-wgt-1.0-p-1.2.1768269232")
+// DeploymentNameMatchesPrefix reports whether deploymentName is prefix or a Baseten
+// promotion copy of it: prefix, one dot and digits ("x.1", "x.1768269232").
 func DeploymentNameMatchesPrefix(deploymentName, prefix string) bool {
-	return deploymentName == prefix || strings.HasPrefix(deploymentName, prefix+".")
+	if deploymentName == prefix {
+		return true
+	}
+	rest, ok := strings.CutPrefix(deploymentName, prefix+".")
+	return ok && rest != "" && strings.Trim(rest, "0123456789") == ""
 }
 
 // IsTerminalFailure returns true for deployment statuses that indicate a terminal failure
