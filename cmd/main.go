@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -161,7 +162,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), withLeaderElection(ctrl.Options{
+	mgr, err := ctrl.NewManager(withClientRateLimit(ctrl.GetConfigOrDie()), withLeaderElection(ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -224,4 +225,11 @@ func withLeaderElection(o ctrl.Options, enabled bool) ctrl.Options {
 	// Safe: main returns as soon as mgr.Start does, so nothing runs after the release.
 	o.LeaderElectionReleaseOnCancel = true
 	return o
+}
+
+// withClientRateLimit replaces the default QPS -1 (no client-side limit) with a
+// bucket far above measured load, so a reconcile hot loop cannot flood the API server.
+func withClientRateLimit(cfg *rest.Config) *rest.Config {
+	cfg.QPS, cfg.Burst = 10, 20
+	return cfg
 }
