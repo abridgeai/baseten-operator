@@ -291,13 +291,6 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		"sourceDeploymentName", sourceDeploymentName,
 		"targetEnvironment", envName)
 
-	r.logUpdateStatus(ctx, model, statusUpdate{
-		deploymentStatus:   statusPromotingDeployment,
-		message:            fmt.Sprintf("%spromoting %s to %s", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName),
-		modelID:            modelID,
-		sourceDeploymentID: sourceDeploymentID,
-	})
-
 	targetDep, err := r.BasetenClient.Promote(ctx, modelID, sourceDeploymentID, envName, model.Spec.Environment.PromotionSettings)
 	if err != nil {
 		logger.Error(err, "Failed to promote source deployment")
@@ -698,12 +691,6 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 	}
-
-	r.logUpdateStatus(ctx, model, statusUpdate{
-		deploymentStatus: statusDeleting,
-		message:          fmt.Sprintf("deleting Baseten model %s", modelID),
-		modelID:          modelID,
-	})
 
 	if err := r.BasetenClient.DeleteModel(ctx, modelID); err != nil {
 		if baseten.IsNotFoundError(err) {
@@ -1386,6 +1373,23 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 		return "", &ctrl.Result{}, err
 	}
 
+	// Try to acquire push semaphore — if full, requeue instead of spawning unbounded goroutines
+	if r.PushSemaphore != nil {
+		select {
+		case r.PushSemaphore <- struct{}{}:
+			// Acquired — will be released in asyncPush
+		default:
+			logger.Info("Push semaphore full, requeuing", "deploymentName", deploymentName)
+			r.logUpdateStatus(ctx, model, statusUpdate{
+				deploymentStatus: statusPending,
+				message:          fmt.Sprintf("%swaiting for push capacity for %s", ap, deploymentName),
+				modelID:          modelID,
+			})
+			result := ctrl.Result{RequeueAfter: 10 * time.Second}
+			return "", &result, nil
+		}
+	}
+
 	// Set status before launching async push
 	logger.Info("Creating deployment via truss push", "deploymentName", deploymentName, "modelName", model.Spec.ModelName)
 	now := metav1.Now()
@@ -1395,28 +1399,6 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	model.Status.TrussPushTime = &now
 	if err := r.Status().Update(ctx, model); err != nil {
 		logger.Error(err, "Failed to update status before push")
-	}
-
-	// Try to acquire push semaphore — if full, requeue instead of spawning unbounded goroutines
-	if r.PushSemaphore != nil {
-		select {
-		case r.PushSemaphore <- struct{}{}:
-			// Acquired — will be released in asyncPush
-		default:
-			logger.Info("Push semaphore full, requeuing", "deploymentName", deploymentName)
-			model.Status.TrussPushStatus = ""
-			model.Status.SourceDeploymentName = ""
-			if err := r.Status().Update(ctx, model); err != nil {
-				logger.Error(err, "Failed to reset status after semaphore full")
-			}
-			r.logUpdateStatus(ctx, model, statusUpdate{
-				deploymentStatus: statusPending,
-				message:          fmt.Sprintf("%swaiting for push capacity for %s", ap, deploymentName),
-				modelID:          modelID,
-			})
-			result := ctrl.Result{RequeueAfter: 10 * time.Second}
-			return "", &result, nil
-		}
 	}
 
 	// Launch push in background goroutine — does NOT block the reconcile loop

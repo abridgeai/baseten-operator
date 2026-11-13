@@ -363,6 +363,16 @@ var _ = Describe("BasetenModel Controller", func() {
 			Expect(result.RequeueAfter).To(BeNumerically("<=", base+base/5))
 		}
 
+		// expectNoRewrite runs one more pass over an unchanged state and checks it wrote nothing.
+		expectNoRewrite := func(name string) {
+			first := &modelsv1alpha1.BasetenModel{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, first)).To(Succeed())
+			_, _ = reconcileByName(name)
+			second := &modelsv1alpha1.BasetenModel{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, second)).To(Succeed())
+			Expect(second.ResourceVersion).To(Equal(first.ResourceVersion), "pass 2 over the same state must not write")
+		}
+
 		Describe("Paused Reconciliation", func() {
 			It("should skip all API calls and return empty result when paused", func() {
 				name := "paused-no-api"
@@ -2149,6 +2159,25 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(getModelStatus(name).DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
 			})
 
+			It("should not rewrite status on a repeated Promote failure", func() {
+				name := "step5-promote-fail-repeat"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusActive, nil
+				}
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					return nil, fmt.Errorf("promotion API error")
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred())
+				Expect(getModelStatus(name).DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+				expectNoRewrite(name)
+			})
+
 			It("should block promotion when another promotion is in progress (double-promote guard)", func() {
 				name := "step5-double-promote"
 				model := newTestModel(name)
@@ -3428,6 +3457,29 @@ var _ = Describe("BasetenModel Controller", func() {
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
 			})
 
+			It("should not rewrite status while the push semaphore stays full", func() {
+				name := "truss-push-semaphore-full"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+
+				reconciler.PushSemaphore = make(chan struct{}, 1)
+				reconciler.PushSemaphore <- struct{}{}
+				mockModelFound()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", nil
+				}
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					Fail("push must not start while the semaphore is full")
+					return nil, nil
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+				Expect(getModelStatus(name).DeploymentStatus).To(Equal(statusPending))
+				expectNoRewrite(name)
+			})
+
 			It("should push a CPU-only config with cpu/memory and no accelerator", func() {
 				name := "truss-push-cpu-only"
 				model := newTrussConfigModel(name)
@@ -3603,6 +3655,89 @@ var _ = Describe("BasetenModel Controller", func() {
 					status := waitForFailure(name, 2)
 					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(2)))
 					Expect(time.Until(status.TrussPushNextRetryTime.Time)).To(BeNumerically(">=", 2*retryBaseInterval-time.Second), "backoff should double")
+				})
+
+				It("should keep the failure record when a due retry finds the push semaphore full", func() {
+					name := "truss-push-backoff-semaphore-full"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					var calls int32
+					failingPush(&calls)
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 1)
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					past := metav1.NewTime(time.Now().Add(-time.Second))
+					m.Status.TrussPushNextRetryTime = &past
+					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
+
+					reconciler.PushSemaphore = make(chan struct{}, 1)
+					reconciler.PushSemaphore <- struct{}{}
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(getModelStatus(name).TrussPushStatus).To(Equal(statusTrussPushFailed))
+					Expect(atomic.LoadInt32(&calls)).To(Equal(int32(1)))
+
+					By("retrying once the semaphore frees, the attempt count grows")
+					reconciler.PushSemaphore = nil
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					waitForFailure(name, 2)
+				})
+
+				It("should keep the last push record while the semaphore is full and push the new config once it frees", func() {
+					name := "truss-push-config-change-semaphore-full"
+					model := newTrussConfigModel(name)
+					defer cleanupModel(name)
+					mockModelFound()
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return "", "", nil
+					}
+					var calls int32
+					release := make(chan struct{})
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+						if atomic.AddInt32(&calls, 1) == 2 {
+							<-release
+						}
+						return &truss.PushResult{ModelID: testModelID, DeploymentID: "dep-" + deploymentName}, nil
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() string { return getModelStatus(name).TrussPushStatus }, 2*time.Second, 50*time.Millisecond).Should(Equal(statusTrussPushDone))
+					before := getModelStatus(name)
+					Expect(before.TrussPushTime).To(BeNil())
+
+					m := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+					m.Spec.TrussConfig.BaseImage.Image = "test:v2"
+					Expect(k8sClient.Update(ctx, m)).To(Succeed())
+
+					reconciler.PushSemaphore = make(chan struct{}, 1)
+					reconciler.PushSemaphore <- struct{}{}
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					full := getModelStatus(name)
+					Expect(full.DeploymentStatus).To(Equal(statusPending))
+					Expect(full.TrussPushStatus).To(Equal(statusTrussPushDone), "a full semaphore must not mark a push")
+					Expect(full.TrussConfigHash).To(Equal(before.TrussConfigHash), "a full semaphore must not record the new hash")
+					Expect(full.SourceDeploymentName).To(Equal(before.SourceDeploymentName), "a full semaphore must not record the new name")
+					Expect(full.TrussPushTime).To(BeNil(), "a full semaphore must not stamp a push time")
+
+					By("freeing the semaphore, the new config is pushed and recorded as pushing")
+					<-reconciler.PushSemaphore
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					pushing := getModelStatus(name)
+					Expect(pushing.DeploymentStatus).To(Equal(baseten.DeploymentStatusDeploying))
+					Expect(pushing.TrussPushStatus).To(Equal(statusTrussPushing))
+					Expect(pushing.TrussConfigHash).NotTo(Equal(before.TrussConfigHash))
+					Expect(pushing.TrussPushTime).NotTo(BeNil())
+					Eventually(func() int32 { return atomic.LoadInt32(&calls) }, 2*time.Second, 50*time.Millisecond).Should(Equal(int32(2)))
+					close(release)
+					Eventually(func() string { return getModelStatus(name).TrussPushStatus }, 2*time.Second, 50*time.Millisecond).Should(Equal(statusTrussPushDone))
 				})
 
 				It("should push a changed config immediately and reset the failure count", func() {
@@ -4368,6 +4503,33 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(got.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
 				Expect(got.Status.DeploymentStatus).To(Equal(statusDeleteFailed))
 				Expect(drainEvents()).To(ContainElement(ContainSubstring("ModelDeleteFailed")))
+			})
+
+			It("should not rewrite status on a repeated DeleteModel failure", func() {
+				name := "deletion-delete-5xx-repeat"
+				model := newTestModel(name)
+				model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDelete
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockEnvWithSettings(
+					&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1},
+					nil,
+				)
+				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+					return &baseten.APIError{StatusCode: 500, Message: "boom"}
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				toDelete := &modelsv1alpha1.BasetenModel{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+				_, err = reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getModelStatus(name).DeploymentStatus).To(Equal(statusDeleteFailed))
+				expectNoRewrite(name)
 			})
 
 			It("with deletionPolicy Delete and empty status.modelID releases finalizer with no API call", func() {
