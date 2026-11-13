@@ -715,7 +715,11 @@ func TestFindDeploymentIDByName(t *testing.T) {
 			if r.URL.Path != "/v1/models/model1/deployments" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
+			if got := r.URL.Query().Get("name"); got != "my-dep" {
+				t.Errorf("name filter = %q, want %q", got, "my-dep")
+			}
 			writeJSON(t, w, managementapi.Deployments{Deployments: []managementapi.Deployment{
+				{Id: "d0", Name: "my-dep.1", Status: status("ACTIVE")},
 				{Id: "d1", Name: "my-dep", Status: status("ACTIVE")},
 			}})
 		}))
