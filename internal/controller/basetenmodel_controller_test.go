@@ -3294,6 +3294,21 @@ var _ = Describe("BasetenModel Controller", func() {
 				Eventually(pushedTeam, 2*time.Second).Should(Receive(Equal("Single Tenant (Evals)")))
 			})
 
+			It("should return a zero Result when the deployment lookup fails", func() {
+				name := "truss-dep-lookup-500"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", &baseten.APIError{StatusCode: 500, Message: "internal error"}
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred())
+				Expect(result.IsZero()).To(BeTrue(), "controller-runtime drops a Result returned with an error")
+			})
+
 			It("should invalidate cached modelID when FindDeploymentIDByName returns 404", func() {
 				// Regression: previously, reconcileTrussDeployment swallowed the 404
 				// into a nil error + requeue result, so the top-level Reconcile's
