@@ -53,6 +53,20 @@ func IsNotFoundError(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+// IsPermanentClientError reports a 400 or 422: Baseten rejected the request
+// body, so sending the same request again cannot succeed.
+func IsPermanentClientError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
 // toAPIError maps a generated-client HTTP failure (*managementapi.ResponseError) to *APIError
 // so IsNotFoundError keeps working; other errors (network, decode) pass through unchanged.
 func toAPIError(err error) error {

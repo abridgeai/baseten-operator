@@ -1599,6 +1599,14 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 				if promotionDrift {
 					r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionSettingsUpdateFailed, "Failed to update promotion settings for %s: %v", envName, err)
 				}
+				if baseten.IsPermanentClientError(err) {
+					r.logUpdateStatus(ctx, model, statusUpdate{
+						deploymentStatus: baseten.DeploymentStatusFailed,
+						message:          fmt.Sprintf("Baseten rejected the settings update for %s; fix the spec: %v", envName, err),
+						modelID:          modelID,
+					})
+					return nil, &ctrl.Result{}, reconcile.TerminalError(err)
+				}
 				r.logUpdateStatus(ctx, model, statusUpdate{
 					deploymentStatus: baseten.DeploymentStatusFailed,
 					message:          fmt.Sprintf("%sfailed to update settings for %s: %v", activeMsg, envName, err),

@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -1084,6 +1085,36 @@ var _ = Describe("BasetenModel Controller", func() {
 				events := drainEvents()
 				Expect(events).To(ContainElement(ContainSubstring("AutoscalingUpdateFailed")))
 				Expect(events).To(ContainElement(ContainSubstring("PromotionSettingsUpdateFailed")))
+			})
+
+			It("should stop retrying only a settings update that Baseten rejects as invalid", func() {
+				for code, terminal := range map[int]bool{400: true, 500: false} {
+					name := fmt.Sprintf("step2-update-rejected-%d", code)
+					model := newTestModel(name)
+					mockModelFound()
+					mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+						return &baseten.Environment{
+							Name:                testEnvName,
+							CurrentDeployment:   &baseten.Deployment{Name: "img-old-wgt-old-p-old.1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 5, ConcurrencyTarget: 10}, // drift: spec says 0
+						}, nil
+					}
+					mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
+						return &baseten.APIError{StatusCode: code, Message: "max_replica too high"}
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).To(HaveOccurred())
+					isTerminal, _ := MatchError(reconcile.TerminalError(nil)).Match(err)
+					Expect(isTerminal).To(Equal(terminal), name)
+					status := getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+					if terminal {
+						Expect(status.Message).To(ContainSubstring("rejected"))
+						Expect(status.Message).NotTo(ContainSubstring("replicas"))
+					}
+					cleanupModel(name)
+				}
 			})
 
 			It("should detect and reconcile promotion settings drift", func() {

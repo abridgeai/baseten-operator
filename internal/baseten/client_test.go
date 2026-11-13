@@ -172,6 +172,22 @@ func TestIsNotFoundError(t *testing.T) {
 	}
 }
 
+func TestIsPermanentClientError(t *testing.T) {
+	permanent := map[int]bool{
+		http.StatusBadRequest: true, http.StatusUnprocessableEntity: true,
+		http.StatusUnauthorized: false, http.StatusForbidden: false, http.StatusNotFound: false,
+		http.StatusConflict: false, http.StatusTooManyRequests: false, http.StatusInternalServerError: false,
+	}
+	for code, want := range permanent {
+		if got := IsPermanentClientError(fmt.Errorf("wrapped: %w", &APIError{StatusCode: code})); got != want {
+			t.Errorf("IsPermanentClientError(%d) = %v, want %v", code, got, want)
+		}
+	}
+	if IsPermanentClientError(errors.New("network")) {
+		t.Error("IsPermanentClientError(non-APIError) = true, want false")
+	}
+}
+
 func TestAPIError_Error(t *testing.T) {
 	err := &APIError{StatusCode: 404, Message: "not found"}
 	expected := "API request failed with status 404: not found"
