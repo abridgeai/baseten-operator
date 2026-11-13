@@ -75,6 +75,10 @@ const (
 	// retryMaxInterval is the maximum backoff interval for deployment retries.
 	retryMaxInterval = 30 * time.Minute
 
+	// reconcileTimeout bounds one pass, so a hung Baseten API cannot hold a worker. It stays
+	// above the worst chain that still succeeds: about 6 calls at the 30 s client timeout.
+	reconcileTimeout = 4 * time.Minute
+
 	// retryJitterFraction is the maximum fraction of jitter added to retry intervals (0-50%).
 	retryJitterFraction = 0.5
 )
@@ -1262,8 +1266,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 			// the model ID itself is no longer valid (model recreated / migrated),
 			// which should trigger a re-resolution by name rather than infinitely
 			// retrying against a dead ID.
-			result := ctrl.Result{RequeueAfter: 30 * time.Second}
-			return "", &result, err
+			return "", &ctrl.Result{}, err
 		}
 
 		if existingID != "" {
@@ -2009,6 +2012,6 @@ func (r *BasetenModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&modelsv1alpha1.BasetenModel{}).
 		Named("basetenmodel").
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent, ReconciliationTimeout: reconcileTimeout}).
 		Complete(r)
 }
