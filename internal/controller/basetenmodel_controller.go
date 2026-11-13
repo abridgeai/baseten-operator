@@ -661,6 +661,12 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 
 	modelID := model.Status.ModelID
 	if modelID == "" {
+		// A first push writes the new model ID back when it ends; releasing now would leak that model.
+		if model.Status.TrussPushStatus == statusTrussPushing && model.Status.TrussPushTime != nil &&
+			time.Since(model.Status.TrussPushTime.Time) < trussPushStaleTimeout {
+			logger.Info("Holding finalizer until the in-flight truss push reports a model ID", "model", model.Name)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 		logger.Info("Releasing finalizer (deletionPolicy Delete but status.modelID empty)", "model", model.Name)
 		return r.releaseFinalizer(ctx, model)
 	}
