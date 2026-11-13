@@ -350,7 +350,6 @@ active: depl-vllm-0.17.0-2cb9685f.1775156532 (0 replicas, min:0 max:5, SCALED_TO
 
 # Promotion in progress
 active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoting: depl-vllm-0.17.0-2cb9685f (BUILDING, 0 replicas)
-active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoting depl-vllm-0.17.0-2cb9685f to production
 active: depl-vllm-0.16.0-a3f7c2b1 (3 replicas) | promoted depl-vllm-0.17.0-2cb9685f to production (DEPLOYING)
 
 # Pause mode
@@ -374,7 +373,6 @@ active: {name} ({replicas} replicas, min:{min} max:{max}, SCALED_TO_ZERO) in {en
 
 **Promotion lifecycle:**
 ```
-promoting {source} to {env}
 promoted {source} to {env} ({status})
 promotion of '{source}' to {env} failed: {error}
 active: {current} ({replicas} replicas) | promoting: {candidate} ({status}, {replicas} replicas)
