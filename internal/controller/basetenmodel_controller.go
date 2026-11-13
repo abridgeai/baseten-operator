@@ -82,6 +82,9 @@ const (
 // BasetenModelReconciler reconciles a BasetenModel object
 type BasetenModelReconciler struct {
 	client.Client
+	// APIReader reads objects the manager does not cache (the setup-script ConfigMap),
+	// so a Get does not open a cluster-wide informer.
+	APIReader               client.Reader
 	Scheme                  *runtime.Scheme
 	BasetenClient           baseten.ClientInterface
 	TrussPusher             truss.PusherInterface
@@ -115,7 +118,7 @@ type statusUpdate struct {
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 
 func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -1497,7 +1500,7 @@ func (r *BasetenModelReconciler) readSetupScript(ctx context.Context, tc *models
 	if tc.SetupScript != nil && tc.SetupScript.ConfigMapRef != nil {
 		ref := tc.SetupScript.ConfigMapRef
 		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, cm); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, cm); err != nil {
 			return "", fmt.Errorf("ConfigMap '%s' not found: %w", ref.Name, err)
 		}
 		script, ok := cm.Data[ref.Key]
