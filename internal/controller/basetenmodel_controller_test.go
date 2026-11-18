@@ -520,7 +520,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					Fail("UpdateDeploymentAutoscaling must not be called in Observe mode")
 					return nil
 				}
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					Fail("truss push must not be called in Observe mode")
 					return nil, nil
 				}
@@ -3403,12 +3403,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil // Not found — triggers push
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					Expect(deploymentName).To(HavePrefix("depl-"))
@@ -3428,6 +3429,121 @@ var _ = Describe("BasetenModel Controller", func() {
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
 			})
 
+			// pushedEnvironment reconciles a fresh trussConfig CR whose deployment does not
+			// exist yet and returns the environment the pusher was asked to deploy into.
+			pushedEnvironment := func(name string) string {
+				model := newTrussConfigModel(name)
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", nil
+				}
+				pushed := make(chan string, 1)
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
+					pushed <- environment
+					return &truss.PushResult{ModelID: testModelID, DeploymentID: "env-dep"}, nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				var environment string
+				Eventually(pushed, 2*time.Second).Should(Receive(&environment))
+				return environment
+			}
+
+			It("should push into the environment when it already exists", func() {
+				name := "truss-push-into-environment"
+				defer cleanupModel(name)
+				mockModelFound()
+				mockEnvWithSettings(nil, nil)
+
+				Expect(pushedEnvironment(name)).To(Equal(testEnvName))
+			})
+
+			It("should push a standalone deployment when the environment does not exist yet", func() {
+				name := "truss-push-environment-missing"
+				defer cleanupModel(name)
+				mockModelFound()
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "environment not found"}
+				}
+
+				Expect(pushedEnvironment(name)).To(BeEmpty(), "the environment is created after the push, so the push must stay standalone")
+			})
+
+			It("should push a standalone deployment when the model does not exist yet", func() {
+				name := "truss-push-model-missing"
+				defer cleanupModel(name)
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					return "", nil
+				}
+				// GetEnvironmentFunc stays unset: without a model there is no environment to look up.
+
+				Expect(pushedEnvironment(name)).To(BeEmpty())
+			})
+
+			// pushedTrussModel creates a trussConfig CR whose push already completed, so the
+			// next reconcile takes the cached fast path straight to the environment check.
+			pushedTrussModel := func(name string) string {
+				model := newTrussConfigModel(name)
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				hash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
+				deploymentName := truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image)
+				model.Status.ModelID = testModelID
+				model.Status.TrussConfigHash = hash
+				model.Status.TrussPushStatus = statusTrussPushDone
+				model.Status.SourceDeploymentName = deploymentName
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+				return deploymentName
+			}
+
+			failOnPromote := func() {
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					Fail("Promote must not be called: Baseten promotes a deployment pushed into the environment itself")
+					return nil, nil
+				}
+			}
+
+			It("should report promoting, without promoting again, while the pushed deployment is the environment's candidate", func() {
+				name := "truss-pushed-candidate"
+				defer cleanupModel(name)
+				deploymentName := pushedTrussModel(name)
+				mockModelFound()
+				candidate := &baseten.Deployment{ID: "cand-1", Name: deploymentName, Status: baseten.DeploymentStatusBuilding}
+				mockEnvWithSettings(nil, candidate)
+				failOnPromote()
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(statusPromoting))
+				Expect(status.CandidateDeploymentName).To(Equal(deploymentName))
+				// Our own promotion, not a foreign one blocking us: plain progress message, no PromotionBlocked event.
+				Expect(status.Message).To(Equal(promotionMessage(nil, candidate)))
+				Expect(drainEvents()).NotTo(ContainElement(ContainSubstring(EventPromotionBlocked)))
+				Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionFalse))
+				Expect(getCondition(status.Conditions, "Progressing").Status).To(Equal(metav1.ConditionTrue))
+			})
+
+			It("should be steady state once the pushed deployment is the environment's current deployment", func() {
+				name := "truss-pushed-current"
+				defer cleanupModel(name)
+				deploymentName := pushedTrussModel(name)
+				mockModelFound()
+				mockEnvWithSettings(&baseten.Deployment{ID: "cur-1", Name: deploymentName, Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 2}, nil)
+				failOnPromote()
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+				Expect(status.ActiveDeploymentName).To(Equal(deploymentName))
+				Expect(status.ActiveReplicaCount).To(Equal(int32(2)))
+				Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+			})
+
 			It("should push a CPU-only config with cpu/memory and no accelerator", func() {
 				name := "truss-push-cpu-only"
 				model := newTrussConfigModel(name)
@@ -3439,12 +3555,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil
 				}
 
 				pushed := make(chan string, 1)
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					Expect(deploymentName).To(HavePrefix("depl-test-latest-"))
 					pushed <- string(configYAML)
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "cpu-dep-id"}, nil
@@ -3474,7 +3591,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil // not found yet: truss push creates it
 				}
 				pushedTeam := make(chan string, 1)
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushedTeam <- team
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "team-dep"}, nil
 				}
@@ -3533,10 +3650,11 @@ var _ = Describe("BasetenModel Controller", func() {
 			Describe("push failure backoff", func() {
 				failingPush := func(calls *int32) {
 					mockModelFound()
+					mockEnvWithSettings(nil, nil)
 					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 						return "", "", nil
 					}
-					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 						atomic.AddInt32(calls, 1)
 						return nil, fmt.Errorf("truss push failed: API error (UNAUTHORIZED_ACCESS)")
 					}
@@ -3644,7 +3762,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					past := metav1.NewTime(time.Now().Add(-time.Second))
 					m.Status.TrussPushNextRetryTime = &past
 					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
-					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 						return &truss.PushResult{ModelID: testModelID, DeploymentID: "ok"}, nil
 					}
 
@@ -3702,7 +3820,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, fmt.Errorf("should not be called")
 				}
@@ -3722,11 +3840,12 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil // Not found — push will fail, next reconcile retries
 				}
 
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					return nil, fmt.Errorf("upload failed: connection timeout")
 				}
 
@@ -3774,7 +3893,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				var capturedSetupScript []byte
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					capturedSetupScript = setupScript
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "new-dep"}, nil
 				}
@@ -3837,7 +3956,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
@@ -3866,7 +3985,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
@@ -3900,7 +4019,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3945,7 +4064,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3982,7 +4101,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
