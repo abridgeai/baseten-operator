@@ -1386,8 +1386,10 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 		return "", &ctrl.Result{}, err
 	}
 
+	pushEnvironment := r.pushEnvironment(ctx, model, modelID)
+
 	// Set status before launching async push
-	logger.Info("Creating deployment via truss push", "deploymentName", deploymentName, "modelName", model.Spec.ModelName)
+	logger.Info("Creating deployment via truss push", "deploymentName", deploymentName, "modelName", model.Spec.ModelName, "environment", pushEnvironment)
 	now := metav1.Now()
 	model.Status.TrussConfigHash = configHash
 	model.Status.SourceDeploymentName = deploymentName
@@ -1425,7 +1427,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	} else {
 		r.Recorder.Eventf(model, corev1.EventTypeNormal, EventTrussPushStarted, "Creating deployment '%s' via truss push", deploymentName)
 	}
-	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, model.Spec.Team, deploymentName)
+	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, model.Spec.Team, deploymentName, pushEnvironment)
 
 	r.logUpdateStatus(ctx, model, statusUpdate{
 		deploymentStatus: baseten.DeploymentStatusDeploying,
@@ -1436,8 +1438,26 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	return "", &result, nil
 }
 
+// pushEnvironment returns the environment a truss push should deploy straight into,
+// or "" for a standalone push that Step 5 promotes later. Baseten builds a standalone
+// deployment in its default region and only copies it into the environment's region on
+// promotion, so pushing into the environment avoids that detour. A push into an
+// environment that does not exist yet fails, and the environment is only created after
+// the first push (Step 2), so that case keeps the standalone path.
+func (r *BasetenModelReconciler) pushEnvironment(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) string {
+	if modelID == "" {
+		return ""
+	}
+	envName := model.Spec.Environment.Name
+	if _, err := r.BasetenClient.GetEnvironment(ctx, modelID, envName); err != nil {
+		log.FromContext(ctx).Info("Environment not available for truss push, pushing standalone deployment", "environment", envName, "reason", err.Error())
+		return ""
+	}
+	return envName
+}
+
 // asyncPush runs truss push in the background and writes result back to CR status.
-func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, team, deploymentName string) {
+func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, team, deploymentName, environment string) {
 	if r.PushSemaphore != nil {
 		defer func() { <-r.PushSemaphore }()
 	}
@@ -1447,7 +1467,7 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName)
+	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName, environment)
 	if err != nil {
 		logger.Error(err, "Create deployment failed", "deploymentName", deploymentName)
 		r.recordPushFailure(modelName, namespace, deploymentName, err)

@@ -166,7 +166,7 @@ spec:
 
 ### Operator-Managed Deployments (trussConfig)
 
-Define your deployment inline and the operator handles the `truss push` and promotion. Deployment names are deterministic from config content, so the same config across environments results in only one push.
+Define your deployment inline and the operator handles the `truss push` and promotion. Deployment names are deterministic from config content, so the same config across environments results in only one push. When the target environment already exists, the push goes straight into it, so Baseten builds the deployment in that environment's region and promotes it itself; otherwise the operator pushes a standalone deployment, creates the environment, and promotes.
 
 ```yaml
 spec:
