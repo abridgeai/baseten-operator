@@ -166,7 +166,7 @@ spec:
 
 ### Operator-Managed Deployments (trussConfig)
 
-Define your deployment inline and the operator handles the `truss push` and promotion. Deployment names are deterministic from config content, so the same config across environments results in only one push.
+Define your deployment inline and the operator handles the `truss push` and promotion. Deployment names are deterministic from config content, so the same config across environments results in only one push. When the target environment already exists, the push goes straight into it, so Baseten builds the deployment in that environment's region and promotes it itself; otherwise the operator pushes a standalone deployment, creates the environment, and promotes.
 
 ```yaml
 spec:
@@ -317,7 +317,7 @@ spec:
 
 `spec.deletionPolicy` controls what happens to the upstream Baseten model when the CR is deleted. Only honored in `Reconcile` mode; `Pause` and `Observe` always retain.
 
-- **`DeleteWithGuardrails`** — recommended when you want declarative deletion without availability risk. The operator calls `ListEnvironments` first and refuses to delete while any environment has `min_replica > 0` or active replicas. Blocks with `DELETE_BLOCKED` status naming the offending envs (e.g., `prod (min=2, active=4)`), emits a `ModelDeleteBlocked` event, and requeues every 30s. Once every env drains, the next reconcile proceeds with `DeleteModel`. Mitigates the case where a `Delete` cascade would nuke envs not tracked by this CR's spec, including ones that may still be serving production traffic.
+- **`DeleteWithGuardrails`** — recommended when you want declarative deletion without availability risk. The operator calls `ListEnvironments` first and refuses to delete while any environment has `min_replica > 0`, active replicas, or an enabled autoscaling schedule with `min_replica > 0`; schedules that cannot be decoded also block (fail safe). Blocks with `DELETE_BLOCKED` status naming the offending envs (e.g., `prod (min=2, active=4)`, `prod (min=0, active=0, schedule business-hours min=2)` or `prod (min=0, active=0, schedules unreadable)`), emits a `ModelDeleteBlocked` event, and requeues every 30s. Once every env drains, the next reconcile proceeds with `DeleteModel`. Mitigates the case where a `Delete` cascade would nuke envs not tracked by this CR's spec, including ones that may still be serving production traffic.
 - **`Retain`** (default) — CR is removed, model is preserved in Baseten. Safe choice for click-ops models or anything you might want back.
 - **`Delete`** — CR deletion cascades to `DeleteModel`, removing the model and **all** its environments and deployments. Irrevocable, no checks.
 

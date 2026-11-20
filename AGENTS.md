@@ -14,7 +14,11 @@ Two mutually exclusive ways to specify the deployment (CEL-validated, exactly on
   (naming: `img-{ver}-wgt-{ver}-p-{ver}`).
 - **`spec.trussConfig`** — the operator creates the deployment itself: it hashes the config to a
   deterministic name `depl-{imageName}-{imageTag}-{hash}`, and if it doesn't exist, pushes it via
-  the truss-go SDK in a background goroutine (non-blocking reconcile).
+  the truss-go SDK in a background goroutine (non-blocking reconcile). When the target environment
+  already exists the push goes straight into it (`truss push --environment`), so Baseten builds the
+  deployment in the environment's region and promotes it itself; the reconcile then only tracks the
+  environment's candidate/current deployment. When the environment (or the model) doesn't exist yet,
+  the push is standalone and the environment is created and promoted into afterwards.
 
 Both converge on environment reconciliation + promotion.
 
@@ -34,7 +38,8 @@ Both converge on environment reconciliation + promotion.
 
 - **Reconcile is environment-polling + prefix matching.** `GET environments/{name}` returns
   `current_deployment` and `candidate_deployment` and is the single source of truth. Baseten adds
-  timestamp suffixes during promotion, so names are matched with `DeploymentNameMatchesPrefix`.
+  a dot plus a promotion counter (legacy: a 10-digit timestamp) to names during promotion, so
+  names are matched with `DeploymentNameMatchesPrefix`.
 - **Tri-state health:** every status update sets both `Ready` and `Progressing` conditions
   (Ready=True → Argo Healthy; Ready=False+Progressing=True → Progressing; both False → Degraded).
 - **Automatic retry:** retryable failures (FAILED, DEPLOY_FAILED, BUILD_FAILED) are retried via the

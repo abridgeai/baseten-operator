@@ -45,9 +45,11 @@ GitOps pipeline).
 helm uninstall baseten-operator --namespace baseten-operator-system
 ```
 
-> ⚠️ Because the CRD is part of the chart, `helm uninstall` removes the CRD and all `BasetenModel`
-> resources along with it. Back up your CRs first, or install with `crds.install=false` to
-> keep CRD lifecycle separate.
+> The CRD carries `helm.sh/resource-policy: keep` and `client.lifecycle.config.k8s.io/deletion: detach`,
+> so `helm uninstall` and a Config Sync prune leave the CRD and all `BasetenModel` resources in
+> place. To remove them, delete the `BasetenModel` resources before `helm uninstall` (the operator
+> must still run to clear their finalizer, and `deletionPolicy` decides what happens upstream), then
+> delete the CRD by hand.
 
 ## Values
 

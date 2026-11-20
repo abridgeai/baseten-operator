@@ -923,12 +923,13 @@ var _ = Describe("Baseten API rate limits", func() {
 		}
 		defer cleanup(name)
 		mockFound()
+		mockEnv(nil)
 		var pushes int
 		mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 			return "", "", nil
 		}
 		reconciler.TrussPusher = &truss.MockPusher{
-			PushFromConfigFunc: func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+			PushFromConfigFunc: func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 				pushes++
 				return nil, fmt.Errorf("truss push failed: %w", &trussgo.APIError{StatusCode: http.StatusTooManyRequests, Message: "slow down"})
 			},

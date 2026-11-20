@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -212,6 +213,22 @@ var _ = Describe("BasetenModel Controller", func() {
 			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
 			Expect(err.Error()).To(ContainSubstring("team is immutable once set"))
 		})
+
+		It("rejects changing modelName once created", func() {
+			m := newModel("model-name-immutable", "")
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			unchanged := m.DeepCopy()
+			unchanged.Spec.SourceDeploymentName = "dep-v2"
+			Expect(k8sClient.Update(ctx, unchanged)).To(Succeed())
+
+			changed := unchanged.DeepCopy()
+			changed.Spec.ModelName = "other-model"
+			err := k8sClient.Update(ctx, changed)
+			Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)
+			Expect(err.Error()).To(ContainSubstring("modelName is immutable"))
+		})
 	})
 
 	// Reconciliation tests using mock client
@@ -266,6 +283,7 @@ var _ = Describe("BasetenModel Controller", func() {
 			recorder = record.NewFakeRecorder(20)
 			reconciler = &BasetenModelReconciler{
 				Client:        k8sClient,
+				APIReader:     k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				BasetenClient: mockClient,
 				TrussPusher:   mockPusher,
@@ -331,6 +349,18 @@ var _ = Describe("BasetenModel Controller", func() {
 		setupThroughStep2 := func() {
 			mockModelFound()
 			mockEnvWithSettings(nil, nil)
+		}
+
+		// expectWait checks one poll: exactly 30s for a new state, else in (base, 1.2*base].
+		expectWait := func(name string, base time.Duration) {
+			result, err := reconcileByName(name)
+			Expect(err).NotTo(HaveOccurred())
+			if base == 30*time.Second {
+				Expect(result.RequeueAfter).To(Equal(base))
+				return
+			}
+			Expect(result.RequeueAfter).To(BeNumerically(">", base))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", base+base/5))
 		}
 
 		Describe("Paused Reconciliation", func() {
@@ -490,7 +520,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					Fail("UpdateDeploymentAutoscaling must not be called in Observe mode")
 					return nil
 				}
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					Fail("truss push must not be called in Observe mode")
 					return nil, nil
 				}
@@ -570,6 +600,36 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(status.CandidateDeploymentName).To(Equal(testSourceDep + ".222"))
 			})
 
+			It("should back off in Observe mode while nothing changes and reset on any change", func() {
+				name := "observe-backoff"
+				model := newTestModel(name)
+				model.Spec.Mode = modelsv1alpha1.ModeObserve
+				defer cleanupModel(name)
+
+				mockModelFound()
+				current := &baseten.Deployment{Name: "img-old-wgt-old-p-old.111", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3}
+				candidate := &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusDeploying}
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{Name: testEnvName, CurrentDeployment: current, CandidateDeployment: candidate, AutoscalingSettings: testAutoscalingSettings()}, nil
+				}
+				expectNoMutations()
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				for _, base := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+					expectWait(name, base)
+				}
+				candidate.ActiveReplicaCount = 1 // only the status message changes
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				old, inFlight := current, candidate
+				current, candidate = &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1}, nil
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+				current, candidate = old, inFlight
+				expectWait(name, 30*time.Second)
+			})
+
 			It("should poll every 5 minutes only when the current deployment is the source and serving", func() {
 				cases := []struct {
 					name    string
@@ -584,6 +644,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 				for _, c := range cases {
 					model := newTestModel(c.name)
+					DeferCleanup(cleanupModel, c.name)
 					model.Spec.Mode = modelsv1alpha1.ModeObserve
 					mockModelFound()
 					mockEnvWithSettings(c.current, &baseten.Deployment{Name: testSourceDep + ".222", Status: baseten.DeploymentStatusDeploying})
@@ -1055,6 +1116,36 @@ var _ = Describe("BasetenModel Controller", func() {
 				events := drainEvents()
 				Expect(events).To(ContainElement(ContainSubstring("AutoscalingUpdateFailed")))
 				Expect(events).To(ContainElement(ContainSubstring("PromotionSettingsUpdateFailed")))
+			})
+
+			It("should stop retrying only a settings update that Baseten rejects as invalid", func() {
+				for code, terminal := range map[int]bool{400: true, 500: false} {
+					name := fmt.Sprintf("step2-update-rejected-%d", code)
+					model := newTestModel(name)
+					mockModelFound()
+					mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+						return &baseten.Environment{
+							Name:                testEnvName,
+							CurrentDeployment:   &baseten.Deployment{Name: "img-old-wgt-old-p-old.1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 3},
+							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 5, ConcurrencyTarget: 10}, // drift: spec says 0
+						}, nil
+					}
+					mockClient.UpdateEnvironmentSettingsFunc = func(ctx context.Context, modelID, envName string, a *modelsv1alpha1.AutoscalingConfig, p *modelsv1alpha1.PromotionSettingsConfig) error {
+						return &baseten.APIError{StatusCode: code, Message: "max_replica too high"}
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).To(HaveOccurred())
+					isTerminal, _ := MatchError(reconcile.TerminalError(nil)).Match(err)
+					Expect(isTerminal).To(Equal(terminal), name)
+					status := getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusFailed))
+					if terminal {
+						Expect(status.Message).To(ContainSubstring("rejected"))
+						Expect(status.Message).NotTo(ContainSubstring("replicas"))
+					}
+					cleanupModel(name)
+				}
 			})
 
 			It("should detect and reconcile promotion settings drift", func() {
@@ -1665,6 +1756,135 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
 			})
 
+			DescribeTable("should promote a spec change, also when the live name matches it",
+				func(name, lastSource, specSource, live string) {
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = specSource
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = lastSource
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					live0 := &baseten.Deployment{ID: "live-id", Name: live, Status: baseten.DeploymentStatusActive}
+					mockEnvWithSettings(live0, nil)
+					candStatus := ""
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						if depName == specSource+".1" {
+							return "promoted-dep-id", candStatus, nil
+						}
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promoted := ""
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promoted = depID
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: specSource + ".1", Status: "DEPLOYING"}, nil
+					}
+					retries := 0
+					mockClient.RetryDeploymentFunc = func(ctx context.Context, modelID, deploymentID string) (*baseten.RetryResponse, error) {
+						retries++
+						return &baseten.RetryResponse{Retried: true}, nil
+					}
+
+					_, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promoted).To(Equal(testDeploymentID))
+
+					// Later passes: the old copy still serves while our candidate deploys, then fails.
+					for _, st := range []string{baseten.DeploymentStatusDeploying, baseten.DeploymentStatusBuildFailed} {
+						candStatus = st
+						mockEnvWithSettings(live0, &baseten.Deployment{ID: "promoted-dep-id", Name: specSource + ".1", Status: st})
+						_, err = reconcileByName(name)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(getModelStatus(name).DeploymentStatus).NotTo(Equal(baseten.DeploymentStatusActive), st)
+					}
+					Expect(retries).To(Equal(1))
+				},
+				Entry("rollback p-1.3 to p-1", "step5-rollback-shorter", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.3"),
+				Entry("rollback p-1.3 to p-1, live copy suffixed", "step5-rollback-suffixed", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.3.2"),
+				Entry("upgrade p-1 to p-1.2 while the p-1 copy is p-1.2", "step5-upgrade-collides", "img-1.0-wgt-1.0-p-1", "img-1.0-wgt-1.0-p-1.2", "img-1.0-wgt-1.0-p-1.2"),
+				Entry("unrelated live name with no recorded source", "step5-unrelated-live", "", "img-1.0-wgt-1.0-p-1", "img-0.9-wgt-1.0-p-1.1"),
+			)
+
+			DescribeTable("should treat a live .N promotion copy as steady state",
+				func(name, lastSource, live, statusCand string, cand *baseten.Deployment) {
+					const src = "depl-model-management-cpu-latest-3791d967"
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = src
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = lastSource
+					model.Status.CandidateDeploymentID = statusCand
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{ID: "live-id", Name: src + live, Status: baseten.DeploymentStatusActive}, cand)
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promoteCalled := false
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promoteCalled = true
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: src + ".9", Status: "DEPLOYING"}, nil
+					}
+
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promoteCalled).To(BeFalse())
+					Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+					Expect(getModelStatus(name).ActiveDeploymentName).To(Equal(src + live))
+				},
+				Entry(".1 with no recorded source", "step5-live-copy-1", "", ".1", "", nil),
+				Entry(".2 with the same recorded source", "step5-live-copy-2", "depl-model-management-cpu-latest-3791d967", ".2", "", nil),
+				Entry(".2 with a candidate of the source that is not ours", "step5-live-copy-foreign", "", ".2", "",
+					&baseten.Deployment{ID: "foreign-id", Name: "depl-model-management-cpu-latest-3791d967.3", Status: baseten.DeploymentStatusDeploying}),
+				Entry(".2 with our candidate of another source", "step5-live-copy-other", "", ".2", "cand-id",
+					&baseten.Deployment{ID: "cand-id", Name: "depl-model-management-cpu-latest-0000aaaa.1", Status: baseten.DeploymentStatusDeploying}),
+				Entry(".1 completed while our candidate is still listed", "step5-live-copy-lingering",
+					"depl-model-management-cpu-latest-3791d967", ".1", "live-id",
+					&baseten.Deployment{ID: "live-id", Name: "depl-model-management-cpu-latest-3791d967.1", Status: baseten.DeploymentStatusActive}),
+				Entry(".1 with an older recorded source", "step5-live-copy-older-last", "depl-model-management-cpu-latest-0000aaaa", ".1", "", nil),
+				Entry(".2 with a foreign candidate while our live ID is recorded", "step5-live-copy-foreign-recorded",
+					"depl-model-management-cpu-latest-3791d967", ".2", "live-id",
+					&baseten.Deployment{ID: "foreign-id", Name: "depl-model-management-cpu-latest-3791d967.3", Status: baseten.DeploymentStatusDeploying}),
+			)
+
+			DescribeTable("should call Promote again on the next pass after a failed Promote",
+				func(name, live string) {
+					const src = "img-1.0-wgt-1.0-p-1"
+					model := newTestModel(name)
+					model.Spec.SourceDeploymentName = src
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.SourceDeploymentName = live
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{ID: "live-id", Name: live, Status: baseten.DeploymentStatusActive}, nil)
+					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+						return testDeploymentID, baseten.DeploymentStatusActive, nil
+					}
+					promotes := 0
+					mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+						promotes++
+						if promotes == 1 {
+							return nil, &baseten.APIError{StatusCode: 500, Message: "internal error"}
+						}
+						return &baseten.Deployment{ID: "promoted-dep-id", Name: src + ".1", Status: "DEPLOYING"}, nil
+					}
+
+					_, err := reconcileByName(name)
+					Expect(err).To(HaveOccurred())
+
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(promotes).To(Equal(2))
+					Expect(getModelStatus(name).DeploymentStatus).NotTo(Equal(baseten.DeploymentStatusActive))
+				},
+				Entry("colliding rollback p-1.3 to p-1", "step5-promote-fail-colliding", "img-1.0-wgt-1.0-p-1.3"),
+				Entry("non-colliding live name", "step5-promote-fail-control", "img-0.9-wgt-1.0-p-1.1"),
+			)
+
 			It("should invalidate cached modelID when Promote fails with 404", func() {
 				// Regression: if modelID goes stale between validateSourceDeployment
 				// and Promote (e.g., model recreated mid-reconcile), Promote's 404
@@ -1758,6 +1978,58 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
 				Expect(getModelStatus(name).DeploymentStatus).To(Equal("SOME_NEW_STATUS"))
+			})
+
+			It("should back off with jitter while the source stays unchanged and reset on any change", func() {
+				name := "step5-backoff"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				setupThroughStep2()
+				status := baseten.DeploymentStatusBuilding
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, status, nil
+				}
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				for _, base := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+					expectWait(name, base)
+				}
+				status = baseten.DeploymentStatusDeploying
+				expectWait(name, 30*time.Second)
+				status = "SOME_NEW_STATUS"
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, model)).To(Succeed())
+				model.Spec.SourceDeploymentName = "img-2-wgt-2-p-2"
+				Expect(k8sClient.Update(ctx, model)).To(Succeed())
+				expectWait(name, 30*time.Second)
+			})
+
+			It("should start again at 30 seconds after the steady state", func() {
+				name := "step5-backoff-steady"
+				model := newTestModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				var current *baseten.Deployment
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return &baseten.Environment{Name: testEnvName, CurrentDeployment: current, AutoscalingSettings: testAutoscalingSettings()}, nil
+				}
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return testDeploymentID, baseten.DeploymentStatusBuilding, nil
+				}
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				expectWait(name, 30*time.Second)
+				expectWait(name, time.Minute)
+
+				current = &baseten.Deployment{Name: testSourceDep + ".1", Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 1}
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
+				current = nil
+				expectWait(name, 30*time.Second)
 			})
 
 			It("should activate and requeue when source is INACTIVE", func() {
@@ -3131,12 +3403,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil // Not found — triggers push
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					Expect(deploymentName).To(HavePrefix("depl-"))
@@ -3156,6 +3429,121 @@ var _ = Describe("BasetenModel Controller", func() {
 				Eventually(func() bool { return pushCalled }, 2*time.Second, 100*time.Millisecond).Should(BeTrue(), "async push should be called")
 			})
 
+			// pushedEnvironment reconciles a fresh trussConfig CR whose deployment does not
+			// exist yet and returns the environment the pusher was asked to deploy into.
+			pushedEnvironment := func(name string) string {
+				model := newTrussConfigModel(name)
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", nil
+				}
+				pushed := make(chan string, 1)
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
+					pushed <- environment
+					return &truss.PushResult{ModelID: testModelID, DeploymentID: "env-dep"}, nil
+				}
+
+				_, err := reconcileModel(model)
+				Expect(err).NotTo(HaveOccurred())
+				var environment string
+				Eventually(pushed, 2*time.Second).Should(Receive(&environment))
+				return environment
+			}
+
+			It("should push into the environment when it already exists", func() {
+				name := "truss-push-into-environment"
+				defer cleanupModel(name)
+				mockModelFound()
+				mockEnvWithSettings(nil, nil)
+
+				Expect(pushedEnvironment(name)).To(Equal(testEnvName))
+			})
+
+			It("should push a standalone deployment when the environment does not exist yet", func() {
+				name := "truss-push-environment-missing"
+				defer cleanupModel(name)
+				mockModelFound()
+				mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
+					return nil, &baseten.APIError{StatusCode: 404, Message: "environment not found"}
+				}
+
+				Expect(pushedEnvironment(name)).To(BeEmpty(), "the environment is created after the push, so the push must stay standalone")
+			})
+
+			It("should push a standalone deployment when the model does not exist yet", func() {
+				name := "truss-push-model-missing"
+				defer cleanupModel(name)
+				mockClient.FindModelIDByNameFunc = func(ctx context.Context, modelName, team string) (string, error) {
+					return "", nil
+				}
+				// GetEnvironmentFunc stays unset: without a model there is no environment to look up.
+
+				Expect(pushedEnvironment(name)).To(BeEmpty())
+			})
+
+			// pushedTrussModel creates a trussConfig CR whose push already completed, so the
+			// next reconcile takes the cached fast path straight to the environment check.
+			pushedTrussModel := func(name string) string {
+				model := newTrussConfigModel(name)
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				hash := truss.HashTrussConfig(model.Spec.TrussConfig, "")
+				deploymentName := truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image)
+				model.Status.ModelID = testModelID
+				model.Status.TrussConfigHash = hash
+				model.Status.TrussPushStatus = statusTrussPushDone
+				model.Status.SourceDeploymentName = deploymentName
+				Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+				return deploymentName
+			}
+
+			failOnPromote := func() {
+				mockClient.PromoteFunc = func(ctx context.Context, modelID, depID, env string, s *modelsv1alpha1.PromotionSettingsConfig) (*baseten.Deployment, error) {
+					Fail("Promote must not be called: Baseten promotes a deployment pushed into the environment itself")
+					return nil, nil
+				}
+			}
+
+			It("should report promoting, without promoting again, while the pushed deployment is the environment's candidate", func() {
+				name := "truss-pushed-candidate"
+				defer cleanupModel(name)
+				deploymentName := pushedTrussModel(name)
+				mockModelFound()
+				candidate := &baseten.Deployment{ID: "cand-1", Name: deploymentName, Status: baseten.DeploymentStatusBuilding}
+				mockEnvWithSettings(nil, candidate)
+				failOnPromote()
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(statusPromoting))
+				Expect(status.CandidateDeploymentName).To(Equal(deploymentName))
+				// Our own promotion, not a foreign one blocking us: plain progress message, no PromotionBlocked event.
+				Expect(status.Message).To(Equal(promotionMessage(nil, candidate)))
+				Expect(drainEvents()).NotTo(ContainElement(ContainSubstring(EventPromotionBlocked)))
+				Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionFalse))
+				Expect(getCondition(status.Conditions, "Progressing").Status).To(Equal(metav1.ConditionTrue))
+			})
+
+			It("should be steady state once the pushed deployment is the environment's current deployment", func() {
+				name := "truss-pushed-current"
+				defer cleanupModel(name)
+				deploymentName := pushedTrussModel(name)
+				mockModelFound()
+				mockEnvWithSettings(&baseten.Deployment{ID: "cur-1", Name: deploymentName, Status: baseten.DeploymentStatusActive, ActiveReplicaCount: 2}, nil)
+				failOnPromote()
+
+				result, err := reconcileByName(name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
+				status := getModelStatus(name)
+				Expect(status.DeploymentStatus).To(Equal(baseten.DeploymentStatusActive))
+				Expect(status.ActiveDeploymentName).To(Equal(deploymentName))
+				Expect(status.ActiveReplicaCount).To(Equal(int32(2)))
+				Expect(getCondition(status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
+			})
+
 			It("should push a CPU-only config with cpu/memory and no accelerator", func() {
 				name := "truss-push-cpu-only"
 				model := newTrussConfigModel(name)
@@ -3167,12 +3555,13 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil
 				}
 
 				pushed := make(chan string, 1)
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					Expect(deploymentName).To(HavePrefix("depl-test-latest-"))
 					pushed <- string(configYAML)
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "cpu-dep-id"}, nil
@@ -3202,7 +3591,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil // not found yet: truss push creates it
 				}
 				pushedTeam := make(chan string, 1)
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushedTeam <- team
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "team-dep"}, nil
 				}
@@ -3211,6 +3600,21 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(lookupTeam).To(Equal("Single Tenant (Evals)"))
 				Eventually(pushedTeam, 2*time.Second).Should(Receive(Equal("Single Tenant (Evals)")))
+			})
+
+			It("should return a zero Result when the deployment lookup fails", func() {
+				name := "truss-dep-lookup-500"
+				model := newTrussConfigModel(name)
+				defer cleanupModel(name)
+
+				mockModelFound()
+				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+					return "", "", &baseten.APIError{StatusCode: 500, Message: "internal error"}
+				}
+
+				result, err := reconcileModel(model)
+				Expect(err).To(HaveOccurred())
+				Expect(result.IsZero()).To(BeTrue(), "controller-runtime drops a Result returned with an error")
 			})
 
 			It("should invalidate cached modelID when FindDeploymentIDByName returns 404", func() {
@@ -3246,10 +3650,11 @@ var _ = Describe("BasetenModel Controller", func() {
 			Describe("push failure backoff", func() {
 				failingPush := func(calls *int32) {
 					mockModelFound()
+					mockEnvWithSettings(nil, nil)
 					mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 						return "", "", nil
 					}
-					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 						atomic.AddInt32(calls, 1)
 						return nil, fmt.Errorf("truss push failed: API error (UNAUTHORIZED_ACCESS)")
 					}
@@ -3357,7 +3762,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					past := metav1.NewTime(time.Now().Add(-time.Second))
 					m.Status.TrussPushNextRetryTime = &past
 					Expect(k8sClient.Status().Update(ctx, m)).To(Succeed())
-					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+					mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 						return &truss.PushResult{ModelID: testModelID, DeploymentID: "ok"}, nil
 					}
 
@@ -3415,7 +3820,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, fmt.Errorf("should not be called")
 				}
@@ -3435,11 +3840,12 @@ var _ = Describe("BasetenModel Controller", func() {
 				defer cleanupModel(name)
 
 				mockModelFound()
+				mockEnvWithSettings(nil, nil)
 				mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
 					return "", "", nil // Not found — push will fail, next reconcile retries
 				}
 
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					return nil, fmt.Errorf("upload failed: connection timeout")
 				}
 
@@ -3487,7 +3893,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				mockEnvWithSettings(nil, nil)
 
 				var capturedSetupScript []byte
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					capturedSetupScript = setupScript
 					return &truss.PushResult{ModelID: testModelID, DeploymentID: "new-dep"}, nil
 				}
@@ -3550,7 +3956,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				}
 
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					Expect(modelName).To(Equal(testModelName))
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
@@ -3579,7 +3985,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
@@ -3613,7 +4019,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3658,7 +4064,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return nil, nil
 				}
@@ -3695,7 +4101,7 @@ var _ = Describe("BasetenModel Controller", func() {
 					return "", nil
 				}
 				pushCalled := false
-				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName string) (*truss.PushResult, error) {
+				mockPusher.PushFromConfigFunc = func(ctx context.Context, configYAML, setupScript []byte, modelName, team, deploymentName, environment string) (*truss.PushResult, error) {
 					pushCalled = true
 					return &truss.PushResult{ModelID: "new-model-id", DeploymentID: "new-dep-id"}, nil
 				}
@@ -3878,6 +4284,33 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(status.ModelID).To(Equal("push-created-model-id"))
 				Expect(status.TrussPushStatus).To(Equal(statusTrussPushDone))
 			})
+		})
+
+		It("should clear the backoff state when the finalizer is released", func() {
+			name := "deletion-clears-backoff"
+			key := types.NamespacedName{Name: name, Namespace: "default"}
+			model := newTestModel(name)
+			defer cleanupModel(name)
+
+			setupThroughStep2()
+			mockClient.FindDeploymentIDByNameFunc = func(ctx context.Context, modelID, depName string) (string, string, error) {
+				return testDeploymentID, baseten.DeploymentStatusBuilding, nil
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			expectWait(name, 30*time.Second)
+			expectWait(name, time.Minute)
+			_, found := reconciler.pollState.Load(key)
+			Expect(found).To(BeTrue(), "backoff entry should exist before deletion")
+
+			toDelete := &modelsv1alpha1.BasetenModel{}
+			Expect(k8sClient.Get(ctx, key, toDelete)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+			_, err := reconcileByName(name)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, key, &modelsv1alpha1.BasetenModel{}))).To(BeTrue(), "finalizer should be released")
+			_, found = reconciler.pollState.Load(key)
+			Expect(found).To(BeFalse(), "backoff entry should be gone after the finalizer is released")
 		})
 
 		Describe("Resource not found", func() {
@@ -4077,6 +4510,38 @@ var _ = Describe("BasetenModel Controller", func() {
 				reconcileUntilGone(name)
 			})
 
+			DescribeTable("with deletionPolicy Delete and empty status.modelID during a first push",
+				func(name string, policy modelsv1alpha1.DeletionPolicy, pushStatus string, pushAge time.Duration, wantHeld bool) {
+					model := newTestModel(name)
+					model.Spec.DeletionPolicy = policy
+					defer cleanupModel(name)
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					model.Status.TrussPushStatus = pushStatus
+					if pushAge >= 0 {
+						model.Status.TrussPushTime = &metav1.Time{Time: time.Now().Add(-pushAge)}
+					}
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, model)).To(Succeed())
+
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					got := &modelsv1alpha1.BasetenModel{}
+					getErr := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)
+					if wantHeld {
+						Expect(getErr).NotTo(HaveOccurred())
+						Expect(got.Finalizers).To(ContainElement(modelsv1alpha1.FinalizerName))
+						Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+					} else {
+						Expect(errors.IsNotFound(getErr)).To(BeTrue(), "finalizer released, object gone")
+					}
+				},
+				Entry("holds the finalizer while the push is in flight", "deletion-delete-push-inflight", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, 4*time.Minute, true),
+				Entry("releases after the push goes stale", "deletion-delete-push-stale", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, 6*time.Minute, false),
+				Entry("releases when no push is in flight", "deletion-delete-push-ended", modelsv1alpha1.DeletionPolicyDelete, "", time.Minute, false),
+				Entry("releases when the push has no start time", "deletion-delete-push-notime", modelsv1alpha1.DeletionPolicyDelete, statusTrussPushing, -time.Second, false),
+				Entry("holds the finalizer under DeleteWithGuardrails too", "deletion-guardrails-push-inflight", modelsv1alpha1.DeletionPolicyDeleteWithGuardrails, statusTrussPushing, 4*time.Minute, true),
+			)
+
 			It("with deletionPolicy DeleteWithGuardrails proceeds when all envs idle", func() {
 				name := "deletion-guardrails-idle"
 				model := newTestModel(name)
@@ -4213,6 +4678,75 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=0, active=3)"))
 			})
 
+			DescribeTable("with deletionPolicy DeleteWithGuardrails on an idle env with autoscaling schedules",
+				func(name string, schedules []baseten.AutoscalingSchedule, decodeErr error, wantBlocked string) {
+					model := newTestModel(name)
+					model.Spec.DeletionPolicy = modelsv1alpha1.DeletionPolicyDeleteWithGuardrails
+					defer cleanupModel(name)
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{Name: testSourceDep + ".123", Status: baseten.DeploymentStatusActive}, nil)
+					var observed *baseten.AutoscalingSchedules
+					if schedules != nil {
+						observed = &baseten.AutoscalingSchedules{Timezone: ptr("America/New_York"), Schedules: schedules, AppliedState: &baseten.AutoscalingScheduleState{ScheduleID: ptr("sched-nights"), AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5}}}
+					}
+					mockClient.ListEnvironmentsFunc = func(ctx context.Context, modelID string) ([]baseten.Environment, error) {
+						return []baseten.Environment{{
+							Name:                 "prod",
+							CurrentDeployment:    &baseten.Deployment{Name: "depl-prod", Status: baseten.DeploymentStatusScaledToZero},
+							PromotionSettings:    &baseten.PromotionSettings{},
+							AutoscalingSettings:  &baseten.AutoscalingSettings{MinReplica: 0, MaxReplica: 5},
+							AutoscalingSchedules: observed,
+							ScheduleDecodeErr:    decodeErr,
+						}}, nil
+					}
+					deleteCalls := 0
+					mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
+						deleteCalls++
+						return nil
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					_, err = reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					toDelete := &modelsv1alpha1.BasetenModel{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, toDelete)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, toDelete)).To(Succeed())
+
+					if wantBlocked == "" {
+						reconcileUntilGone(name)
+						Expect(deleteCalls).To(Equal(1))
+						return
+					}
+					result, err := reconcileByName(name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+					Expect(deleteCalls).To(Equal(0))
+					status := getModelStatus(name)
+					Expect(status.DeploymentStatus).To(Equal(statusDeleteBlocked))
+					Expect(status.Message).To(ContainSubstring(wantBlocked))
+					Expect(status.Message).NotTo(ContainSubstring("schedule off"))
+					Expect(status.Message).NotTo(ContainSubstring("schedule nights"))
+				},
+				Entry("blocks on an enabled schedule with min_replicas above 0", "deletion-guardrails-schedule-on",
+					[]baseten.AutoscalingSchedule{
+						{ID: "sched-bh", Name: "business-hours", Enabled: true, Cadence: "DAILY", Weekdays: []string{"MONDAY", "FRIDAY"}, StartHour: ptr(int32(9)), StartMinute: 30, EndHour: ptr(int32(17)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 2, MaxReplica: 10}},
+						{ID: "sched-off", Name: "off", Enabled: false, Cadence: baseten.CadenceOneTime, StartAt: "2099-11-01T00:00:00Z", EndAt: "2099-11-02T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 3, MaxReplica: 10}},
+						{ID: "sched-nights", Name: "nights", Enabled: true, Cadence: "DAILY", Weekdays: []string{"MONDAY", "FRIDAY"}, StartHour: ptr(int32(0)), EndHour: ptr(int32(6)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 5}},
+						{ID: "sched-we", Name: "weekend", Enabled: true, Cadence: baseten.CadenceOneTime, StartAt: "2099-10-03T00:00:00Z", EndAt: "2099-10-05T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 1, MaxReplica: 1}},
+					}, nil, "prod (min=0, active=0, schedule business-hours min=2, schedule weekend min=1)"),
+				Entry("proceeds when every schedule is disabled or has min_replicas 0", "deletion-guardrails-schedule-off",
+					[]baseten.AutoscalingSchedule{
+						{ID: "sched-off", Name: "off", Enabled: false, Cadence: "DAILY", Weekdays: []string{"SATURDAY"}, StartHour: ptr(int32(8)), EndHour: ptr(int32(20)), AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 3, MaxReplica: 10}},
+						{ID: "sched-nights", Name: "nights", Enabled: true, Cadence: "HOURLY", Weekdays: []string{"SUNDAY"}, EndMinute: 15, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 5}},
+					}, nil, ""),
+				Entry("proceeds when the schedule list is empty", "deletion-guardrails-schedule-empty",
+					[]baseten.AutoscalingSchedule{}, nil, ""),
+				Entry("blocks when the schedules cannot be decoded (fail safe)", "deletion-guardrails-schedule-unreadable",
+					nil, fmt.Errorf("bad schedule payload"), "prod (min=0, active=0, schedules unreadable)"),
+			)
+
 			It("with deletionPolicy DeleteWithGuardrails blocks on a busy env unrelated to the CR's spec", func() {
 				// CR tracks the "dev" env, but "prod" env (which this CR has
 				// nothing to do with) is still serving. DeleteModel cascades to
@@ -4242,6 +4776,8 @@ var _ = Describe("BasetenModel Controller", func() {
 							CurrentDeployment:   &baseten.Deployment{Name: "depl-prod", ActiveReplicaCount: 4},
 							AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 2, MaxReplica: 20},
 						},
+						{Name: "staging", CurrentDeployment: &baseten.Deployment{Name: "depl-staging", ActiveReplicaCount: 1}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 3}, AutoscalingSchedules: &baseten.AutoscalingSchedules{Timezone: ptr("UTC"), Schedules: []baseten.AutoscalingSchedule{{ID: "sched-st", Name: "weekend", Enabled: true, Cadence: "HOURLY", Weekdays: []string{"SATURDAY", "SUNDAY"}, EndMinute: 15, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 1, MaxReplica: 4}}, {ID: "sched-st-off", Name: "paused", Enabled: false, Cadence: "HOURLY", Weekdays: []string{"MONDAY"}, EndMinute: 30, AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 2, MaxReplica: 4}}, {ID: "sched-st-once", Name: "drain", Enabled: true, Cadence: baseten.CadenceOneTime, StartAt: "2099-12-01T00:00:00Z", EndAt: "2099-12-02T00:00:00Z", AutoscalingSettings: baseten.ScheduleAutoscalingSettings{MinReplica: 0, MaxReplica: 4}}}}},
+						{Name: "canary", CurrentDeployment: &baseten.Deployment{Name: "depl-canary", ActiveReplicaCount: 1}, AutoscalingSettings: &baseten.AutoscalingSettings{MinReplica: 1, MaxReplica: 3}, ScheduleDecodeErr: fmt.Errorf("bad schedule payload")},
 					}, nil
 				}
 				mockClient.DeleteModelFunc = func(ctx context.Context, modelID string) error {
@@ -4266,6 +4802,8 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(stuck.Status.DeploymentStatus).To(Equal(statusDeleteBlocked))
 				Expect(stuck.Status.Message).To(ContainSubstring("prod (min=2, active=4)"),
 					"status should call out the offending env even when it's not the one this CR tracks")
+				Expect(stuck.Status.Message).To(ContainSubstring("staging (min=1, active=1, schedule weekend min=1)"))
+				Expect(stuck.Status.Message).To(ContainSubstring("canary (min=1, active=1, schedules unreadable)"))
 				Expect(stuck.Status.Message).NotTo(ContainSubstring(testEnvName+" ("),
 					"the idle env this CR tracks must not appear in blockers")
 			})

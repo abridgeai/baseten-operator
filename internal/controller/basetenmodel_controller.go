@@ -77,6 +77,10 @@ const (
 	// retryMaxInterval is the maximum backoff interval for deployment retries.
 	retryMaxInterval = 30 * time.Minute
 
+	// reconcileTimeout bounds one pass, so a hung Baseten API cannot hold a worker. It stays
+	// above the worst chain that still succeeds: about 6 calls at the 30 s client timeout.
+	reconcileTimeout = 4 * time.Minute
+
 	// retryJitterFraction is the maximum fraction of jitter added to retry intervals (0-50%).
 	retryJitterFraction = 0.5
 
@@ -97,6 +101,9 @@ const (
 // BasetenModelReconciler reconciles a BasetenModel object
 type BasetenModelReconciler struct {
 	client.Client
+	// APIReader reads objects the manager does not cache (the setup-script ConfigMap),
+	// so a Get does not open a cluster-wide informer.
+	APIReader               client.Reader
 	Scheme                  *runtime.Scheme
 	BasetenClient           baseten.ClientInterface
 	TrussPusher             truss.PusherInterface
@@ -114,6 +121,13 @@ type BasetenModelReconciler struct {
 	// controllerName overrides the controller name. Both are empty in production.
 	watchNamespace string
 	controllerName string
+
+	pollState sync.Map // client.ObjectKey -> pollState; one key never reconciles concurrently
+}
+
+type pollState struct {
+	token string
+	wait  time.Duration
 }
 
 type statusUpdate struct {
@@ -135,7 +149,7 @@ type statusUpdate struct {
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 
 func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -200,7 +214,7 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	logger.Info("Environment reconciled", "environment", envName)
 
-	if env.CurrentDeployment != nil && baseten.DeploymentNameMatchesPrefix(env.CurrentDeployment.Name, sourceDeploymentName) {
+	if currentServesSource(model, env, sourceDeploymentName) {
 		logger.V(1).Info("Current deployment matches source prefix",
 			"currentDeployment", env.CurrentDeployment.Name,
 			"sourceDeploymentName", sourceDeploymentName,
@@ -237,6 +251,7 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 
+		r.resetWait(model)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
@@ -684,6 +699,12 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 
 	modelID := model.Status.ModelID
 	if modelID == "" {
+		// A first push writes the new model ID back when it ends; releasing now would leak that model.
+		if model.Status.TrussPushStatus == statusTrussPushing && model.Status.TrussPushTime != nil &&
+			time.Since(model.Status.TrussPushTime.Time) < trussPushStaleTimeout {
+			logger.Info("Holding finalizer until the in-flight truss push reports a model ID", "model", model.Name)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 		logger.Info("Releasing finalizer (deletionPolicy Delete but status.modelID empty)", "model", model.Name)
 		return r.releaseFinalizer(ctx, model)
 	}
@@ -756,9 +777,11 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 // checkDeleteGuardrails inspects every environment under the model and returns
 // a sorted list of human-readable "name (min=N, active=M)" entries for any
 // environment that is not fully idle. An environment is considered serving if
-// either its env-level autoscaling MinReplica > 0 or any of its current/
-// candidate deployments has ActiveReplicaCount > 0. Returns an empty slice when
-// the model is safe to delete.
+// its env-level autoscaling MinReplica > 0, any of its current/candidate
+// deployments has ActiveReplicaCount > 0, or an enabled autoscaling schedule
+// sets MinReplica above 0 (window not checked; adds ", schedule S min=K").
+// Undecodable schedules also block (fail safe; adds ", schedules unreadable").
+// Returns an empty slice when the model is safe to delete.
 //
 // A 404 on ListEnvironments means the upstream model is already gone (e.g.,
 // deleted out-of-band). Treat as "no envs blocking" so the deletion path can
@@ -785,8 +808,19 @@ func (r *BasetenModelReconciler) checkDeleteGuardrails(ctx context.Context, mode
 		if env.CandidateDeployment != nil && env.CandidateDeployment.ActiveReplicaCount > activeReplica {
 			activeReplica = env.CandidateDeployment.ActiveReplicaCount
 		}
-		if minReplica > 0 || activeReplica > 0 {
-			blockers = append(blockers, fmt.Sprintf("%s (min=%d, active=%d)", env.Name, minReplica, activeReplica))
+		schedules := ""
+		if env.AutoscalingSchedules != nil {
+			for _, s := range env.AutoscalingSchedules.Schedules {
+				if s.Enabled && s.AutoscalingSettings.MinReplica > 0 {
+					schedules += fmt.Sprintf(", schedule %s min=%d", s.Name, s.AutoscalingSettings.MinReplica)
+				}
+			}
+		}
+		if env.ScheduleDecodeErr != nil {
+			schedules += ", schedules unreadable"
+		}
+		if minReplica > 0 || activeReplica > 0 || schedules != "" {
+			blockers = append(blockers, fmt.Sprintf("%s (min=%d, active=%d%s)", env.Name, minReplica, activeReplica, schedules))
 		}
 	}
 	sort.Strings(blockers)
@@ -799,6 +833,7 @@ func (r *BasetenModelReconciler) checkDeleteGuardrails(ctx context.Context, mode
 // finalizer-clear — the cleanup goal is achieved either way.
 func (r *BasetenModelReconciler) releaseFinalizer(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, error) {
 	controllerutil.RemoveFinalizer(model, modelsv1alpha1.FinalizerName)
+	r.resetWait(model)
 	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, model))
 }
 
@@ -935,9 +970,10 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 
 	if cur := env.CurrentDeployment; cur != nil && baseten.DeploymentNameMatchesPrefix(cur.Name, sourceDeploymentName) &&
 		(cur.Status == baseten.DeploymentStatusActive || cur.Status == baseten.DeploymentStatusScaledToZero) {
+		r.resetWait(model)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: r.waitInterval(model, su.message)}, nil
 }
 
 // expectedSourceDeploymentName returns the deployment name this CR's spec
@@ -960,10 +996,27 @@ func (r *BasetenModelReconciler) expectedSourceDeploymentName(ctx context.Contex
 	return truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image), nil
 }
 
+// currentServesSource reports whether current is the promotion of source. "p-1.3" matches
+// both "p-1.3" and "p-1" (Baseten copies are "<name>.<N>"), so after a spec change a live
+// name that also matches the last promoted source belongs to that source, and while our own
+// promotion of source is the candidate, the live name is the old copy.
+func currentServesSource(model *modelsv1alpha1.BasetenModel, env *baseten.Environment, source string) bool {
+	current, cand := env.CurrentDeployment, env.CandidateDeployment
+	if current == nil || !baseten.DeploymentNameMatchesPrefix(current.Name, source) {
+		return false
+	}
+	if cand != nil && cand.ID != current.ID && cand.ID == model.Status.CandidateDeploymentID &&
+		baseten.DeploymentNameMatchesPrefix(cand.Name, source) {
+		return false
+	}
+	last := model.Status.SourceDeploymentName
+	return last == source || !baseten.DeploymentNameMatchesPrefix(current.Name, last)
+}
+
 // composeObserveStatus builds a statusUpdate that reflects observed Baseten
-// state. Mirrors the Reconcile-path status decisions for steady, promoting,
-// and not-yet-promoted scenarios, with mode-specific phrasing where Observe
-// can't act ("awaiting reconciliation", "observe mode does not create").
+// state: steady (plain prefix match, without the currentServesSource tiebreak
+// of Reconcile), promoting, and not-yet-promoted, with mode-specific phrasing
+// where Observe can't act ("awaiting reconciliation", "observe mode does not create").
 func (r *BasetenModelReconciler) composeObserveStatus(model *modelsv1alpha1.BasetenModel, env *baseten.Environment, sourceDeploymentName, modelID string) statusUpdate {
 	envName := model.Spec.Environment.Name
 
@@ -1295,11 +1348,10 @@ func (r *BasetenModelReconciler) promoteSource(ctx context.Context, model *model
 		logger.Error(err, "Failed to promote source deployment")
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionFailed, "Failed to promote %s to %s: %v", sourceDeploymentName, envName, err)
 		r.logUpdateStatus(ctx, model, statusUpdate{
-			deploymentStatus:     baseten.DeploymentStatusFailed,
-			message:              fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
-			modelID:              modelID,
-			sourceDeploymentID:   sourceDeploymentID,
-			sourceDeploymentName: sourceDeploymentName,
+			deploymentStatus:   baseten.DeploymentStatusFailed,
+			message:            fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
+			modelID:            modelID,
+			sourceDeploymentID: sourceDeploymentID,
 		})
 		if r.invalidateModelID(ctx, model, err) {
 			return nil, ctrl.Result{RequeueAfter: time.Second}, nil
@@ -1609,8 +1661,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 			// the model ID itself is no longer valid (model recreated / migrated),
 			// which should trigger a re-resolution by name rather than infinitely
 			// retrying against a dead ID.
-			result := ctrl.Result{RequeueAfter: 30 * time.Second}
-			return "", &result, err
+			return "", &ctrl.Result{}, err
 		}
 
 		if existingID != "" {
@@ -1696,8 +1747,10 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 		return "", &ctrl.Result{}, err
 	}
 
+	pushEnvironment := r.pushEnvironment(ctx, model, modelID)
+
 	// Set status before launching async push
-	logger.Info("Creating deployment via truss push", "deploymentName", deploymentName, "modelName", model.Spec.ModelName)
+	logger.Info("Creating deployment via truss push", "deploymentName", deploymentName, "modelName", model.Spec.ModelName, "environment", pushEnvironment)
 	now := metav1.Now()
 	model.Status.TrussConfigHash = configHash
 	model.Status.SourceDeploymentName = deploymentName
@@ -1735,7 +1788,7 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	} else {
 		r.Recorder.Eventf(model, corev1.EventTypeNormal, EventTrussPushStarted, "Creating deployment '%s' via truss push", deploymentName)
 	}
-	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, model.Spec.Team, deploymentName)
+	go r.asyncPush(model.Name, model.Namespace, configYAML, []byte(setupScript), model.Spec.ModelName, model.Spec.Team, deploymentName, pushEnvironment)
 
 	r.logUpdateStatus(ctx, model, statusUpdate{
 		deploymentStatus: baseten.DeploymentStatusDeploying,
@@ -1746,8 +1799,26 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 	return "", &result, nil
 }
 
+// pushEnvironment returns the environment a truss push should deploy straight into,
+// or "" for a standalone push that Step 5 promotes later. Baseten builds a standalone
+// deployment in its default region and only copies it into the environment's region on
+// promotion, so pushing into the environment avoids that detour. A push into an
+// environment that does not exist yet fails, and the environment is only created after
+// the first push (Step 2), so that case keeps the standalone path.
+func (r *BasetenModelReconciler) pushEnvironment(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) string {
+	if modelID == "" {
+		return ""
+	}
+	envName := model.Spec.Environment.Name
+	if _, err := r.BasetenClient.GetEnvironment(ctx, modelID, envName); err != nil {
+		log.FromContext(ctx).Info("Environment not available for truss push, pushing standalone deployment", "environment", envName, "reason", err.Error())
+		return ""
+	}
+	return envName
+}
+
 // asyncPush runs truss push in the background and writes result back to CR status.
-func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, team, deploymentName string) {
+func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYAML, setupScript []byte, basetenModelName, team, deploymentName, environment string) {
 	if r.PushSemaphore != nil {
 		defer func() { <-r.PushSemaphore }()
 	}
@@ -1757,7 +1828,7 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName)
+	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName, environment)
 	if err != nil {
 		logger.Error(err, "Create deployment failed", "deploymentName", deploymentName)
 		if truss.IsRateLimited(err) {
@@ -1904,7 +1975,7 @@ func (r *BasetenModelReconciler) readSetupScript(ctx context.Context, tc *models
 	if tc.SetupScript != nil && tc.SetupScript.ConfigMapRef != nil {
 		ref := tc.SetupScript.ConfigMapRef
 		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, cm); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, cm); err != nil {
 			return "", fmt.Errorf("ConfigMap '%s' not found: %w", ref.Name, err)
 		}
 		script, ok := cm.Data[ref.Key]
@@ -2015,6 +2086,14 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 				if promotionDrift {
 					r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionSettingsUpdateFailed, "Failed to update promotion settings for %s: %v", envName, err)
 				}
+				if baseten.IsPermanentClientError(err) {
+					r.logUpdateStatus(ctx, model, statusUpdate{
+						deploymentStatus: baseten.DeploymentStatusFailed,
+						message:          fmt.Sprintf("Baseten rejected the settings update for %s; fix the spec: %v", envName, err),
+						modelID:          modelID,
+					})
+					return nil, &ctrl.Result{}, reconcile.TerminalError(err)
+				}
 				r.logUpdateStatus(ctx, model, statusUpdate{
 					deploymentStatus: baseten.DeploymentStatusFailed,
 					message:          fmt.Sprintf("%sfailed to update settings for %s: %v", activeMsg, envName, err),
@@ -2113,6 +2192,7 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 
 	logger.Info("Found source deployment in Baseten", "sourceDeploymentID", sourceDeploymentID, "sourceDeploymentName", sourceDeploymentName, "status", sourceDeploymentStatus)
 
+	pollToken := sourceDeploymentName + "|" + sourceDeploymentStatus
 	switch sourceDeploymentStatus {
 	case baseten.DeploymentStatusFailed, baseten.DeploymentStatusDeployFailed, baseten.DeploymentStatusBuildFailed:
 		logger.Info("Source deployment failed", "sourceDeploymentName", sourceDeploymentName, "status", sourceDeploymentStatus)
@@ -2162,7 +2242,7 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 			modelID:          modelID,
 		})
 		logger.Info("Source deployment not ready for promotion yet", "status", sourceDeploymentStatus)
-		result := ctrl.Result{RequeueAfter: 30 * time.Second}
+		result := ctrl.Result{RequeueAfter: r.waitInterval(model, pollToken)}
 		return "", &result, nil
 
 	case baseten.DeploymentStatusActive:
@@ -2175,11 +2255,30 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 			message:          fmt.Sprintf("%swaiting to promote: source deployment %s has status %s", ap, sourceDeploymentName, sourceDeploymentStatus),
 			modelID:          modelID,
 		})
-		result := ctrl.Result{RequeueAfter: 30 * time.Second}
+		result := ctrl.Result{RequeueAfter: r.waitInterval(model, pollToken)}
 		return "", &result, nil
 	}
 
 	return sourceDeploymentID, nil, nil
+}
+
+// waitInterval returns 30s for a new token, then doubles per unchanged poll up
+// to 5m, plus up to 20% jitter. State is in memory only.
+func (r *BasetenModelReconciler) waitInterval(model *modelsv1alpha1.BasetenModel, token string) time.Duration {
+	key := client.ObjectKeyFromObject(model)
+	v, _ := r.pollState.Load(key)
+	st, _ := v.(pollState)
+	if st.token != token {
+		r.pollState.Store(key, pollState{token: token, wait: 30 * time.Second})
+		return 30 * time.Second
+	}
+	st.wait = min(2*st.wait, 5*time.Minute)
+	r.pollState.Store(key, st)
+	return st.wait + time.Duration(float64(st.wait)*0.2*rand.Float64())
+}
+
+func (r *BasetenModelReconciler) resetWait(model *modelsv1alpha1.BasetenModel) {
+	r.pollState.Delete(client.ObjectKeyFromObject(model))
 }
 
 // activePrefix returns "active: {name} ({replicas} replicas) | " when there's
@@ -2446,7 +2545,7 @@ func (r *BasetenModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&modelsv1alpha1.BasetenModel{}).
 		Named(name).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent})
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent, ReconciliationTimeout: reconcileTimeout})
 	if ns := r.watchNamespace; ns != "" {
 		builder = builder.WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetNamespace() == ns

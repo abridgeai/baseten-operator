@@ -56,6 +56,20 @@ func IsNotFoundError(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+// IsPermanentClientError reports a 400 or 422: Baseten rejected the request
+// body, so sending the same request again cannot succeed.
+func IsPermanentClientError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
 // toAPIError maps a generated-client HTTP failure (*managementapi.ResponseError) to *APIError
 // so IsNotFoundError keeps working; other errors (network, decode) pass through unchanged.
 // The generated client drops response headers, so a 429's Retry-After is read from the
@@ -198,13 +212,13 @@ type Environment struct {
 }
 
 // FindModelIDByName returns the ID of the model named modelName ("" if not found).
-// A non-empty team scopes the lookup to that team.
+// A non-empty team scopes the lookup to that team; without one, a name found in several teams is an error.
 func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) (string, error) {
 	ctx = captureRateLimit(ctx)
 	var models *managementapi.Models
 	var err error
 	if team == "" {
-		models, err = c.api.GetModels(ctx, managementapi.GetV1ModelsParams{})
+		models, err = c.api.GetModels(ctx, managementapi.GetV1ModelsParams{Name: &modelName})
 	} else {
 		var teamID string
 		if teamID, err = c.findTeamID(ctx, team); err != nil {
@@ -215,12 +229,18 @@ func (c *Client) FindModelIDByName(ctx context.Context, modelName, team string) 
 	if err != nil {
 		return "", toAPIError(ctx, err)
 	}
+	var id string
+	var teams []string
 	for _, m := range models.Models {
 		if m.Name == modelName {
-			return m.Id, nil
+			id = m.Id
+			teams = append(teams, m.TeamName)
 		}
 	}
-	return "", nil
+	if len(teams) > 1 {
+		return "", fmt.Errorf("baseten model %q exists in teams %v; set spec.team to pick one", modelName, teams)
+	}
+	return id, nil
 }
 
 func (c *Client) findTeamID(ctx context.Context, team string) (string, error) {
@@ -247,7 +267,7 @@ func (c *Client) DeleteModel(ctx context.Context, modelID string) error {
 // FindDeploymentIDByName lists deployments and returns the ID and status matching deploymentName.
 func (c *Client) FindDeploymentIDByName(ctx context.Context, modelID, deploymentName string) (string, string, error) {
 	ctx = captureRateLimit(ctx)
-	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{})
+	deps, err := c.api.GetModelsDeployments(ctx, modelID, managementapi.GetV1ModelsModelIdDeploymentsParams{Name: &deploymentName})
 	if err != nil {
 		return "", "", toAPIError(ctx, err)
 	}
@@ -598,10 +618,14 @@ func int32PtrToIntPtr(p *int32) *int {
 	return &v
 }
 
-// DeploymentNameMatchesPrefix checks if a deployment name matches the given prefix,
-// accounting for Baseten's timestamp suffix (e.g., "img-1.0-wgt-1.0-p-1.2.1768269232")
+// DeploymentNameMatchesPrefix reports whether deploymentName is prefix or a Baseten
+// promotion copy of it: prefix, one dot and digits ("x.1", "x.1768269232").
 func DeploymentNameMatchesPrefix(deploymentName, prefix string) bool {
-	return deploymentName == prefix || strings.HasPrefix(deploymentName, prefix+".")
+	if deploymentName == prefix {
+		return true
+	}
+	rest, ok := strings.CutPrefix(deploymentName, prefix+".")
+	return ok && rest != "" && strings.Trim(rest, "0123456789") == ""
 }
 
 // IsTerminalFailure returns true for deployment statuses that indicate a terminal failure

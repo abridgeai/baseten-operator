@@ -53,6 +53,17 @@ func TestDeploymentNameMatchesPrefix(t *testing.T) {
 		{"empty prefix", "img-1.0", "", false},
 		{"both empty", "", "", true},
 		{"prefix without dot separator should not match", "img-1.0-wgt-1.0-p-1.2extra", "img-1.0-wgt-1.0-p-1.2", false},
+		{"live promotion counter .1", "depl-model-management-cpu-latest-3791d967.1", "depl-model-management-cpu-latest-3791d967", true},
+		{"live promotion counter .2", "depl-abridge-models-vllm-0.26.0-2026.1106.2120-14b56f1f.2", "depl-abridge-models-vllm-0.26.0-2026.1106.2120-14b56f1f", true},
+		{"dotted version tail is not a promotion suffix", "img-1.0-wgt-1.0-p-1.3.1768269232", "img-1.0-wgt-1.0-p-1", false},
+		{"non-numeric dotted tail", "img-1.0-wgt-1.0-p-1.2.rc1", "img-1.0-wgt-1.0-p-1.2", false},
+		{"bare trailing dot", "img-1.0-wgt-1.0-p-1.", "img-1.0-wgt-1.0-p-1", false},
+		{"one dotted number is ambiguous and matches", "img-1.0-wgt-1.0-p-1.3", "img-1.0-wgt-1.0-p-1", true},
+		{"promotion counter .6", "img-1.0-wgt-1.0-p-1.2.6", "img-1.0-wgt-1.0-p-1.2", true},
+		{"promotion counter .12", "img-1.0-wgt-1.0-p-1.2.12", "img-1.0-wgt-1.0-p-1.2", true},
+		{"long promotion counter", "img-1.0-wgt-1.0-p-1.2.123456789012", "img-1.0-wgt-1.0-p-1.2", true},
+		{"digits without the dot do not match", "img-1.0-wgt-1.0-p-1.212", "img-1.0-wgt-1.0-p-1.2", false},
+		{"all-digit name under another prefix", "1768269232", "img-1.0", false},
 	}
 
 	for _, tt := range tests {
@@ -169,6 +180,22 @@ func TestIsNotFoundError(t *testing.T) {
 				t.Errorf("IsNotFoundError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsPermanentClientError(t *testing.T) {
+	permanent := map[int]bool{
+		http.StatusBadRequest: true, http.StatusUnprocessableEntity: true,
+		http.StatusUnauthorized: false, http.StatusForbidden: false, http.StatusNotFound: false,
+		http.StatusConflict: false, http.StatusTooManyRequests: false, http.StatusInternalServerError: false,
+	}
+	for code, want := range permanent {
+		if got := IsPermanentClientError(fmt.Errorf("wrapped: %w", &APIError{StatusCode: code})); got != want {
+			t.Errorf("IsPermanentClientError(%d) = %v, want %v", code, got, want)
+		}
+	}
+	if IsPermanentClientError(errors.New("network")) {
+		t.Error("IsPermanentClientError(non-APIError) = true, want false")
 	}
 }
 
@@ -541,6 +568,43 @@ func TestFindModelIDByName(t *testing.T) {
 			t.Errorf("StatusCode = %d, want 500", apiErr.StatusCode)
 		}
 	})
+
+	t.Run("org-wide lookup filters by name", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("name"); got != "my-model" {
+				t.Errorf("models name filter = %q, want my-model", got)
+			}
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{{Id: "m1", Name: "my-model"}}})
+		}))
+		defer srv.Close()
+
+		if _, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("same name in two teams is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, managementapi.Models{Models: []managementapi.Model{
+				{Id: "m-a", Name: "my-model", TeamName: "TeamA"},
+				{Id: "m-b", Name: "my-model", TeamName: "TeamB"},
+			}})
+		}))
+		defer srv.Close()
+
+		id, err := newTestClient(srv.URL).FindModelIDByName(context.Background(), "my-model", "")
+		if err == nil || !strings.Contains(err.Error(), "spec.team") {
+			t.Fatalf("expected an ambiguity error naming spec.team, got id=%q err=%v", id, err)
+		}
+		for _, team := range []string{"TeamA", "TeamB"} {
+			if !strings.Contains(err.Error(), team) {
+				t.Errorf("ambiguity error %q does not name %s", err, team)
+			}
+		}
+		if id != "" {
+			t.Errorf("id = %q, want empty on ambiguity", id)
+		}
+	})
 }
 
 func TestFindModelIDByName_Team(t *testing.T) {
@@ -678,7 +742,11 @@ func TestFindDeploymentIDByName(t *testing.T) {
 			if r.URL.Path != "/v1/models/model1/deployments" {
 				t.Errorf("unexpected path: %s", r.URL.Path)
 			}
+			if got := r.URL.Query().Get("name"); got != "my-dep" {
+				t.Errorf("name filter = %q, want %q", got, "my-dep")
+			}
 			writeJSON(t, w, managementapi.Deployments{Deployments: []managementapi.Deployment{
+				{Id: "d0", Name: "my-dep.1", Status: status("ACTIVE")},
 				{Id: "d1", Name: "my-dep", Status: status("ACTIVE")},
 			}})
 		}))
