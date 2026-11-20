@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	modelsv1alpha1 "github.com/abridgeai/baseten-operator/api/v1alpha1"
@@ -54,6 +55,7 @@ const (
 	statusDeleting            = "DELETING"
 	statusDeleteFailed        = "DELETE_FAILED"
 	statusDeleteBlocked       = "DELETE_BLOCKED"
+	statusRateLimited         = "RATE_LIMITED"
 
 	conditionReady       = "Ready"
 	conditionProgressing = "Progressing"
@@ -81,6 +83,19 @@ const (
 
 	// retryJitterFraction is the maximum fraction of jitter added to retry intervals (0-50%).
 	retryJitterFraction = 0.5
+
+	// rateLimitDefaultDelay is the wait for a 429 that did not send Retry-After.
+	// Added to rateLimitJitter, the total stays under a minute.
+	rateLimitDefaultDelay = 15 * time.Second
+	rateLimitJitter       = 15 * time.Second
+	// rateLimitHeaderJitter is added on top of Retry-After, never subtracted,
+	// so a fleet does not retry on the same instant and never retries early.
+	rateLimitHeaderJitter = 5 * time.Second
+	// rateLimitMinDelay keeps Retry-After: 0 from producing a zero result.
+	// A zero result with a nil error is not requeued once status stops changing.
+	rateLimitMinDelay = time.Second
+
+	rateLimitMessage = "rate limited"
 )
 
 // BasetenModelReconciler reconciles a BasetenModel object
@@ -95,6 +110,17 @@ type BasetenModelReconciler struct {
 	Recorder                record.EventRecorder
 	MaxConcurrentReconciles int           // concurrent reconcile workers (default 1)
 	PushSemaphore           chan struct{} // bounds concurrent async truss push goroutines
+
+	// rateLimitUntil mirrors status.rateLimitWindowEnd for this process so a
+	// follow-up reconcile can skip the fold before it re-reads. The status
+	// field is the source of truth across restarts.
+	rateLimitMu    sync.Mutex
+	rateLimitUntil map[string]time.Time
+
+	// watchNamespace, when set, limits the watch to that namespace.
+	// controllerName overrides the controller name. Both are empty in production.
+	watchNamespace string
+	controllerName string
 
 	pollState sync.Map // client.ObjectKey -> pollState; one key never reconciles concurrently
 }
@@ -116,6 +142,7 @@ type statusUpdate struct {
 	clearCandidate             bool
 	replicaCount               int32
 	firstDeploymentFailureTime *metav1.Time
+	rateLimitWindowEnd         *metav1.Time
 }
 
 // +kubebuilder:rbac:groups=models.baseten.com,resources=basetenmodels,verbs=get;list;watch;create;update;patch;delete
@@ -142,6 +169,12 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if handled, result, err := r.reconcileLifecycle(ctx, model); handled {
 		return result, err
 	}
+	// The last status is PAUSED only while spec.mode (or spec.paused) was Pause.
+	// Leaving Pause starts the failed-deployment deadline over and drops any
+	// rate-limit window, including when the failure clock was never set.
+	r.resetFailureClockAfterPause(ctx, model)
+	// A spec edit must not sit behind a wait computed for the previous spec.
+	r.clearRateLimitWindowOnSpecChange(ctx, model)
 
 	// Observe mode short-circuits normal reconciliation with a read-only path.
 	if effectiveMode(model) == modelsv1alpha1.ModeObserve {
@@ -188,32 +221,7 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			"status", env.CurrentDeployment.Status)
 
 		if env.CurrentDeployment.Status == baseten.DeploymentStatusInactive {
-			logger.Info("Reactivating inactive current deployment",
-				"deploymentID", env.CurrentDeployment.ID,
-				"deploymentName", env.CurrentDeployment.Name)
-			if err := r.BasetenClient.ActivateDeployment(ctx, modelID, env.CurrentDeployment.ID); err != nil {
-				logger.Error(err, "Failed to reactivate current deployment")
-				r.logUpdateStatus(ctx, model, statusUpdate{
-					deploymentStatus:     baseten.DeploymentStatusFailed,
-					message:              fmt.Sprintf("failed to reactivate deployment %s in %s environment: %v", env.CurrentDeployment.Name, envName, err),
-					modelID:              modelID,
-					activeDeploymentName: env.CurrentDeployment.Name,
-					replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
-				})
-				if r.invalidateModelID(ctx, model, err) {
-					return ctrl.Result{RequeueAfter: time.Second}, nil
-				}
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-			}
-			r.Recorder.Eventf(model, corev1.EventTypeNormal, EventDeploymentReactivated, "Reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName)
-			r.logUpdateStatus(ctx, model, statusUpdate{
-				deploymentStatus:     baseten.DeploymentStatusActivating,
-				message:              fmt.Sprintf("reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName),
-				modelID:              modelID,
-				activeDeploymentName: env.CurrentDeployment.Name,
-				replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
-			})
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			return r.reactivateCurrent(ctx, model, modelID, envName, env)
 		}
 
 		su := statusUpdate{
@@ -235,9 +243,12 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 
-		// Orphan cleanup: only when opted in and in steady state
+		// Orphan cleanup: only when opted in and in steady state.
+		// A 429 here requeues on the rate-limit delay instead of the 5m poll.
 		if model.Spec.OrphanDeploymentCleanup != nil {
-			r.reconcileOrphanCleanup(ctx, model, modelID)
+			if result := r.reconcileOrphanCleanup(ctx, model, modelID); result != nil {
+				return *result, nil
+			}
 		}
 
 		r.resetWait(model)
@@ -291,27 +302,11 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		"sourceDeploymentName", sourceDeploymentName,
 		"targetEnvironment", envName)
 
-	r.logUpdateStatus(ctx, model, statusUpdate{
-		deploymentStatus:   statusPromotingDeployment,
-		message:            fmt.Sprintf("%spromoting %s to %s", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName),
-		modelID:            modelID,
-		sourceDeploymentID: sourceDeploymentID,
-	})
-
-	targetDep, err := r.BasetenClient.Promote(ctx, modelID, sourceDeploymentID, envName, model.Spec.Environment.PromotionSettings)
-	if err != nil {
-		logger.Error(err, "Failed to promote source deployment")
-		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionFailed, "Failed to promote %s to %s: %v", sourceDeploymentName, envName, err)
-		r.logUpdateStatus(ctx, model, statusUpdate{
-			deploymentStatus:   baseten.DeploymentStatusFailed,
-			message:            fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
-			modelID:            modelID,
-			sourceDeploymentID: sourceDeploymentID,
-		})
-		if r.invalidateModelID(ctx, model, err) {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		return ctrl.Result{}, err
+	// One status write for this pass. Writing PROMOTING_DEPLOYMENT here and
+	// RATE_LIMITED after a 429 requeues the object before RequeueAfter can wait.
+	targetDep, promoteResult, err := r.promoteSource(ctx, model, modelID, sourceDeploymentID, sourceDeploymentName, envName, env)
+	if err != nil || promoteResult.RequeueAfter > 0 {
+		return promoteResult, err
 	}
 
 	logger.Info("Source deployment promoted successfully",
@@ -397,30 +392,33 @@ func (r *BasetenModelReconciler) checkDoublePromoteGuard(ctx context.Context, mo
 	return &result
 }
 
-func (r *BasetenModelReconciler) reconcileOrphanCleanup(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) {
+func (r *BasetenModelReconciler) reconcileOrphanCleanup(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string) *ctrl.Result {
 	logger := log.FromContext(ctx)
 	cleanup := model.Spec.OrphanDeploymentCleanup
 
 	// Skip cleanup if interval not configured (feature disabled)
 	if cleanup.IntervalMinutes == nil {
-		return
+		return nil
 	}
 	// Skip cleanup if interval hasn't elapsed (rate limiting to avoid API churn)
 	if model.Status.LastCleanupTime != nil && time.Since(model.Status.LastCleanupTime.Time) < time.Duration(*cleanup.IntervalMinutes)*time.Minute {
-		return
+		return nil
 	}
 
 	scaleIn := cleanup.ScaleToZero != nil && *cleanup.ScaleToZero
 	deleteStale := cleanup.Delete != nil && *cleanup.Delete
 	// Skip cleanup if neither action is enabled (nothing to do)
 	if !scaleIn && !deleteStale {
-		return
+		return nil
 	}
 
 	orphans, err := r.findOrphanDeployments(ctx, model, modelID)
 	if err != nil {
+		if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+			return &result
+		}
 		logger.Error(err, "Failed to find orphan deployments")
-		return
+		return nil
 	}
 
 	logger.Info("Orphan cleanup: found orphan deployments", "count", len(orphans))
@@ -428,13 +426,23 @@ func (r *BasetenModelReconciler) reconcileOrphanCleanup(ctx context.Context, mod
 	scaledIn := 0
 	var scaledNames []string
 	if scaleIn {
-		scaledIn, scaledNames = r.scaleInOrphans(ctx, modelID, orphans)
+		var scaleErr error
+		scaledIn, scaledNames, scaleErr = r.scaleInOrphans(ctx, modelID, orphans)
+		if result, ok := r.requeueQuietRateLimit(ctx, model, scaleErr); ok {
+			r.recordOrphanProgress(ctx, model, scaledIn, scaledNames, 0, nil)
+			return &result
+		}
 	}
 
 	deleted := 0
 	var deletedNames []string
 	if deleteStale {
-		deleted, deletedNames = r.deleteStaleOrphans(ctx, model, modelID, orphans, cleanup)
+		var deleteErr error
+		deleted, deletedNames, deleteErr = r.deleteStaleOrphans(ctx, model, modelID, orphans, cleanup)
+		if result, ok := r.requeueQuietRateLimit(ctx, model, deleteErr); ok {
+			r.recordOrphanProgress(ctx, model, scaledIn, scaledNames, deleted, deletedNames)
+			return &result
+		}
 	}
 
 	if scaledIn > 0 {
@@ -448,6 +456,27 @@ func (r *BasetenModelReconciler) reconcileOrphanCleanup(ctx context.Context, mod
 	model.Status.LastCleanupTime = &now
 	if err := r.Status().Update(ctx, model); err != nil {
 		logger.Error(err, "Failed to update lastCleanupTime")
+	}
+	return nil
+}
+
+// recordOrphanProgress emits events for work finished before a 429 and stamps
+// LastCleanupTime when that work is non-empty, so the interval does not immediately
+// repeat mutations that already succeeded.
+func (r *BasetenModelReconciler) recordOrphanProgress(ctx context.Context, model *modelsv1alpha1.BasetenModel, scaledIn int, scaledNames []string, deleted int, deletedNames []string) {
+	if scaledIn > 0 {
+		r.Recorder.Eventf(model, corev1.EventTypeNormal, EventOrphanDeploymentsScaledIn, "Scaled in %d orphan deployments: %s", scaledIn, strings.Join(scaledNames, ", "))
+	}
+	if deleted > 0 {
+		r.Recorder.Eventf(model, corev1.EventTypeNormal, EventOrphanDeploymentsDeleted, "Deleted %d stale orphan deployments: %s", deleted, strings.Join(deletedNames, ", "))
+	}
+	if scaledIn == 0 && deleted == 0 {
+		return
+	}
+	now := metav1.Now()
+	model.Status.LastCleanupTime = &now
+	if err := r.Status().Update(ctx, model); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update lastCleanupTime after partial orphan cleanup")
 	}
 }
 
@@ -499,7 +528,7 @@ func (r *BasetenModelReconciler) findOrphanDeployments(ctx context.Context, mode
 	return orphans, nil
 }
 
-func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID string, orphans []baseten.DeploymentDetail) (int, []string) {
+func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID string, orphans []baseten.DeploymentDetail) (int, []string, error) {
 	logger := log.FromContext(ctx)
 	scaledIn := 0
 	names := make([]string, 0, len(orphans))
@@ -509,6 +538,9 @@ func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID str
 			continue
 		}
 		if err := r.BasetenClient.UpdateDeploymentAutoscaling(ctx, modelID, dep.ID, 0); err != nil {
+			if baseten.IsRateLimited(err) {
+				return scaledIn, names, err
+			}
 			logger.Error(err, "Failed to scale in orphan deployment", "deploymentID", dep.ID, "deploymentName", dep.Name)
 			continue
 		}
@@ -516,16 +548,16 @@ func (r *BasetenModelReconciler) scaleInOrphans(ctx context.Context, modelID str
 		scaledIn++
 		names = append(names, dep.Name)
 	}
-	return scaledIn, names
+	return scaledIn, names, nil
 }
 
-func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string, orphans []baseten.DeploymentDetail, cleanup *modelsv1alpha1.OrphanDeploymentCleanupConfig) (int, []string) {
+func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string, orphans []baseten.DeploymentDetail, cleanup *modelsv1alpha1.OrphanDeploymentCleanupConfig) (int, []string, error) {
 	logger := log.FromContext(ctx)
 
 	// Skip deletion if safety parameters not configured (prevents accidental mass deletion)
 	if cleanup.DeleteAfterDays == nil || cleanup.MinToKeep == nil {
 		logger.Info("Skipping stale orphan deletion: deleteAfterDays and minToKeep must be set")
-		return 0, nil
+		return 0, nil, nil
 	}
 	staleDays := *cleanup.DeleteAfterDays
 	minKeep := *cleanup.MinToKeep
@@ -568,8 +600,12 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 	cutoff := time.Now().AddDate(0, 0, -int(staleDays))
 	deleted := 0
 	names := make([]string, 0, len(candidates))
+	var rateErr error
 
 	tryDelete := func(dep baseten.DeploymentDetail) {
+		if rateErr != nil {
+			return
+		}
 		if dep.Status != baseten.DeploymentStatusInactive && !baseten.IsTerminalFailure(dep.Status) {
 			return
 		}
@@ -582,6 +618,10 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 			return
 		}
 		if err := r.BasetenClient.DeleteDeployment(ctx, modelID, dep.ID); err != nil {
+			if baseten.IsRateLimited(err) {
+				rateErr = err
+				return
+			}
 			logger.Error(err, "Failed to delete stale orphan deployment", "deploymentID", dep.ID, "deploymentName", dep.Name)
 			return
 		}
@@ -597,7 +637,7 @@ func (r *BasetenModelReconciler) deleteStaleOrphans(ctx context.Context, model *
 		tryDelete(dep)
 	}
 
-	return deleted, names
+	return deleted, names, rateErr
 }
 
 // reconcileLifecycle handles the pre-reconcile lifecycle for a BasetenModel:
@@ -673,6 +713,9 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 	if policy == modelsv1alpha1.DeletionPolicyDeleteWithGuardrails {
 		blockers, err := r.checkDeleteGuardrails(ctx, modelID)
 		if err != nil {
+			if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+				return result, nil
+			}
 			logger.Error(err, "Failed to evaluate delete guardrails", "modelID", modelID)
 			msg := fmt.Sprintf("deletion blocked: failed to list environments for model %s: %v", modelID, err)
 			if model.Status.DeploymentStatus != statusDeleteBlocked {
@@ -699,17 +742,16 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 		}
 	}
 
-	r.logUpdateStatus(ctx, model, statusUpdate{
-		deploymentStatus: statusDeleting,
-		message:          fmt.Sprintf("deleting Baseten model %s", modelID),
-		modelID:          modelID,
-	})
-
 	if err := r.BasetenClient.DeleteModel(ctx, modelID); err != nil {
 		if baseten.IsNotFoundError(err) {
 			logger.Info("Baseten model already deleted (404), releasing finalizer", "modelID", modelID)
 			r.Recorder.Eventf(model, corev1.EventTypeNormal, EventModelDeleted, "Baseten model %s already deleted (404)", modelID)
 			return r.releaseFinalizer(ctx, model)
+		}
+		// A 429 is the only status write this pass. Writing DELETING first would
+		// requeue immediately and stack another wait onto the failure clock.
+		if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+			return result, nil
 		}
 		logger.Error(err, "Failed to delete Baseten model", "modelID", modelID)
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelDeleteFailed, "Failed to delete Baseten model %s: %v", modelID, err)
@@ -720,6 +762,12 @@ func (r *BasetenModelReconciler) reconcileDeletion(ctx context.Context, model *m
 		})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+
+	r.logUpdateStatus(ctx, model, statusUpdate{
+		deploymentStatus: statusDeleting,
+		message:          fmt.Sprintf("deleting Baseten model %s", modelID),
+		modelID:          modelID,
+	})
 
 	logger.Info("Deleted Baseten model, releasing finalizer", "modelID", modelID)
 	r.Recorder.Eventf(model, corev1.EventTypeNormal, EventModelDeleted, "Deleted Baseten model %s", modelID)
@@ -789,6 +837,25 @@ func (r *BasetenModelReconciler) releaseFinalizer(ctx context.Context, model *mo
 	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, model))
 }
 
+// resetFailureClockAfterPause clears FirstDeploymentFailureTime on the first
+// reconcile after Pause, so the 2h retry deadline does not include time spent paused.
+// The rate-limit window is cleared even when that clock was never set, so a
+// resume is not left PAUSED behind a wait.
+func (r *BasetenModelReconciler) resetFailureClockAfterPause(ctx context.Context, model *modelsv1alpha1.BasetenModel) {
+	if model.Status.DeploymentStatus != statusPaused {
+		return
+	}
+	if model.Status.FirstDeploymentFailureTime == nil && model.Status.RateLimitWindowEnd == nil {
+		return
+	}
+	model.Status.FirstDeploymentFailureTime = nil
+	model.Status.RateLimitWindowEnd = nil
+	r.clearRateLimitWait(model)
+	if err := r.Status().Update(ctx, model); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to reset deployment failure clock after leaving pause")
+	}
+}
+
 func (r *BasetenModelReconciler) reconcilePaused(ctx context.Context, model *modelsv1alpha1.BasetenModel) {
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciliation paused", "name", model.Name)
@@ -832,12 +899,20 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 	logger := log.FromContext(ctx)
 	logger.Info("Observing BasetenModel (read-only)", "name", model.Name)
 
+	if result, waiting := r.openRateLimitWindow(ctx, model); waiting {
+		return result, nil
+	}
+
 	// Resolve modelID (cached if available; otherwise lookup by name). Never creates.
 	modelID := model.Status.ModelID
 	if modelID == "" {
 		var err error
 		modelID, err = r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName, model.Spec.Team)
 		if err != nil {
+			if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+				r.ensureInitialRateLimitStatus(ctx, model)
+				return result, nil
+			}
 			logger.Error(err, "Failed to lookup model")
 			r.logUpdateStatus(ctx, model, statusUpdate{
 				deploymentStatus: baseten.DeploymentStatusFailed,
@@ -871,6 +946,9 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 	// Fetch environment. Never creates.
 	env, err := r.BasetenClient.GetEnvironment(ctx, modelID, envName)
 	if err != nil {
+		if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+			return result, nil
+		}
 		if baseten.IsNotFoundError(err) {
 			r.logUpdateStatus(ctx, model, statusUpdate{
 				deploymentStatus: baseten.DeploymentStatusFailed,
@@ -1071,20 +1149,14 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 ) (*ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
 
-	// Set firstDeploymentFailureTime on first detection
-	firstFailure := model.Status.FirstDeploymentFailureTime
-	if firstFailure == nil {
-		now := metav1.Now()
-		firstFailure = &now
-		model.Status.FirstDeploymentFailureTime = firstFailure
-		if err := r.Status().Update(ctx, model); err != nil {
-			logger.Error(err, "Failed to set firstDeploymentFailureTime")
-		}
+	// The clock starts only after a retry attempt that was not a 429. While a
+	// saved 429 window is still open this wait is not a retry, and it must not
+	// exhaust the deadline before Baseten will accept another call.
+	if result, waiting := r.openRateLimitWindow(ctx, model); waiting {
+		return &result, true
 	}
-
-	// Check 2h deadline
-	if time.Since(firstFailure.Time) > deploymentRetryDeadline {
-		logger.Info("Deployment retry deadline exceeded", "deploymentName", deploymentName, "firstFailure", firstFailure.Time)
+	if model.Status.FirstDeploymentFailureTime != nil && time.Since(model.Status.FirstDeploymentFailureTime.Time) > deploymentRetryDeadline {
+		logger.Info("Deployment retry deadline exceeded", "deploymentName", deploymentName, "firstFailure", model.Status.FirstDeploymentFailureTime.Time)
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventDeploymentRetryExhausted,
 			"Deployment %s has been failing for over %s, giving up retries", deploymentName, deploymentRetryDeadline)
 		return nil, false
@@ -1105,6 +1177,9 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 	currentStatus := failedStatus
 	_, freshStatus, err := r.BasetenClient.FindDeploymentIDByName(ctx, modelID, deploymentName)
 	if err != nil {
+		if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+			return &result, true
+		}
 		logger.Error(err, "Failed to re-check deployment status before retry", "deploymentName", deploymentName)
 		// Proceed with the status we have — the retry API is idempotent
 	} else if freshStatus != "" {
@@ -1120,6 +1195,10 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 	// Call retry API
 	retryResp, err := r.BasetenClient.RetryDeployment(ctx, modelID, deploymentID)
 	if err != nil {
+		if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+			return &result, true
+		}
+		r.noteFailureClock(model)
 		logger.Error(err, "Failed to call retry API", "deploymentID", deploymentID)
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventDeploymentRetryFailed,
 			"Failed to retry deployment %s: %v", deploymentName, err)
@@ -1128,6 +1207,7 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 		return &result, true
 	}
 
+	r.noteFailureClock(model)
 	if !retryResp.Retried {
 		logger.Info("Retry API declined", "deploymentName", deploymentName, "reason", retryResp.Reason)
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventDeploymentRetryFailed,
@@ -1152,6 +1232,17 @@ func (r *BasetenModelReconciler) tryRetryDeployment(
 
 	result := ctrl.Result{RequeueAfter: 30 * time.Second}
 	return &result, true
+}
+
+// noteFailureClock records the start of the 2h deadline on the in-memory model.
+// The following status write persists it. A 429 returns before this, so the
+// deadline does not start while the retry API is rate limiting us.
+func (r *BasetenModelReconciler) noteFailureClock(model *modelsv1alpha1.BasetenModel) {
+	if model.Status.FirstDeploymentFailureTime != nil {
+		return
+	}
+	now := metav1.Now()
+	model.Status.FirstDeploymentFailureTime = &now
 }
 
 // scheduleNextRetry increments the retry count and computes the next retry time
@@ -1181,8 +1272,266 @@ func retryBackoff(retryCount int32) time.Duration {
 	return base + jitter
 }
 
+// rateLimitDelay is how long to wait before retrying a 429.
+// Retry-After is a lower bound when Baseten sends it, clamped to
+// [rateLimitMinDelay, baseten.MaxRetryAfter]. Otherwise the wait is a short
+// jittered delay that stays under a minute. The whole clamped wait is folded
+// into the failure clock, so it does not burn the 2h budget.
+func rateLimitDelay(err error) time.Duration {
+	delay := rateLimitDefaultDelay + boundedJitter(rateLimitJitter)
+	if d, ok := baseten.RetryAfter(err); ok {
+		if d < 0 {
+			d = 0
+		}
+		if d > baseten.MaxRetryAfter {
+			d = baseten.MaxRetryAfter
+		}
+		delay = d + boundedJitter(rateLimitHeaderJitter)
+	}
+	if delay > baseten.MaxRetryAfter {
+		delay = baseten.MaxRetryAfter
+	}
+	if delay < rateLimitMinDelay {
+		return rateLimitMinDelay
+	}
+	return delay
+}
+
+func boundedJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	// [0, max). A zero draw is fine; rateLimitMinDelay covers a fully zero wait.
+	return time.Duration(rand.Float64() * float64(max))
+}
+
+func (r *BasetenModelReconciler) reactivateCurrent(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID, envName string, env *baseten.Environment) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Reactivating inactive current deployment",
+		"deploymentID", env.CurrentDeployment.ID,
+		"deploymentName", env.CurrentDeployment.Name)
+	if err := r.BasetenClient.ActivateDeployment(ctx, modelID, env.CurrentDeployment.ID); err != nil {
+		if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+			return result, nil
+		}
+		logger.Error(err, "Failed to reactivate current deployment")
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus:     baseten.DeploymentStatusFailed,
+			message:              fmt.Sprintf("failed to reactivate deployment %s in %s environment: %v", env.CurrentDeployment.Name, envName, err),
+			modelID:              modelID,
+			activeDeploymentName: env.CurrentDeployment.Name,
+			replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
+		})
+		if r.invalidateModelID(ctx, model, err) {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	r.Recorder.Eventf(model, corev1.EventTypeNormal, EventDeploymentReactivated, "Reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName)
+	r.logUpdateStatus(ctx, model, statusUpdate{
+		deploymentStatus:     baseten.DeploymentStatusActivating,
+		message:              fmt.Sprintf("reactivating inactive deployment %s in %s environment", env.CurrentDeployment.Name, envName),
+		modelID:              modelID,
+		activeDeploymentName: env.CurrentDeployment.Name,
+		replicaCount:         env.CurrentDeployment.ActiveReplicaCount,
+	})
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+func (r *BasetenModelReconciler) promoteSource(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID, sourceDeploymentID, sourceDeploymentName, envName string, env *baseten.Environment) (*baseten.Deployment, ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	targetDep, err := r.BasetenClient.Promote(ctx, modelID, sourceDeploymentID, envName, model.Spec.Environment.PromotionSettings)
+	if err != nil {
+		if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+			return nil, result, nil
+		}
+		logger.Error(err, "Failed to promote source deployment")
+		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventPromotionFailed, "Failed to promote %s to %s: %v", sourceDeploymentName, envName, err)
+		r.logUpdateStatus(ctx, model, statusUpdate{
+			deploymentStatus:   baseten.DeploymentStatusFailed,
+			message:            fmt.Sprintf("%spromotion of '%s' to %s failed: %v", activePrefix(env.CurrentDeployment), sourceDeploymentName, envName, err),
+			modelID:            modelID,
+			sourceDeploymentID: sourceDeploymentID,
+		})
+		if r.invalidateModelID(ctx, model, err) {
+			return nil, ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		return nil, ctrl.Result{}, err
+	}
+	return targetDep, ctrl.Result{}, nil
+}
+
+// requeueIfRateLimited is the deploy, promote, activate, retry, and delete path.
+// It records RATE_LIMITED once. A repeated 429 in the same wait does not write
+// again, so the watch does not requeue over RequeueAfter.
+func (r *BasetenModelReconciler) requeueIfRateLimited(ctx context.Context, model *modelsv1alpha1.BasetenModel, modelID string, err error) (ctrl.Result, bool) {
+	delay, ok := r.noteRateLimit(ctx, model, err)
+	if !ok {
+		return ctrl.Result{}, false
+	}
+	if modelID == "" {
+		modelID = model.Status.ModelID
+	}
+	failure, windowEnd := r.foldRateLimitWait(model, delay)
+	r.logUpdateStatus(ctx, model, statusUpdate{
+		deploymentStatus:           statusRateLimited,
+		message:                    rateLimitMessage,
+		modelID:                    modelID,
+		replicaCount:               model.Status.ActiveReplicaCount,
+		firstDeploymentFailureTime: failure,
+		rateLimitWindowEnd:         windowEnd,
+	})
+	return ctrl.Result{RequeueAfter: delay}, true
+}
+
+// requeueQuietRateLimit is a housekeeping 429: an event and a requeue, with no
+// status write and no movement of the failure clock.
+func (r *BasetenModelReconciler) requeueQuietRateLimit(ctx context.Context, model *modelsv1alpha1.BasetenModel, err error) (ctrl.Result, bool) {
+	delay, ok := r.noteRateLimit(ctx, model, err)
+	if !ok {
+		return ctrl.Result{}, false
+	}
+	return ctrl.Result{RequeueAfter: delay}, true
+}
+
+// ensureInitialRateLimitStatus gives a brand-new CR one status write so it is
+// not blank while lookup stays rate limited. Later 429s leave that status alone.
+func (r *BasetenModelReconciler) ensureInitialRateLimitStatus(ctx context.Context, model *modelsv1alpha1.BasetenModel) {
+	if model.Status.DeploymentStatus != "" {
+		return
+	}
+	r.logUpdateStatus(ctx, model, statusUpdate{
+		deploymentStatus: statusRateLimited,
+		message:          rateLimitMessage,
+	})
+}
+
+func (r *BasetenModelReconciler) noteRateLimit(ctx context.Context, model *modelsv1alpha1.BasetenModel, err error) (time.Duration, bool) {
+	if !baseten.IsRateLimited(err) {
+		return 0, false
+	}
+	delay := rateLimitDelay(err)
+	log.FromContext(ctx).Info("Baseten API rate limited", "requeueAfter", delay)
+	r.Recorder.Eventf(model, corev1.EventTypeWarning, EventRateLimited,
+		"Baseten API rate limited, retrying in %s", delay.Round(time.Second))
+	return delay, true
+}
+
+// openRateLimitWindow is the remaining time of a 429 wait already stored on the
+// CR. The deadline check does not run while it is open, so a watch cannot
+// exhaust retries before the folded wait has elapsed. A stored end more than
+// MaxRetryAfter ahead is clamped and written back.
+func (r *BasetenModelReconciler) openRateLimitWindow(ctx context.Context, model *modelsv1alpha1.BasetenModel) (ctrl.Result, bool) {
+	if model.Status.RateLimitWindowEnd == nil {
+		return ctrl.Result{}, false
+	}
+	end := model.Status.RateLimitWindowEnd.Time
+	limit := time.Now().Add(baseten.MaxRetryAfter)
+	if end.After(limit) {
+		clamped := metav1.NewTime(limit)
+		model.Status.RateLimitWindowEnd = &clamped
+		r.clearRateLimitWait(model)
+		if err := r.Status().Update(ctx, model); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to clamp rate limit window")
+		}
+		end = limit
+	}
+	remaining := time.Until(end)
+	if remaining <= 0 {
+		return ctrl.Result{}, false
+	}
+	log.FromContext(ctx).Info("rate limit window still open", "requeueAfter", remaining)
+	return ctrl.Result{RequeueAfter: remaining}, true
+}
+
+// clearRateLimitWindowOnSpecChange drops a wait that was computed for the
+// previous spec so the new generation is reconciled immediately.
+func (r *BasetenModelReconciler) clearRateLimitWindowOnSpecChange(ctx context.Context, model *modelsv1alpha1.BasetenModel) {
+	if model.Status.RateLimitWindowEnd == nil || !specChangedSinceStatus(model) {
+		return
+	}
+	model.Status.RateLimitWindowEnd = nil
+	r.clearRateLimitWait(model)
+	if err := r.Status().Update(ctx, model); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to clear rate limit window after spec change")
+	}
+}
+
+func specChangedSinceStatus(model *modelsv1alpha1.BasetenModel) bool {
+	for _, c := range model.Status.Conditions {
+		if c.Type != conditionReady {
+			continue
+		}
+		return c.ObservedGeneration != model.Generation
+	}
+	return false
+}
+
+// foldRateLimitWait returns the failure clock and window end to persist for this
+// 429, or nils when the saved window already covers the wait. The fold is the
+// whole uncovered tail of the already-capped delay, so a restart does not add
+// the wait again and the wait does not burn the 2h budget.
+func (r *BasetenModelReconciler) foldRateLimitWait(model *modelsv1alpha1.BasetenModel, delay time.Duration) (*metav1.Time, *metav1.Time) {
+	if delay <= 0 {
+		return nil, nil
+	}
+	now := time.Now()
+	proposedEnd := now.Add(delay)
+	var covered time.Time
+	if model.Status.RateLimitWindowEnd != nil {
+		covered = model.Status.RateLimitWindowEnd.Time
+	}
+	key := model.Namespace + "/" + model.Name
+	r.rateLimitMu.Lock()
+	cached, hasCache := time.Time{}, false
+	if r.rateLimitUntil != nil {
+		cached, hasCache = r.rateLimitUntil[key]
+	}
+	r.rateLimitMu.Unlock()
+	// Cache is an optimization: trust it only when status already records the same window.
+	if hasCache && now.Before(cached) && !covered.Add(time.Second).Before(cached) {
+		return nil, nil
+	}
+
+	var uncovered time.Duration
+	switch {
+	case covered.IsZero() || !covered.After(now):
+		uncovered = delay
+	case proposedEnd.After(covered.Add(time.Second)):
+		uncovered = proposedEnd.Sub(covered)
+	default:
+		return nil, nil
+	}
+
+	var failure *metav1.Time
+	if uncovered > 0 && model.Status.FirstDeploymentFailureTime != nil {
+		t := metav1.NewTime(model.Status.FirstDeploymentFailureTime.Add(uncovered))
+		failure = &t
+	}
+	end := metav1.NewTime(proposedEnd)
+	r.rateLimitMu.Lock()
+	if r.rateLimitUntil == nil {
+		r.rateLimitUntil = map[string]time.Time{}
+	}
+	r.rateLimitUntil[key] = proposedEnd
+	r.rateLimitMu.Unlock()
+	return failure, &end
+}
+
+func (r *BasetenModelReconciler) clearRateLimitWait(model *modelsv1alpha1.BasetenModel) {
+	r.rateLimitMu.Lock()
+	defer r.rateLimitMu.Unlock()
+	delete(r.rateLimitUntil, model.Namespace+"/"+model.Name)
+}
+
 func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *modelsv1alpha1.BasetenModel) (string, *ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Before any Baseten call. A watch event during the window lands here too,
+	// so it cannot reach the 2h deadline check.
+	if result, waiting := r.openRateLimitWindow(ctx, model); waiting {
+		return "", &result, nil
+	}
 
 	// Use cached model ID from status if available (persisted in API server across reconciles)
 	if model.Status.ModelID != "" {
@@ -1192,6 +1541,10 @@ func (r *BasetenModelReconciler) resolveModelID(ctx context.Context, model *mode
 
 	modelID, err := r.BasetenClient.FindModelIDByName(ctx, model.Spec.ModelName, model.Spec.Team)
 	if err != nil {
+		if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+			r.ensureInitialRateLimitStatus(ctx, model)
+			return "", &result, nil
+		}
 		logger.Error(err, "Failed to lookup model in Baseten")
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventModelNotFound, "Failed to lookup model %q: %v", model.Spec.ModelName, err)
 		r.logUpdateStatus(ctx, model, statusUpdate{
@@ -1294,6 +1647,9 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 		// Hash changed or first reconcile — verify deployment exists in Baseten
 		existingID, _, err := r.BasetenClient.FindDeploymentIDByName(ctx, modelID, deploymentName)
 		if err != nil {
+			if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+				return "", &result, nil
+			}
 			logger.Error(err, "Failed to check for existing deployment")
 			r.logUpdateStatus(ctx, model, statusUpdate{
 				deploymentStatus: statusPending,
@@ -1361,6 +1717,11 @@ func (r *BasetenModelReconciler) reconcileTrussDeployment(ctx context.Context, m
 		case model.Status.SourceDeploymentName != deploymentName:
 			// Config changed since the failure: push the new config now.
 			clearPushFailure(&model.Status)
+		case next != nil && time.Now().Before(next.Time) && model.Status.DeploymentStatus == statusRateLimited:
+			// A push 429 already recorded RATE_LIMITED. Wait out that delay
+			// without rewriting it as a failed push.
+			result := ctrl.Result{RequeueAfter: time.Until(next.Time)}
+			return "", &result, nil
 		case next != nil && time.Now().Before(next.Time):
 			r.logUpdateStatus(ctx, model, statusUpdate{
 				deploymentStatus: baseten.DeploymentStatusFailed,
@@ -1470,6 +1831,10 @@ func (r *BasetenModelReconciler) asyncPush(modelName, namespace string, configYA
 	result, err := r.TrussPusher.PushFromConfig(ctx, configYAML, setupScript, basetenModelName, team, deploymentName, environment)
 	if err != nil {
 		logger.Error(err, "Create deployment failed", "deploymentName", deploymentName)
+		if truss.IsRateLimited(err) {
+			r.recordPushRateLimit(modelName, namespace, deploymentName, err)
+			return
+		}
 		r.recordPushFailure(modelName, namespace, deploymentName, err)
 		return
 	}
@@ -1507,6 +1872,57 @@ func (r *BasetenModelReconciler) updatePushStatus(modelName, namespace, pushStat
 	if err != nil {
 		logger.Error(err, "Failed to update push status", "pushStatus", pushStatus)
 	}
+}
+
+// recordPushRateLimit waits out a truss-go 429 on the rate-limit delay.
+// It does not increment TrussPushFailureCount or use the 2m-30m push backoff.
+func (r *BasetenModelReconciler) recordPushRateLimit(modelName, namespace, deploymentName string, pushErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	logger := log.FromContext(ctx).WithValues("model", modelName)
+	var delay time.Duration
+	model := &modelsv1alpha1.BasetenModel{}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, model); err != nil {
+			return err
+		}
+		delay = rateLimitDelay(pushErr)
+		failure, windowEnd := r.foldRateLimitWait(model, delay)
+		if failure != nil {
+			model.Status.FirstDeploymentFailureTime = failure
+		}
+		if windowEnd != nil {
+			model.Status.RateLimitWindowEnd = windowEnd
+		}
+		next := metav1.NewTime(time.Now().Add(delay))
+		model.Status.TrussPushStatus = statusTrussPushFailed
+		model.Status.TrussPushTime = nil
+		model.Status.TrussPushNextRetryTime = &next
+		model.Status.DeploymentStatus = statusRateLimited
+		model.Status.Message = rateLimitMessage
+		setCondition(&model.Status.Conditions, metav1.Condition{
+			Type:               conditionReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: model.Generation,
+			Reason:             statusRateLimited,
+			Message:            rateLimitMessage,
+		})
+		setCondition(&model.Status.Conditions, metav1.Condition{
+			Type:               conditionProgressing,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: model.Generation,
+			Reason:             statusRateLimited,
+			Message:            rateLimitMessage,
+		})
+		return r.Status().Update(ctx, model)
+	})
+	if err != nil {
+		logger.Error(err, "Failed to record push rate limit")
+		return
+	}
+	r.Recorder.Eventf(model, corev1.EventTypeWarning, EventRateLimited,
+		"Baseten API rate limited during truss push of %s, retrying in %s", deploymentName, delay.Round(time.Second))
 }
 
 // recordPushFailure marks the push failed and schedules the next attempt with
@@ -1580,10 +1996,16 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 
 	env, err := r.BasetenClient.GetEnvironment(ctx, modelID, envName)
 	if err != nil {
+		if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+			return nil, &result, nil
+		}
 		if baseten.IsNotFoundError(err) {
 			logger.Info("Creating environment with settings", "environment", envName)
 
 			if err := r.BasetenClient.CreateEnvironment(ctx, modelID, &model.Spec.Environment); err != nil {
+				if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+					return nil, &result, nil
+				}
 				logger.Error(err, "Failed to create environment")
 				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventEnvironmentCreateFailed, "Failed to create environment %s: %v", envName, err)
 				r.logUpdateStatus(ctx, model, statusUpdate{
@@ -1654,6 +2076,9 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 
 		if autoscalingDrift || promotionDrift {
 			if err := r.BasetenClient.UpdateEnvironmentSettings(ctx, modelID, envName, autoscalingConfig, promotionConfig); err != nil {
+				if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+					return nil, &result, nil
+				}
 				logger.Error(err, "Failed to update environment settings")
 				if autoscalingDrift {
 					r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingUpdateFailed, "Failed to update autoscaling for %s: %v", envName, err)
@@ -1679,6 +2104,9 @@ func (r *BasetenModelReconciler) reconcileEnvironment(ctx context.Context, model
 		}
 		if scheduleDrift {
 			if err := r.BasetenClient.UpdateAutoscalingSchedules(ctx, modelID, envName, model.Spec.Environment.AutoscalingSchedule, env.AutoscalingSchedules); err != nil {
+				if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+					return nil, &result, nil
+				}
 				logger.Error(err, "Failed to update autoscaling schedules")
 				r.Recorder.Eventf(model, corev1.EventTypeWarning, EventAutoscalingScheduleUpdateFailed, "Failed to update autoscaling schedules for %s: %v", envName, err)
 				r.logUpdateStatus(ctx, model, statusUpdate{
@@ -1738,6 +2166,9 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 	// Get source deployment ID and status by name (created by CI/CD via truss push, or by operator via trussConfig)
 	sourceDeploymentID, sourceDeploymentStatus, err := r.BasetenClient.FindDeploymentIDByName(ctx, modelID, sourceDeploymentName)
 	if err != nil {
+		if result, ok := r.requeueQuietRateLimit(ctx, model, err); ok {
+			return "", &result, nil
+		}
 		logger.Error(err, "Failed to lookup source deployment")
 		r.Recorder.Eventf(model, corev1.EventTypeWarning, EventSourceDeploymentNotFound, "Failed to lookup source deployment %q: %v", sourceDeploymentName, err)
 		r.logUpdateStatus(ctx, model, statusUpdate{
@@ -1780,6 +2211,9 @@ func (r *BasetenModelReconciler) validateSourceDeployment(ctx context.Context, m
 	case baseten.DeploymentStatusInactive:
 		logger.Info("Activating source deployment", "sourceDeploymentID", sourceDeploymentID, "currentStatus", sourceDeploymentStatus)
 		if err := r.BasetenClient.ActivateDeployment(ctx, modelID, sourceDeploymentID); err != nil {
+			if result, ok := r.requeueIfRateLimited(ctx, model, modelID, err); ok {
+				return "", &result, nil
+			}
 			logger.Error(err, "Failed to activate source deployment")
 			r.logUpdateStatus(ctx, model, statusUpdate{
 				deploymentStatus: baseten.DeploymentStatusFailed,
@@ -1884,6 +2318,7 @@ func steadyStateMessage(dep *baseten.Deployment, envName string, autoscaling *ba
 func isProgressingStatus(status string) bool {
 	switch status {
 	case statusPromoting, statusPromotingDeployment, statusPending, statusDeleting,
+		statusRateLimited,
 		baseten.DeploymentStatusActivating,
 		baseten.DeploymentStatusBuilding,
 		baseten.DeploymentStatusDeploying,
@@ -1927,6 +2362,7 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 	// modelID is already cached) triggers an API server write. Without this,
 	// the timestamp would never persist for existing CRs and the recreation
 	// guard for Delete / DeleteWithGuardrails policies would silently stay disabled.
+	beforeConditions := append([]metav1.Condition(nil), model.Status.Conditions...)
 	prev := statusSnapshot{
 		deploymentStatus:        model.Status.DeploymentStatus,
 		message:                 model.Status.Message,
@@ -1938,6 +2374,8 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		activeDeploymentName:    model.Status.ActiveDeploymentName,
 		candidateDeploymentID:   model.Status.CandidateDeploymentID,
 		candidateDeploymentName: model.Status.CandidateDeploymentName,
+		failureUnix:             failureUnix(model.Status.FirstDeploymentFailureTime),
+		rateLimitWindowUnix:     failureUnix(model.Status.RateLimitWindowEnd),
 	}
 
 	model.Status.DeploymentStatus = s.deploymentStatus
@@ -1976,8 +2414,19 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		model.Status.FirstDeploymentFailureTime = nil
 		model.Status.DeploymentRetryCount = 0
 		model.Status.NextRetryTime = nil
+		model.Status.RateLimitWindowEnd = nil
+		r.clearRateLimitWait(model)
 	} else if s.firstDeploymentFailureTime != nil {
 		model.Status.FirstDeploymentFailureTime = s.firstDeploymentFailureTime
+	}
+	if s.rateLimitWindowEnd != nil {
+		model.Status.RateLimitWindowEnd = s.rateLimitWindowEnd
+	}
+	// Pause drops the window even when the failure clock is unset, so resume
+	// is not stuck behind a wait that outlived the pause.
+	if s.deploymentStatus == statusPaused {
+		model.Status.RateLimitWindowEnd = nil
+		r.clearRateLimitWait(model)
 	}
 
 	readyStatus := metav1.ConditionFalse
@@ -2016,8 +2465,10 @@ func (r *BasetenModelReconciler) updateStatus(ctx context.Context, model *models
 		activeDeploymentName:    model.Status.ActiveDeploymentName,
 		candidateDeploymentID:   model.Status.CandidateDeploymentID,
 		candidateDeploymentName: model.Status.CandidateDeploymentName,
+		failureUnix:             failureUnix(model.Status.FirstDeploymentFailureTime),
+		rateLimitWindowUnix:     failureUnix(model.Status.RateLimitWindowEnd),
 	}
-	if curr == prev && !conditionsChanged(model.Status.Conditions, s.deploymentStatus, readyStatus, progressingStatus) {
+	if curr == prev && !conditionsChanged(beforeConditions, model.Generation, s.deploymentStatus, s.message, readyStatus, progressingStatus) {
 		return nil
 	}
 
@@ -2035,6 +2486,15 @@ type statusSnapshot struct {
 	activeDeploymentName    string
 	candidateDeploymentID   string
 	candidateDeploymentName string
+	failureUnix             int64
+	rateLimitWindowUnix     int64
+}
+
+func failureUnix(t *metav1.Time) int64 {
+	if t == nil || t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }
 
 func setCondition(conditions *[]metav1.Condition, condition metav1.Condition) {
@@ -2054,21 +2514,23 @@ func setCondition(conditions *[]metav1.Condition, condition metav1.Condition) {
 	*conditions = append(*conditions, condition)
 }
 
-// conditionsChanged checks if the condition Reason or Status differs from what's already set.
-func conditionsChanged(conditions []metav1.Condition, reason string, readyStatus, progressingStatus metav1.ConditionStatus) bool {
-	for _, c := range conditions {
-		switch c.Type {
-		case conditionReady:
-			if c.Status != readyStatus || c.Reason != reason {
-				return true
-			}
-		case conditionProgressing:
-			if c.Status != progressingStatus || c.Reason != reason {
-				return true
-			}
+// conditionsChanged reports whether Ready or Progressing still differ from the
+// values about to be written, including ObservedGeneration. Compare the conditions
+// from before setCondition; that helper has already overwritten them in place,
+// so comparing afterwards always looks unchanged.
+func conditionsChanged(before []metav1.Condition, generation int64, reason, message string, readyStatus, progressingStatus metav1.ConditionStatus) bool {
+	return conditionStale(before, generation, conditionReady, reason, message, readyStatus) ||
+		conditionStale(before, generation, conditionProgressing, reason, message, progressingStatus)
+}
+
+func conditionStale(existing []metav1.Condition, generation int64, condType, reason, message string, status metav1.ConditionStatus) bool {
+	for _, c := range existing {
+		if c.Type != condType {
+			continue
 		}
+		return c.Status != status || c.Reason != reason || c.Message != message || c.ObservedGeneration != generation
 	}
-	return false
+	return true
 }
 
 func (r *BasetenModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -2076,9 +2538,18 @@ func (r *BasetenModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	name := r.controllerName
+	if name == "" {
+		name = "basetenmodel"
+	}
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&modelsv1alpha1.BasetenModel{}).
-		Named("basetenmodel").
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent, ReconciliationTimeout: reconcileTimeout}).
-		Complete(r)
+		Named(name).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent, ReconciliationTimeout: reconcileTimeout})
+	if ns := r.watchNamespace; ns != "" {
+		builder = builder.WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == ns
+		}))
+	}
+	return builder.Complete(r)
 }
