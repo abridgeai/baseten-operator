@@ -2619,6 +2619,44 @@ var _ = Describe("BasetenModel Controller", func() {
 				Expect(listCalled).To(BeFalse(), "should not list deployments when no cleanup operations are enabled")
 			})
 
+			DescribeTable("should run cleanup only while the live deployment is healthy",
+				func(name, liveStatus string, wantList bool) {
+					model := newTestModel(name)
+					model.Spec.OrphanDeploymentCleanup = &modelsv1alpha1.OrphanDeploymentCleanupConfig{
+						ScaleToZero:     ptr(true),
+						IntervalMinutes: ptr(int32(10)),
+					}
+					defer cleanupModel(name)
+
+					mockModelFound()
+					mockEnvWithSettings(&baseten.Deployment{Name: testSourceDep + ".1", Status: liveStatus}, nil)
+					mockCleanupDeps(nil, nil)
+					listCalled := false
+					mockClient.ListDeploymentsFunc = func(ctx context.Context, modelID string) ([]baseten.DeploymentDetail, error) {
+						listCalled = true
+						return nil, nil
+					}
+
+					_, err := reconcileModel(model)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(listCalled).To(Equal(wantList))
+				},
+				Entry("UNHEALTHY skips", "cleanup-gate-unhealthy", baseten.DeploymentStatusUnhealthy, false),
+				Entry("FAILED skips", "cleanup-gate-failed", baseten.DeploymentStatusFailed, false),
+				Entry("DEPLOYING skips", "cleanup-gate-deploying", baseten.DeploymentStatusDeploying, false),
+				Entry("BUILDING skips", "cleanup-gate-building", baseten.DeploymentStatusBuilding, false),
+				Entry("WAKING_UP skips", "cleanup-gate-waking", baseten.DeploymentStatusWakingUp, false),
+				Entry("ACTIVATING skips", "cleanup-gate-activating", baseten.DeploymentStatusActivating, false),
+				Entry("UPDATING skips", "cleanup-gate-updating", baseten.DeploymentStatusUpdating, false),
+				Entry("DEPLOY_FAILED skips", "cleanup-gate-deploy-failed", baseten.DeploymentStatusDeployFailed, false),
+				Entry("LOADING_MODEL skips", "cleanup-gate-loading", baseten.DeploymentStatusLoadingModel, false),
+				Entry("BUILD_FAILED skips", "cleanup-gate-build-failed", baseten.DeploymentStatusBuildFailed, false),
+				Entry("BUILD_STOPPED skips", "cleanup-gate-build-stopped", baseten.DeploymentStatusBuildStopped, false),
+				Entry("DEACTIVATING skips", "cleanup-gate-deactivating", baseten.DeploymentStatusDeactivating, false),
+				Entry("ACTIVE runs", "cleanup-gate-active", baseten.DeploymentStatusActive, true),
+				Entry("SCALED_TO_ZERO runs", "cleanup-gate-scaled", baseten.DeploymentStatusScaledToZero, true),
+			)
+
 			It("should skip cleanup when intervalMinutes is not set", func() {
 				name := "cleanup-skip-no-interval"
 				model := newTestModel(name)

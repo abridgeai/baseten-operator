@@ -235,8 +235,8 @@ func (r *BasetenModelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 
-		// Orphan cleanup: only when opted in and in steady state
-		if model.Spec.OrphanDeploymentCleanup != nil {
+		// Orphan cleanup: only when opted in and healthy; a failing live deployment needs warm rollback targets.
+		if model.Spec.OrphanDeploymentCleanup != nil && isServing(env.CurrentDeployment.Status) {
 			r.reconcileOrphanCleanup(ctx, model, modelID)
 		}
 
@@ -891,7 +891,7 @@ func (r *BasetenModelReconciler) reconcileObserve(ctx context.Context, model *mo
 	}
 
 	if cur := env.CurrentDeployment; cur != nil && baseten.DeploymentNameMatchesPrefix(cur.Name, sourceDeploymentName) &&
-		(cur.Status == baseten.DeploymentStatusActive || cur.Status == baseten.DeploymentStatusScaledToZero) {
+		isServing(cur.Status) {
 		r.resetWait(model)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
@@ -916,6 +916,11 @@ func (r *BasetenModelReconciler) expectedSourceDeploymentName(ctx context.Contex
 	}
 	hash := truss.HashTrussConfig(model.Spec.TrussConfig, setupScript)
 	return truss.DeploymentName(hash, model.Spec.TrussConfig.BaseImage.Image), nil
+}
+
+// isServing reports whether a live deployment is healthy: ACTIVE, or SCALED_TO_ZERO between requests.
+func isServing(status string) bool {
+	return status == baseten.DeploymentStatusActive || status == baseten.DeploymentStatusScaledToZero
 }
 
 // currentServesSource reports whether current is the promotion of source. "p-1.3" matches
