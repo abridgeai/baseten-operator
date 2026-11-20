@@ -1122,6 +1122,7 @@ var _ = Describe("BasetenModel Controller", func() {
 				for code, terminal := range map[int]bool{400: true, 500: false} {
 					name := fmt.Sprintf("step2-update-rejected-%d", code)
 					model := newTestModel(name)
+					DeferCleanup(cleanupModel, name)
 					mockModelFound()
 					mockClient.GetEnvironmentFunc = func(ctx context.Context, modelID, envName string) (*baseten.Environment, error) {
 						return &baseten.Environment{
